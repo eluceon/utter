@@ -104,7 +104,8 @@ impl TextRefiner for LlmRefiner {
             temperature: 0.2,
         };
 
-        let url = format!("{}/chat/completions", self.config.base_url);
+        let base_url = self.config.base_url.trim_end_matches('/');
+        let url = format!("{base_url}/chat/completions");
         let mut request = self.client.post(url).json(&request_body);
         if let Some(api_key) = &self.config.api_key {
             request = request.bearer_auth(api_key);
@@ -114,6 +115,8 @@ impl TextRefiner for LlmRefiner {
 
         let status = response.status();
         if !status.is_success() {
+            // Body is best-effort context for the error message; if reading
+            // it fails, the status code alone is still reported below.
             let body = response.text().unwrap_or_default();
             return Err(RefineError::Http(format!(
                 "{status}: {}",

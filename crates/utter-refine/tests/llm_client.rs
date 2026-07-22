@@ -245,3 +245,32 @@ async fn verbatim_tone_returns_input_unchanged_without_http_call() {
 
     assert_eq!(result, Ok("  keep me verbatim  ".to_string()));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn trailing_slash_in_base_url_does_not_double_slash_the_path() {
+    let server = MockServer::start().await;
+
+    // The mock only matches the exact single-slash path. If the client
+    // naively concatenated `base_url` + "/chat/completions" without
+    // trimming the trailing slash already present in `base_url`, the
+    // request would hit "/v1//chat/completions" instead and this mock
+    // would never match, failing the request with a 404.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "hi"}}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let cfg = config(format!("{}/v1/", server.uri()));
+    let result = tokio::task::spawn_blocking(move || {
+        let refiner = LlmRefiner::new(cfg, Vec::new());
+        refiner.refine("hello", Tone::Clean)
+    })
+    .await
+    .expect("blocking task panicked");
+
+    assert_eq!(result, Ok("hi".to_string()));
+}

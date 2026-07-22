@@ -7,11 +7,17 @@ license.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 directories = "6"
+hex = "0.4"
+reqwest = { workspace = true }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { workspace = true }
+sha2 = "0.10"
 toml = "0.9"
 utter-core = { path = "../utter-core" }
 utter-refine = { path = "../utter-refine" }
+zip = "2"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"

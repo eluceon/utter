@@ -108,6 +108,7 @@ name = "utter-refine"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "utter-core",
 ]
 
 [[package]]

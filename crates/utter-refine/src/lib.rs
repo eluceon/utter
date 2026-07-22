@@ -5,3 +5,6 @@ pub use rules::{apply_rules, ReplaceRule};
 
 pub mod snippets;
 pub use snippets::{match_snippet, normalize, Snippet};
+
+pub mod prompt;
+pub use prompt::build_prompt;

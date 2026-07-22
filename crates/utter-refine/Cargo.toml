@@ -5,5 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+reqwest = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 utter-core = { path = "../utter-core" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"

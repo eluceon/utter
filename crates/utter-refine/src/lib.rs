@@ -8,3 +8,6 @@ pub use snippets::{match_snippet, normalize, Snippet};
 
 pub mod prompt;
 pub use prompt::build_prompt;
+
+pub mod llm;
+pub use llm::{LlmConfig, LlmRefiner};

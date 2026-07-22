@@ -3,3 +3,11 @@ name = "utter-audio"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+cpal = "0.18"
+crossbeam-channel = { workspace = true }
+rubato = "4"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+utter-core = { path = "../utter-core" }

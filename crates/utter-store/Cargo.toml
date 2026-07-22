@@ -3,3 +3,15 @@ name = "utter-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+directories = "6"
+serde = { workspace = true }
+thiserror = { workspace = true }
+toml = "0.9"
+utter-core = { path = "../utter-core" }
+utter-refine = { path = "../utter-refine" }
+
+[dev-dependencies]
+tempfile = "3"

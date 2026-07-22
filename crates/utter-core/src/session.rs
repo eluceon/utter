@@ -9,7 +9,8 @@
 use crate::types::{InjectionMethod, Transcript};
 
 /// How the user's hotkey drives recording start/stop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DictationMode {
     /// Recording is active only while the hotkey is held down.
     PushToTalk,

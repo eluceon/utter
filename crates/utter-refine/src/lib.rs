@@ -2,3 +2,6 @@
 
 pub mod rules;
 pub use rules::{apply_rules, ReplaceRule};
+
+pub mod snippets;
+pub use snippets::{match_snippet, normalize, Snippet};

@@ -1,0 +1,846 @@
+//! Integration tests for the dictation runtime orchestrator: drives
+//! `Runtime::spawn` through scripted fakes for every adapter (STT engine,
+//! refiner, injector, capture backend) and a real, temp-dir-backed
+//! `HistoryRepo`, asserting on the observable state sequence, notices, and
+//! injected/recorded text — never on internal implementation details.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use crossbeam_channel::{unbounded, Receiver, Sender};
+
+use utter_audio::AudioFrame;
+use utter_core::{
+    DictationMode, InjectError, InjectionMethod, RefineError, SttEngine, SttError, TextInjector,
+    TextRefiner, Tone, TranscribeOptions, Transcript,
+};
+use utter_desktop_lib::runtime::{ActiveCapture, CaptureBackend, EventSink, Runtime, RuntimeDeps};
+use utter_inject::HotkeyEvent;
+use utter_refine::{ReplaceRule, Snippet};
+use utter_store::HistoryRepo;
+
+/// Generous but bounded: every wait in these tests uses this instead of an
+/// unbounded `recv`, so a regression that stalls the worker fails the test
+/// promptly rather than hanging the suite.
+const WAIT: Duration = Duration::from_secs(5);
+
+// ---- fakes ------------------------------------------------------------
+
+/// One call the fake STT engine recorded, in the order it happened. Lets
+/// tests assert ordering (e.g. "every `Feed` precedes the `Finish`") rather
+/// than just call counts.
+#[derive(Debug, Clone, PartialEq)]
+enum CallRecord {
+    Feed(Vec<i16>),
+    Finish,
+}
+
+/// Speech-to-text engine that returns a fixed, scripted result from
+/// `finish()` regardless of what was fed to it, records every `feed`/
+/// `finish` call (in order, with `feed`'s samples) into a shared log, and
+/// can optionally return a scripted partial from `feed` or block for a bit
+/// inside `finish` (to widen a real-time window for a racing `cancel()`).
+struct FakeSttEngine {
+    result: Result<Transcript, SttError>,
+    calls: Arc<Mutex<Vec<CallRecord>>>,
+    partial: Option<String>,
+    finish_delay: Duration,
+}
+
+impl SttEngine for FakeSttEngine {
+    fn begin(&mut self, _opts: &TranscribeOptions) -> Result<(), SttError> {
+        Ok(())
+    }
+
+    fn feed(&mut self, samples: &[i16]) -> Result<Option<String>, SttError> {
+        self.calls
+            .lock()
+            .expect("lock")
+            .push(CallRecord::Feed(samples.to_vec()));
+        Ok(self.partial.clone())
+    }
+
+    fn finish(&mut self) -> Result<Transcript, SttError> {
+        if !self.finish_delay.is_zero() {
+            thread::sleep(self.finish_delay);
+        }
+        self.calls.lock().expect("lock").push(CallRecord::Finish);
+        self.result.clone()
+    }
+}
+
+fn transcript(text: &str) -> Transcript {
+    Transcript {
+        text: text.to_string(),
+        language: None,
+    }
+}
+
+/// Refiner whose behavior (uppercase / fail / succeed-after-a-delay) is
+/// scripted, with a shared call counter tests assert on to prove (or
+/// disprove) it ran. `Delay` is used to widen a real-time window for a
+/// racing `cancel()` in the cancel-during-refine test.
+enum RefineBehavior {
+    Uppercase,
+    Fail(String),
+    Delay(Duration),
+}
+
+struct FakeRefiner {
+    behavior: RefineBehavior,
+    calls: Arc<AtomicUsize>,
+}
+
+impl TextRefiner for FakeRefiner {
+    fn refine(&self, text: &str, _tone: Tone) -> Result<String, RefineError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match &self.behavior {
+            RefineBehavior::Uppercase => Ok(text.to_uppercase()),
+            RefineBehavior::Fail(msg) => Err(RefineError::Http(msg.clone())),
+            RefineBehavior::Delay(d) => {
+                thread::sleep(*d);
+                Ok(text.to_uppercase())
+            }
+        }
+    }
+}
+
+/// Records every string handed to `inject`, optionally failing instead.
+struct FakeInjector {
+    injected: Arc<Mutex<Vec<String>>>,
+    fail: bool,
+}
+
+impl TextInjector for FakeInjector {
+    fn inject(&mut self, text: &str) -> Result<InjectionMethod, InjectError> {
+        if self.fail {
+            return Err(InjectError::Backend("injection failed".to_string()));
+        }
+        self.injected.lock().expect("lock").push(text.to_string());
+        Ok(InjectionMethod::Type)
+    }
+}
+
+/// Never touches real audio hardware. Hands back a no-op capture handle,
+/// and — this is the point of it — stashes the `Sender<AudioFrame>` it was
+/// given into a shared slot, so a test can fetch it after "recording" starts
+/// and push scripted `AudioFrame`s through the exact same channel the real
+/// worker loop reads from.
+struct FakeCaptureBackend {
+    tx_slot: Arc<Mutex<Option<Sender<AudioFrame>>>>,
+}
+
+impl CaptureBackend for FakeCaptureBackend {
+    fn start(
+        &self,
+        _device: Option<&str>,
+        tx: Sender<AudioFrame>,
+    ) -> Result<Box<dyn ActiveCapture>, String> {
+        *self.tx_slot.lock().expect("lock") = Some(tx);
+        Ok(Box::new(NoopActiveCapture))
+    }
+}
+
+struct NoopActiveCapture;
+
+impl ActiveCapture for NoopActiveCapture {
+    fn stop(self: Box<Self>) {}
+}
+
+/// One `emit_state` call: phase, level, and partial, in the shape tests need
+/// to check all three (most tests only care about the phase; a couple check
+/// the partial too).
+type Emission = (String, f32, Option<String>);
+
+/// Records every `emit_state` call (pushed to a channel so tests can wait on
+/// the *next* emission with a bounded timeout instead of polling) and every
+/// `notify` call, in order, into a shared, externally-inspectable Vec.
+struct FakeSink {
+    states_tx: Sender<Emission>,
+    notices: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl EventSink for FakeSink {
+    fn emit_state(&self, state: &str, level: f32, partial: Option<&str>) {
+        let _ = self
+            .states_tx
+            .send((state.to_string(), level, partial.map(str::to_string)));
+    }
+
+    fn notify(&self, kind: &str, msg: &str) {
+        self.notices
+            .lock()
+            .expect("lock")
+            .push((kind.to_string(), msg.to_string()));
+    }
+}
+
+/// Waits for the next emission and returns just its phase — what almost
+/// every test wants.
+fn recv_state(rx: &Receiver<Emission>) -> String {
+    rx.recv_timeout(WAIT)
+        .expect("expected a dictation-state emission within the timeout")
+        .0
+}
+
+/// Waits for emissions, skipping any whose phase doesn't match `expected` —
+/// needed once a test pushes audio frames, since each processed frame emits
+/// its own `"recording"` (possibly repeated several times) before the next
+/// real transition.
+fn recv_until(rx: &Receiver<Emission>, expected: &str) {
+    loop {
+        let (state, _, _) = rx
+            .recv_timeout(WAIT)
+            .expect("expected a dictation-state emission within the timeout");
+        if state == expected {
+            return;
+        }
+    }
+}
+
+/// Waits for the next emission that carries a partial transcript, ignoring
+/// any (e.g. the initial `"recording"` from `StartCapture`) that don't.
+fn recv_partial(rx: &Receiver<Emission>) -> Option<String> {
+    loop {
+        let (_, _, partial) = rx
+            .recv_timeout(WAIT)
+            .expect("expected a dictation-state emission within the timeout");
+        if partial.is_some() {
+            return partial;
+        }
+    }
+}
+
+fn assert_no_more_states(rx: &Receiver<Emission>) {
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "expected no further state emissions"
+    );
+}
+
+/// Common `RuntimeDeps` fields every test wants; individual fields are
+/// overridden per test before calling `build`.
+struct DepsBuilder {
+    mode: DictationMode,
+    refine_enabled: bool,
+    engine_result: Result<Transcript, SttError>,
+    calls: Arc<Mutex<Vec<CallRecord>>>,
+    partial: Option<String>,
+    finish_delay: Duration,
+    refiner: Option<(RefineBehavior, Arc<AtomicUsize>)>,
+    inject_fail: bool,
+    injected: Arc<Mutex<Vec<String>>>,
+    rules: Vec<ReplaceRule>,
+    snippets: Vec<Snippet>,
+    history: Option<HistoryRepo>,
+    silence: Option<Duration>,
+    capture_tx_slot: Arc<Mutex<Option<Sender<AudioFrame>>>>,
+}
+
+impl DepsBuilder {
+    fn new(engine_result: Result<Transcript, SttError>) -> Self {
+        Self {
+            mode: DictationMode::PushToTalk,
+            refine_enabled: false,
+            engine_result,
+            calls: Arc::new(Mutex::new(Vec::new())),
+            partial: None,
+            finish_delay: Duration::ZERO,
+            refiner: None,
+            inject_fail: false,
+            injected: Arc::new(Mutex::new(Vec::new())),
+            rules: Vec::new(),
+            snippets: Vec::new(),
+            history: None,
+            silence: None,
+            capture_tx_slot: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn build(self, hotkey_rx: Receiver<HotkeyEvent>) -> RuntimeDeps {
+        let refiner: Option<Box<dyn TextRefiner>> = self.refiner.map(|(behavior, calls)| {
+            Box::new(FakeRefiner { behavior, calls }) as Box<dyn TextRefiner>
+        });
+
+        RuntimeDeps {
+            mode: self.mode,
+            refine_enabled: self.refine_enabled,
+            silence: self.silence,
+            engine: Box::new(FakeSttEngine {
+                result: self.engine_result,
+                calls: self.calls,
+                partial: self.partial,
+                finish_delay: self.finish_delay,
+            }),
+            refiner,
+            injector: Box::new(FakeInjector {
+                injected: self.injected,
+                fail: self.inject_fail,
+            }),
+            rules: self.rules,
+            snippets: self.snippets,
+            history: self.history,
+            capture_device: None,
+            capture: Box::new(FakeCaptureBackend {
+                tx_slot: self.capture_tx_slot,
+            }),
+            hotkey_rx,
+            vad_sensitivity: 0.5,
+            refine_timeout: Duration::from_secs(1),
+            tone: Tone::Clean,
+            language: None,
+            engine_label: "fake-engine".to_string(),
+        }
+    }
+}
+
+type Notices = Arc<Mutex<Vec<(String, String)>>>;
+
+fn fake_sink() -> (Arc<FakeSink>, Receiver<Emission>, Notices) {
+    let (states_tx, states_rx) = unbounded();
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::new(FakeSink {
+        states_tx,
+        notices: notices.clone(),
+    });
+    (sink, states_rx, notices)
+}
+
+/// Retrieves the `Sender<AudioFrame>` a `FakeCaptureBackend` stashed once
+/// capture started. Callers must have already observed at least one
+/// `"recording"` state emission (i.e. `Effect::StartCapture` has run) before
+/// calling this.
+fn capture_tx(slot: &Arc<Mutex<Option<Sender<AudioFrame>>>>) -> Sender<AudioFrame> {
+    slot.lock()
+        .expect("lock")
+        .clone()
+        .expect("capture should have started and stashed its sender")
+}
+
+// ---- tests --------------------------------------------------------------
+
+#[test]
+fn happy_path_emits_full_sequence_and_injects_refined_text() {
+    let refine_calls = Arc::new(AtomicUsize::new(0));
+    let injected = Arc::new(Mutex::new(Vec::new()));
+    let (sink, states_rx, _notices) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
+    builder.refine_enabled = true;
+    builder.refiner = Some((RefineBehavior::Uppercase, refine_calls.clone()));
+    builder.injected = injected.clone();
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+
+    hotkey_tx
+        .send(HotkeyEvent::Released)
+        .expect("send released");
+    assert_eq!(recv_state(&states_rx), "transcribing");
+    assert_eq!(recv_state(&states_rx), "refining");
+    assert_eq!(recv_state(&states_rx), "injecting");
+    assert_eq!(recv_state(&states_rx), "idle");
+
+    assert_eq!(*injected.lock().expect("lock"), vec!["HELLO WORLD"]);
+    assert_eq!(refine_calls.load(Ordering::SeqCst), 1);
+
+    handle.shutdown();
+}
+
+#[test]
+fn refiner_failure_injects_raw_and_notifies() {
+    let refine_calls = Arc::new(AtomicUsize::new(0));
+    let injected = Arc::new(Mutex::new(Vec::new()));
+    let (sink, states_rx, notices) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
+    builder.refine_enabled = true;
+    builder.refiner = Some((
+        RefineBehavior::Fail("refiner unreachable".to_string()),
+        refine_calls.clone(),
+    ));
+    builder.injected = injected.clone();
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+    hotkey_tx
+        .send(HotkeyEvent::Released)
+        .expect("send released");
+    assert_eq!(recv_state(&states_rx), "transcribing");
+    assert_eq!(recv_state(&states_rx), "refining");
+    assert_eq!(recv_state(&states_rx), "injecting");
+    assert_eq!(recv_state(&states_rx), "idle");
+
+    assert_eq!(*injected.lock().expect("lock"), vec!["hello world"]);
+    assert_eq!(refine_calls.load(Ordering::SeqCst), 1);
+
+    let notices = notices.lock().expect("lock");
+    assert!(
+        notices
+            .iter()
+            .any(|(kind, msg)| kind == "info" && msg.contains("Refinement unavailable")),
+        "expected a refinement-unavailable notice, got {notices:?}"
+    );
+    drop(notices);
+
+    handle.shutdown();
+}
+
+#[test]
+fn snippet_trigger_bypasses_refiner() {
+    let refine_calls = Arc::new(AtomicUsize::new(0));
+    let injected = Arc::new(Mutex::new(Vec::new()));
+    let (sink, states_rx, _notices) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("insert my signature")));
+    builder.refine_enabled = true;
+    builder.refiner = Some((RefineBehavior::Uppercase, refine_calls.clone()));
+    builder.snippets = vec![Snippet {
+        trigger: "insert my signature".to_string(),
+        body: "John Doe, CEO".to_string(),
+    }];
+    builder.injected = injected.clone();
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+    hotkey_tx
+        .send(HotkeyEvent::Released)
+        .expect("send released");
+    assert_eq!(recv_state(&states_rx), "transcribing");
+    assert_eq!(recv_state(&states_rx), "refining");
+    assert_eq!(recv_state(&states_rx), "injecting");
+    assert_eq!(recv_state(&states_rx), "idle");
+
+    assert_eq!(*injected.lock().expect("lock"), vec!["John Doe, CEO"]);
+    assert_eq!(
+        refine_calls.load(Ordering::SeqCst),
+        0,
+        "the refiner must never be called for a snippet hit"
+    );
+
+    handle.shutdown();
+}
+
+#[test]
+fn cancel_during_recording_injects_nothing() {
+    let injected = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (sink, states_rx, _notices) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("should never be seen")));
+    builder.calls = calls.clone();
+    builder.injected = injected.clone();
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+
+    handle.cancel();
+    assert_eq!(recv_state(&states_rx), "idle");
+
+    assert!(injected.lock().expect("lock").is_empty());
+    assert!(
+        calls.lock().expect("lock").is_empty(),
+        "engine.feed()/finish() must never run for a cancelled recording with no audio"
+    );
+    assert_no_more_states(&states_rx);
+
+    handle.shutdown();
+}
+
+#[test]
+fn cancel_after_finish_before_transcript_ready_injects_nothing() {
+    // Commit point 1/2 (see the module doc comment in runtime.rs): a cancel
+    // that arrives while `engine.finish()` is blocking must still prevent
+    // injection. Delaying `finish()` gives the test a real-time window to
+    // send `cancel()` after "transcribing" is observed (which happens
+    // *before* `finish()` is even called) but comfortably before `finish()`
+    // returns and the runtime checks for a pending cancel.
+    let injected = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (sink, states_rx, _notices) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
+    builder.finish_delay = Duration::from_millis(250);
+    builder.calls = calls.clone();
+    builder.injected = injected.clone();
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+    hotkey_tx
+        .send(HotkeyEvent::Released)
+        .expect("send released");
+    assert_eq!(recv_state(&states_rx), "transcribing");
+
+    handle.cancel();
+
+    assert_eq!(recv_state(&states_rx), "idle");
+    assert!(injected.lock().expect("lock").is_empty());
+    assert_no_more_states(&states_rx);
+
+    handle.shutdown();
+}
+
+#[test]
+fn cancel_during_refine_injects_nothing() {
+    // Commit point 2/2: a cancel that arrives while the refine call is in
+    // flight must still prevent injection, even though the refine call
+    // itself completed (the refiner's own network/inference call cannot be
+    // aborted mid-flight — only the resulting `Inject` is prevented). This
+    // is also the only place a "cancel just before inject" could land in
+    // this design: nothing async happens between a refine call resolving
+    // and the `Inject` effect it would produce, so there is no separate,
+    // distinguishable commit point to test beyond this one.
+    let injected = Arc::new(Mutex::new(Vec::new()));
+    let refine_calls = Arc::new(AtomicUsize::new(0));
+    let (sink, states_rx, _notices) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
+    builder.refine_enabled = true;
+    builder.refiner = Some((
+        RefineBehavior::Delay(Duration::from_millis(250)),
+        refine_calls,
+    ));
+    builder.injected = injected.clone();
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+    hotkey_tx
+        .send(HotkeyEvent::Released)
+        .expect("send released");
+    assert_eq!(recv_state(&states_rx), "transcribing");
+    assert_eq!(recv_state(&states_rx), "refining");
+
+    handle.cancel();
+
+    assert_eq!(recv_state(&states_rx), "idle");
+    assert!(
+        injected.lock().expect("lock").is_empty(),
+        "nothing must be injected once a cancel arrived before the inject commit point"
+    );
+    assert_no_more_states(&states_rx);
+
+    handle.shutdown();
+}
+
+#[test]
+fn empty_transcript_notifies_and_injects_nothing() {
+    let injected = Arc::new(Mutex::new(Vec::new()));
+    let (sink, states_rx, notices) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("   ")));
+    builder.injected = injected.clone();
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+    hotkey_tx
+        .send(HotkeyEvent::Released)
+        .expect("send released");
+    assert_eq!(recv_state(&states_rx), "transcribing");
+    assert_eq!(recv_state(&states_rx), "idle");
+
+    assert!(injected.lock().expect("lock").is_empty());
+    let notices = notices.lock().expect("lock");
+    assert!(
+        notices
+            .iter()
+            .any(|(kind, msg)| kind == "info" && msg == "Nothing heard"),
+        "expected a 'Nothing heard' notice, got {notices:?}"
+    );
+    drop(notices);
+
+    handle.shutdown();
+}
+
+#[test]
+fn history_entry_recorded_with_raw_and_final_text() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("history.sqlite3");
+    let history = HistoryRepo::open(&db_path).expect("open history db");
+
+    let refine_calls = Arc::new(AtomicUsize::new(0));
+    let injected = Arc::new(Mutex::new(Vec::new()));
+    let (sink, states_rx, _notices) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
+    builder.refine_enabled = true;
+    builder.refiner = Some((RefineBehavior::Uppercase, refine_calls));
+    builder.injected = injected.clone();
+    builder.history = Some(history);
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+    hotkey_tx
+        .send(HotkeyEvent::Released)
+        .expect("send released");
+    assert_eq!(recv_state(&states_rx), "transcribing");
+    assert_eq!(recv_state(&states_rx), "refining");
+    assert_eq!(recv_state(&states_rx), "injecting");
+    assert_eq!(recv_state(&states_rx), "idle");
+
+    assert_eq!(*injected.lock().expect("lock"), vec!["HELLO WORLD"]);
+
+    handle.shutdown();
+
+    // Re-open the same on-disk database to verify what the worker thread
+    // persisted; the write is autocommit and happened-before the "idle"
+    // emission above, so it is guaranteed visible here.
+    let verify = HistoryRepo::open(&db_path).expect("reopen history db");
+    let entries = verify.list(None, 10).expect("list history");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].raw_text, "hello world");
+    assert_eq!(entries[0].final_text, "HELLO WORLD");
+    assert_eq!(entries[0].engine, "fake-engine");
+    assert!(entries[0].duration_ms >= 0);
+}
+
+#[test]
+fn reload_swaps_deps_between_sessions() {
+    let injected_a = Arc::new(Mutex::new(Vec::new()));
+    let injected_b = Arc::new(Mutex::new(Vec::new()));
+    let (sink, states_rx, _notices) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder_a = DepsBuilder::new(Ok(transcript("hello world")));
+    builder_a.injected = injected_a.clone();
+    let deps_a = builder_a.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps_a, sink);
+
+    // Still idle (no session started yet): the new deps, including a fresh
+    // hotkey channel, apply immediately rather than being queued.
+    let (hotkey_tx_b, hotkey_rx_b) = unbounded();
+    let mut builder_b = DepsBuilder::new(Ok(transcript("second session")));
+    builder_b.injected = injected_b.clone();
+    let deps_b = builder_b.build(hotkey_rx_b);
+    handle.reload(deps_b);
+
+    hotkey_tx_b
+        .send(HotkeyEvent::Pressed)
+        .expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+    hotkey_tx_b
+        .send(HotkeyEvent::Released)
+        .expect("send released");
+    assert_eq!(recv_state(&states_rx), "transcribing");
+    assert_eq!(recv_state(&states_rx), "injecting");
+    assert_eq!(recv_state(&states_rx), "idle");
+
+    assert!(injected_a.lock().expect("lock").is_empty());
+    assert_eq!(*injected_b.lock().expect("lock"), vec!["second session"]);
+
+    // The old hotkey channel's receiver was dropped by `reload`; sending on
+    // it now simply fails rather than resurrecting the old session.
+    let _ = hotkey_tx.send(HotkeyEvent::Pressed);
+
+    handle.shutdown();
+}
+
+#[test]
+fn toggle_drives_a_full_session_in_toggle_mode() {
+    let injected = Arc::new(Mutex::new(Vec::new()));
+    let (sink, states_rx, _notices) = fake_sink();
+
+    let (_hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("toggled")));
+    builder.mode = DictationMode::Toggle;
+    builder.injected = injected.clone();
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    handle.toggle();
+    assert_eq!(recv_state(&states_rx), "recording");
+
+    handle.toggle();
+    assert_eq!(recv_state(&states_rx), "transcribing");
+    assert_eq!(recv_state(&states_rx), "injecting");
+    assert_eq!(recv_state(&states_rx), "idle");
+
+    assert_eq!(*injected.lock().expect("lock"), vec!["toggled"]);
+
+    handle.shutdown();
+}
+
+#[test]
+fn audio_frames_are_fed_to_engine_and_partial_reaches_sink() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let tx_slot = Arc::new(Mutex::new(None));
+    let (sink, states_rx, _notices) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
+    builder.calls = calls.clone();
+    builder.partial = Some("partial text".to_string());
+    builder.capture_tx_slot = tx_slot.clone();
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+
+    let tx = capture_tx(&tx_slot);
+    tx.send(AudioFrame {
+        samples: vec![100; 50],
+    })
+    .expect("send frame");
+
+    // The frame's rms/partial reaches the sink as a "recording" emission
+    // carrying the scripted partial.
+    let partial = recv_partial(&states_rx);
+    assert_eq!(partial.as_deref(), Some("partial text"));
+
+    // ... and the frame's samples actually reached `engine.feed`.
+    let calls = calls.lock().expect("lock");
+    assert!(
+        calls
+            .iter()
+            .any(|c| matches!(c, CallRecord::Feed(samples) if samples.len() == 50)),
+        "expected engine.feed to have been called with the pushed frame, got {calls:?}"
+    );
+    drop(calls);
+
+    handle.shutdown();
+}
+
+#[test]
+fn trailing_frames_are_fed_before_finish_is_called() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let tx_slot = Arc::new(Mutex::new(None));
+    let (sink, states_rx, _notices) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
+    builder.calls = calls.clone();
+    builder.capture_tx_slot = tx_slot.clone();
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+
+    let tx = capture_tx(&tx_slot);
+    // Push frames and release the hotkey back-to-back, without waiting for
+    // either frame to be individually processed first: whichever the
+    // `select!` loop happens to pick up first (an audio frame via the
+    // normal recording-path feed, or the hotkey release triggering
+    // `StopCapture`'s trailing-frame drain), every sample must still reach
+    // `engine.feed` strictly before `engine.finish()` is called.
+    tx.send(AudioFrame {
+        samples: vec![1, 2, 3],
+    })
+    .expect("send frame 1");
+    tx.send(AudioFrame {
+        samples: vec![4, 5, 6],
+    })
+    .expect("send frame 2");
+    hotkey_tx
+        .send(HotkeyEvent::Released)
+        .expect("send released");
+
+    // Depending on which the `select!` loop happens to service first, zero,
+    // one, or two of the pushed frames may be processed via the normal
+    // recording-path feed (each emitting its own extra "recording") before
+    // `Released` is picked up — `recv_until` skips those rather than
+    // asserting an exact count, since the ordering guarantee under test is
+    // about `engine.feed`/`engine.finish()` call order, not the state
+    // channel's exact cardinality.
+    recv_until(&states_rx, "transcribing");
+    recv_until(&states_rx, "injecting");
+    recv_until(&states_rx, "idle");
+
+    let calls = calls.lock().expect("lock");
+    let finish_index = calls
+        .iter()
+        .position(|c| *c == CallRecord::Finish)
+        .expect("finish() should have been called exactly once");
+    let feeds_before_finish: Vec<&CallRecord> = calls[..finish_index].iter().collect();
+    assert_eq!(
+        feeds_before_finish.len(),
+        2,
+        "both frames should have been fed before finish(), got {calls:?}"
+    );
+    assert!(feeds_before_finish
+        .iter()
+        .any(|c| matches!(c, CallRecord::Feed(s) if s == &vec![1i16, 2, 3])));
+    assert!(feeds_before_finish
+        .iter()
+        .any(|c| matches!(c, CallRecord::Feed(s) if s == &vec![4i16, 5, 6])));
+    drop(calls);
+
+    handle.shutdown();
+}
+
+#[test]
+fn silence_timeout_stops_recording_without_hotkey_release() {
+    let tx_slot = Arc::new(Mutex::new(None));
+    let (sink, states_rx, _notices) = fake_sink();
+
+    let (_hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
+    builder.silence = Some(Duration::from_millis(30));
+    builder.capture_tx_slot = tx_slot.clone();
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    // Drive recording via `toggle` rather than a hotkey channel, since no
+    // release is ever going to be sent in this test.
+    handle.toggle();
+    assert_eq!(recv_state(&states_rx), "recording");
+
+    let tx = capture_tx(&tx_slot);
+    // All-zero samples are silence (rms 0.0). Spaced 10ms apart in real
+    // time so the 30ms silence hold genuinely elapses; comfortably more
+    // frames than needed, for margin.
+    for _ in 0..10 {
+        tx.send(AudioFrame {
+            samples: vec![0i16; 10],
+        })
+        .expect("send silent frame");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // No hotkey release, no manual cancel: only the silence timeout can
+    // have driven this transition.
+    recv_until(&states_rx, "transcribing");
+    recv_until(&states_rx, "injecting");
+    recv_until(&states_rx, "idle");
+
+    handle.shutdown();
+}

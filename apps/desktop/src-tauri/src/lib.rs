@@ -13,6 +13,10 @@ mod commands;
 /// emitted by this task), but their shape is part of this crate's contract
 /// with the frontend, defined once for the runtime task that will emit them.
 pub mod events;
+/// The dictation runtime orchestrator (worker thread, state machine wiring).
+/// Public so integration tests can drive it directly; nothing in `run()`
+/// constructs or starts it yet — booting it into the app is a later task.
+pub mod runtime;
 mod state;
 
 use tauri::Manager;

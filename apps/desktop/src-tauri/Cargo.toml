@@ -21,6 +21,7 @@ serde = { workspace = true }
 tauri = { version = "2.11", features = ["tray-icon"] }
 tauri-plugin-notification = "2"
 keyring = "4"
+tracing = { workspace = true }
 
 utter-core = { path = "../../../crates/utter-core" }
 utter-audio = { path = "../../../crates/utter-audio" }

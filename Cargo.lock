@@ -5547,6 +5547,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-notification",
  "tempfile",
+ "tracing",
  "utter-audio",
  "utter-core",
  "utter-inject",

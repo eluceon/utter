@@ -13,13 +13,7 @@ use utter_store::{HistoryEntry, ModelInfo, Settings};
 
 use crate::events::ModelProgress;
 use crate::state::AppState;
-
-/// The service name under which all Utter secrets are stored in the OS
-/// keyring; the per-secret identity is the keyring *username*, one of
-/// [`STT_KEY_SERVICE`] / [`REFINE_KEY_SERVICE`].
-const KEYRING_SERVICE: &str = "utter";
-const STT_KEY_SERVICE: &str = "stt";
-const REFINE_KEY_SERVICE: &str = "refine";
+use crate::{keyring_password, KEYRING_SERVICE, REFINE_KEY_SERVICE, STT_KEY_SERVICE};
 
 /// Maximum number of history entries returned by [`history_list`].
 const HISTORY_LIST_LIMIT: u32 = 500;
@@ -46,14 +40,33 @@ pub fn get_settings(state: State<AppState>) -> Settings {
 }
 
 #[tauri::command]
-pub fn save_settings(state: State<AppState>, settings: Settings) -> Result<(), String> {
-    // Hold the write lock across persist + apply + in-memory update so two
-    // concurrent `save_settings` calls are fully serialized instead of
-    // interleaving their disk write / apply / in-memory steps (which could
-    // otherwise leave the on-disk file and in-memory state with different
-    // winners). This command is sync, runs on tauri's threadpool rather than
-    // an async/UI thread, and `utter_store::save` is a small TOML write, so
-    // holding a `std::sync::RwLock` write guard across it is fine.
+pub fn save_settings(
+    app: AppHandle,
+    state: State<AppState>,
+    settings: Settings,
+) -> Result<(), String> {
+    persist_and_apply(&app, &state, settings)
+}
+
+/// Saves `settings` to disk, rebuilds the live dictation runtime from them
+/// (hotkey source, STT engine, refiner, injector chain — see
+/// `runtime_boot::rebuild`), and updates the in-memory copy.
+///
+/// The one path every settings change goes through, whether it came from the
+/// settings UI (`save_settings`) or the tray's "Refinement" checkbox.
+///
+/// Holds the write lock across persist + apply + in-memory update so two
+/// concurrent callers are fully serialized instead of interleaving their
+/// disk write / apply / in-memory steps (which could otherwise leave the
+/// on-disk file and in-memory state with different winners). This runs on
+/// tauri's threadpool rather than an async/UI thread, and `utter_store::save`
+/// is a small TOML write, so holding a `std::sync::RwLock` write guard across
+/// it (and the runtime rebuild) is fine.
+pub(crate) fn persist_and_apply(
+    app: &AppHandle,
+    state: &AppState,
+    settings: Settings,
+) -> Result<(), String> {
     let mut guard = state
         .settings
         .write()
@@ -62,20 +75,24 @@ pub fn save_settings(state: State<AppState>, settings: Settings) -> Result<(), S
     utter_store::save(&utter_store::config_path(), &settings)
         .map_err(|e| format!("failed to save settings: {e}"))?;
 
-    apply_settings(&settings)?;
+    crate::runtime_boot::rebuild(app, state, &settings)?;
 
     *guard = settings;
 
     Ok(())
 }
 
-/// Applies settings that require rebuilding live components: the hotkey
-/// source and the active STT/refine engines. As of this task there is no
-/// running session/runtime to rebuild yet (that lands with the runtime
-/// orchestrator in Task 17/18), so this is currently a no-op — but it is a
-/// real call site `save_settings` already goes through, ready for that task
-/// to fill in rather than a dead stub nothing calls.
-fn apply_settings(_settings: &Settings) -> Result<(), String> {
+/// Cancels the in-flight dictation session, if any (a no-op while idle).
+/// Backs the HUD's "click anywhere to cancel" affordance.
+#[tauri::command]
+pub fn cancel_dictation(state: State<AppState>) -> Result<(), String> {
+    let guard = state
+        .session_ctl
+        .lock()
+        .map_err(|_| "session control lock poisoned".to_string())?;
+    if let Some(handle) = guard.as_ref() {
+        handle.cancel();
+    }
     Ok(())
 }
 
@@ -238,9 +255,7 @@ pub fn has_api_key(service: String) -> bool {
     if validate_key_service(&service).is_err() {
         return false;
     }
-    keyring::Entry::new(KEYRING_SERVICE, &service)
-        .and_then(|entry| entry.get_password())
-        .is_ok()
+    keyring_password(&service).is_some()
 }
 
 #[tauri::command]
@@ -256,9 +271,7 @@ pub fn test_refine(state: State<AppState>, sample: String) -> Result<String, Str
         .map_err(|_| "settings lock poisoned".to_string())?
         .clone();
 
-    let api_key = keyring::Entry::new(KEYRING_SERVICE, REFINE_KEY_SERVICE)
-        .and_then(|entry| entry.get_password())
-        .ok();
+    let api_key = keyring_password(REFINE_KEY_SERVICE);
 
     let refiner = LlmRefiner::new(
         LlmConfig {

@@ -3,7 +3,7 @@
 
   import { settingsStore } from './lib/stores'
   import { applyTheme } from './lib/theme'
-  import { defaultSettings } from './lib/types'
+  import { deepEqual, defaultSettings } from './lib/types'
 
   import General from './pages/General.svelte'
   import Dictation from './pages/Dictation.svelte'
@@ -50,7 +50,7 @@
   let showOnboarding = $state(false)
 
   function isDefaultSettings(settings: unknown): boolean {
-    return JSON.stringify(settings) === JSON.stringify(defaultSettings())
+    return deepEqual(settings, defaultSettings())
   }
 
   function finishOnboarding() {

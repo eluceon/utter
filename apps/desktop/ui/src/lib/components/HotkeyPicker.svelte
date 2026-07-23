@@ -1,12 +1,10 @@
 <script lang="ts">
-  // Captures a keydown/keyup gesture and normalizes it into the chord string
-  // format `utter_inject::hotkey::parse_hotkey` accepts: `+`-separated
-  // tokens, each one of `ctrl`/`alt`/`shift`/`super` (the modifier names,
-  // canonicalized — the Rust parser also accepts `control` and `meta`/`win`
-  // as aliases for `ctrl`/`super`, but this picker only ever emits the
-  // canonical short forms) or a single letter/digit/`f1`..`f24` base key. A
-  // chord made entirely of modifiers (e.g. the default `ctrl+super`) is
-  // valid and accepted here too.
+  // Captures a keydown/keyup gesture and normalizes it into a hotkey chord
+  // string. The token-normalization rules live in `../hotkey` (unit-tested
+  // there, including the shift+digit case); this component only owns the
+  // capture gesture (which keys are currently down, when to finalize).
+
+  import { formatCombo, isModifierToken, tokenFor } from '../hotkey'
 
   interface Props {
     value?: string
@@ -15,16 +13,6 @@
   }
 
   let { value = $bindable(''), id, disabled = false }: Props = $props()
-
-  const MODIFIER_ORDER = ['ctrl', 'alt', 'shift', 'super'] as const
-  type ModifierToken = (typeof MODIFIER_ORDER)[number]
-
-  const MODIFIER_KEY_NAMES: Record<string, ModifierToken> = {
-    Control: 'ctrl',
-    Alt: 'alt',
-    Shift: 'shift',
-    Meta: 'super',
-  }
 
   let capturing = $state(false)
   let preview = $state('')
@@ -36,23 +24,6 @@
    * this set once `down` empties out, so releasing modifiers before the
    * base key (or vice versa) still captures the full combo. */
   let combo = new Set<string>()
-
-  function tokenFor(key: string): string | null {
-    if (key in MODIFIER_KEY_NAMES) return MODIFIER_KEY_NAMES[key]
-    if (/^F(?:[1-9]|1[0-9]|2[0-4])$/.test(key)) return key.toLowerCase()
-    if (/^[a-zA-Z0-9]$/.test(key)) return key.toLowerCase()
-    return null
-  }
-
-  function isModifier(token: string): token is ModifierToken {
-    return (MODIFIER_ORDER as readonly string[]).includes(token)
-  }
-
-  function formatCombo(tokens: Set<string>): string {
-    const mods = MODIFIER_ORDER.filter((m) => tokens.has(m))
-    const rest = [...tokens].filter((t) => !isModifier(t))
-    return [...mods, ...rest].join('+')
-  }
 
   function start() {
     if (disabled) return
@@ -83,11 +54,11 @@
       return
     }
 
-    const token = tokenFor(event.key)
+    const token = tokenFor(event.code, event.key)
     if (!token) return
 
-    const hasBaseKey = [...combo].some((t) => !isModifier(t))
-    if (!isModifier(token) && hasBaseKey && !combo.has(token)) {
+    const hasBaseKey = [...combo].some((t) => !isModifierToken(t))
+    if (!isModifierToken(token) && hasBaseKey && !combo.has(token)) {
       hint = 'A hotkey may only have one base key'
       return
     }
@@ -102,7 +73,7 @@
     if (!capturing) return
     event.preventDefault()
 
-    const token = tokenFor(event.key)
+    const token = tokenFor(event.code, event.key)
     if (token) down.delete(token)
 
     if (down.size === 0) {

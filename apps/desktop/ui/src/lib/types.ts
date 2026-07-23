@@ -147,6 +147,36 @@ export function defaultSettings(): Settings {
   }
 }
 
+/** Structural deep equality: object key order never matters (unlike a naive
+ * `JSON.stringify` comparison, which is sensitive to it), arrays compare
+ * element-by-element in order, and primitives compare with `===`. Sufficient
+ * for comparing two `Settings` values without depending on both having been
+ * serialized with identical key ordering. */
+export function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (typeof a !== typeof b || a === null || b === null) return false
+
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false
+    return a.every((value, i) => deepEqual(value, b[i]))
+  }
+
+  if (typeof a === 'object' && typeof b === 'object') {
+    const aRecord = a as Record<string, unknown>
+    const bRecord = b as Record<string, unknown>
+    const aKeys = Object.keys(aRecord)
+    const bKeys = Object.keys(bRecord)
+    if (aKeys.length !== bKeys.length) return false
+    return aKeys.every(
+      (key) =>
+        Object.prototype.hasOwnProperty.call(bRecord, key) &&
+        deepEqual(aRecord[key], bRecord[key]),
+    )
+  }
+
+  return false
+}
+
 /** `crates/utter-store/src/models.rs::ModelInfo` */
 export interface ModelInfo {
   id: string

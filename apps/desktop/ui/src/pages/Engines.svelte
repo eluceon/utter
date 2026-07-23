@@ -18,6 +18,7 @@
   let sttConfigured = $state(false)
   let sttApiKey = $state('')
   let sttKeyJustSaved = $state(false)
+  let sttKeyError = $state('')
 
   const ENGINE_OPTIONS: { value: EngineKind; label: string }[] = [
     { value: 'whisper', label: 'Whisper (local)' },
@@ -99,7 +100,13 @@
 
   async function saveSttKey() {
     if (!sttApiKey.trim()) return
-    await api.setApiKey('stt', sttApiKey)
+    sttKeyError = ''
+    try {
+      await api.setApiKey('stt', sttApiKey)
+    } catch (err) {
+      sttKeyError = `Failed to save API key: ${String(err)}`
+      return
+    }
     sttApiKey = ''
     sttConfigured = true
     sttKeyJustSaved = true
@@ -243,6 +250,9 @@
         <span class="badge badge-missing">Not set</span>
       {/if}
     </div>
+    {#if sttKeyError}
+      <p class="error">{sttKeyError}</p>
+    {/if}
   </Field>
 </Section>
 

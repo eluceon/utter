@@ -54,6 +54,7 @@
   let refineConfigured = $state(false)
   let refineApiKey = $state('')
   let refineKeyJustSaved = $state(false)
+  let refineKeyError = $state('')
 
   onMount(async () => {
     try {
@@ -65,7 +66,13 @@
 
   async function saveRefineKey() {
     if (!refineApiKey.trim()) return
-    await api.setApiKey('refine', refineApiKey)
+    refineKeyError = ''
+    try {
+      await api.setApiKey('refine', refineApiKey)
+    } catch (err) {
+      refineKeyError = `Failed to save API key: ${String(err)}`
+      return
+    }
     refineApiKey = ''
     refineConfigured = true
     refineKeyJustSaved = true
@@ -170,6 +177,9 @@
         <span class="badge badge-missing">Not set</span>
       {/if}
     </div>
+    {#if refineKeyError}
+      <p class="error">{refineKeyError}</p>
+    {/if}
   </Field>
 </Section>
 
@@ -226,6 +236,11 @@
   .badge-missing {
     background: var(--bg-sunken);
     color: var(--text-muted);
+  }
+
+  .error {
+    color: var(--danger);
+    font-size: 13px;
   }
 
   textarea {

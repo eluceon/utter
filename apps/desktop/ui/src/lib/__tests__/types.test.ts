@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest'
 
-import { defaultSettings, type Settings } from '../types'
+import { deepEqual, defaultSettings, type Settings } from '../types'
+
+describe('deepEqual', () => {
+  it('is true for structurally equal objects regardless of key order, false for a real difference', () => {
+    const a = { general: { theme: 'dark', autostart: true }, snippets: [{ trigger: 't', body: 'b' }] }
+    const b = { snippets: [{ body: 'b', trigger: 't' }], general: { autostart: true, theme: 'dark' } }
+    expect(deepEqual(a, b)).toBe(true)
+    expect(deepEqual(a, { ...b, general: { ...b.general, theme: 'light' } })).toBe(false)
+  })
+})
 
 describe('Settings type/JSON round-trip', () => {
   it('defaultSettings() survives a JSON round-trip unchanged', () => {

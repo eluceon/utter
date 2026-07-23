@@ -3,6 +3,7 @@
 
   import { settingsStore } from './lib/stores'
   import { applyTheme } from './lib/theme'
+  import { defaultSettings } from './lib/types'
 
   import General from './pages/General.svelte'
   import Dictation from './pages/Dictation.svelte'
@@ -12,6 +13,20 @@
   import Snippets from './pages/Snippets.svelte'
   import History from './pages/History.svelte'
   import Advanced from './pages/Advanced.svelte'
+  import Onboarding from './pages/Onboarding.svelte'
+
+  // The onboarding wizard is shown when we have no signal that this user has
+  // ever been through it or configured anything: no completion flag in
+  // localStorage (nothing else survives an uninstall/reinstall or a "start
+  // fresh" without the flag), AND the loaded settings are byte-for-byte the
+  // defaults (a real config file that merely doesn't set some fields would
+  // still differ once anything meaningful was changed and saved). This is a
+  // heuristic, not a hard signal — the brief explicitly rules out adding a
+  // new Rust command (e.g. "does config.toml exist") for this task, so
+  // there is no way to distinguish "never configured" from "configured
+  // everything back to the exact defaults on purpose" without one. A
+  // dedicated `config_exists` command would remove this ambiguity later.
+  const ONBOARDED_KEY = 'utter.onboarded'
 
   const NAV: { hash: string; label: string }[] = [
     { hash: 'general', label: 'General' },
@@ -32,6 +47,16 @@
   let hash = $state(currentHash())
   let loading = $state(true)
   let loadError = $state('')
+  let showOnboarding = $state(false)
+
+  function isDefaultSettings(settings: unknown): boolean {
+    return JSON.stringify(settings) === JSON.stringify(defaultSettings())
+  }
+
+  function finishOnboarding() {
+    localStorage.setItem(ONBOARDED_KEY, '1')
+    showOnboarding = false
+  }
 
   function onHashChange() {
     void settingsStore.flush()
@@ -44,7 +69,8 @@
 
   onMount(async () => {
     try {
-      await settingsStore.load()
+      const loaded = await settingsStore.load()
+      showOnboarding = !localStorage.getItem(ONBOARDED_KEY) && isDefaultSettings(loaded)
     } catch (err) {
       loadError = `Failed to load settings: ${String(err)}`
     } finally {
@@ -73,6 +99,8 @@
   <div class="status">Loading settings…</div>
 {:else if loadError}
   <div class="status error">{loadError}</div>
+{:else if showOnboarding}
+  <Onboarding onDone={finishOnboarding} />
 {:else if $settingsStore}
   <div class="shell">
     <nav aria-label="Settings sections">

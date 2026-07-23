@@ -3,3 +3,11 @@ name = "utter-stt"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+utter-core = { path = "../utter-core" }
+whisper-rs = { version = "0.16", optional = true, features = ["tracing_backend"] }
+
+[features]
+default = ["whisper"]
+whisper = ["dep:whisper-rs"]

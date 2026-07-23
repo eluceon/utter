@@ -3,3 +3,13 @@ name = "utter-inject"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+arboard = { version = "3.6", features = ["wayland-data-control"] }
+crossbeam-channel = { workspace = true }
+evdev = "0.13"
+global-hotkey = "0.8"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+utter-core = { path = "../utter-core" }

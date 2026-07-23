@@ -85,13 +85,17 @@ pub(crate) fn persist_and_apply(
 /// Cancels the in-flight dictation session, if any (a no-op while idle).
 /// Backs the HUD's "click anywhere to cancel" affordance.
 #[tauri::command]
-pub fn cancel_dictation(state: State<AppState>) -> Result<(), String> {
+pub fn cancel_dictation(app: AppHandle, state: State<AppState>) -> Result<(), String> {
     let guard = state
         .session_ctl
         .lock()
         .map_err(|_| "session control lock poisoned".to_string())?;
-    if let Some(handle) = guard.as_ref() {
-        handle.cancel();
+    match guard.as_ref() {
+        Some(handle) => handle.cancel(),
+        None => {
+            drop(guard);
+            crate::sink::notify_no_session(&app);
+        }
     }
     Ok(())
 }

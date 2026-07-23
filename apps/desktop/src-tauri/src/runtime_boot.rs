@@ -149,7 +149,11 @@ fn build_deps(
         notices.push(("warning", msg));
     }
 
-    let refiner = build_refiner(&settings.refine, settings.dictionary.terms.clone());
+    let (refiner, refiner_notice) =
+        build_refiner(&settings.refine, settings.dictionary.terms.clone());
+    if let Some(msg) = refiner_notice {
+        notices.push(("info", msg));
+    }
     let injector = build_injector(settings.advanced.injection);
 
     let (hotkey_rx, hotkey_notice) = spawn_hotkey_source(&settings.dictation.hotkey);
@@ -309,13 +313,37 @@ fn refine_configured(cfg: &RefineCfg) -> bool {
     cfg.enabled && !cfg.base_url.trim().is_empty() && !cfg.model.trim().is_empty()
 }
 
-fn build_refiner(cfg: &RefineCfg, dictionary_terms: Vec<String>) -> Option<Box<dyn TextRefiner>> {
+/// The notice queued when refinement is enabled/configured but no API key is
+/// set in the keyring — pulled out as a pure function of `has_key` (rather
+/// than inlined next to the `keyring_password` call) so it's testable
+/// without touching the real keyring. Unlike a missing cloud STT key (always
+/// an error — that endpoint always requires one), a missing refine key is
+/// legitimate for local endpoints (e.g. Ollama), so this is an `"info"`
+/// notice, not a `"warning"`, and never blocks building the refiner.
+fn refine_missing_key_notice(has_key: bool) -> Option<String> {
+    if has_key {
+        None
+    } else {
+        Some(
+            "Refinement is enabled without an API key; local endpoints (e.g. Ollama) work \
+             without one — set a key in Settings if your provider requires it."
+                .to_string(),
+        )
+    }
+}
+
+fn build_refiner(
+    cfg: &RefineCfg,
+    dictionary_terms: Vec<String>,
+) -> (Option<Box<dyn TextRefiner>>, Option<String>) {
     if !refine_configured(cfg) {
-        return None;
+        return (None, None);
     }
 
     let api_key = keyring_password(REFINE_KEY_SERVICE);
-    Some(Box::new(LlmRefiner::new(
+    let notice = refine_missing_key_notice(api_key.is_some());
+
+    let refiner = Box::new(LlmRefiner::new(
         LlmConfig {
             base_url: cfg.base_url.clone(),
             api_key,
@@ -323,7 +351,9 @@ fn build_refiner(cfg: &RefineCfg, dictionary_terms: Vec<String>) -> Option<Box<d
             timeout: Duration::from_secs(cfg.timeout_secs),
         },
         dictionary_terms,
-    )))
+    ));
+
+    (Some(refiner), notice)
 }
 
 fn build_injector(preference: InjectionPreference) -> Box<dyn TextInjector> {
@@ -353,17 +383,21 @@ fn build_injector(preference: InjectionPreference) -> Box<dyn TextInjector> {
 
 /// Starts the hotkey monitor thread for `hotkey` and returns the receiver
 /// side of its event channel, plus a notice if capture couldn't be started
-/// (an invalid chord, or missing permissions) — the runtime still boots with
-/// no hotkey rather than failing outright.
+/// (an invalid chord, missing permissions, or the OS refusing to spawn the
+/// monitor thread) — the runtime still boots with no hotkey rather than
+/// failing outright.
 ///
-/// The channel's sender is either owned by the spawned `HotkeySource` thread
-/// (which runs, and keeps it alive, until a later `save_settings` supersedes
-/// it via the generation counter — see `utter_inject::create_source`) or, on
-/// failure, deliberately leaked: with no thread to own it, dropping it
-/// instead would make every future `select!` in the runtime worker see the
-/// channel as immediately "ready" with a disconnect error, spinning the
-/// worker thread at 100% CPU forever. One leaked `Sender` per failed (re)boot
-/// is an intentionally rare, negligible cost next to that.
+/// The channel's sender is cloned before being handed to the spawned
+/// `HotkeySource` thread rather than moved directly: on the happy path the
+/// thread's clone keeps the channel alive (until a later `save_settings`
+/// supersedes it via the generation counter — see `utter_inject::create_source`)
+/// for as long as it runs, so this function's own clone can simply be
+/// dropped normally. On any failure path (no thread ever started to own a
+/// clone), this function's clone is instead deliberately leaked: dropping it
+/// would make every future `select!` in the runtime worker see the channel
+/// as immediately "ready" with a disconnect error, spinning the worker
+/// thread at 100% CPU forever. One leaked `Sender` per failed (re)boot is an
+/// intentionally rare, negligible cost next to that.
 fn spawn_hotkey_source(hotkey: &str) -> (Receiver<HotkeyEvent>, Option<String>) {
     let (tx, rx) = unbounded::<HotkeyEvent>();
 
@@ -381,21 +415,35 @@ fn spawn_hotkey_source(hotkey: &str) -> (Receiver<HotkeyEvent>, Option<String>) 
         }
     };
 
-    match create_source(&spec) {
-        Ok(source) => {
-            thread::Builder::new()
-                .name("utter-hotkey".to_string())
-                .spawn(move || source.run(tx))
-                .expect("failed to spawn the utter-hotkey source thread");
-            (rx, None)
-        }
+    let source = match create_source(&spec) {
+        Ok(source) => source,
         Err(e) => {
             std::mem::forget(tx);
-            (
+            return (
                 rx,
                 Some(format!(
                     "failed to start hotkey capture: {e}; check input group / uinput \
                      permissions in Settings > Permissions"
+                )),
+            );
+        }
+    };
+
+    let thread_tx = tx.clone();
+    let spawned = thread::Builder::new()
+        .name("utter-hotkey".to_string())
+        .spawn(move || source.run(thread_tx));
+
+    match spawned {
+        Ok(_join_handle) => (rx, None),
+        Err(e) => {
+            tracing::error!("failed to spawn the utter-hotkey source thread: {e}");
+            std::mem::forget(tx);
+            (
+                rx,
+                Some(format!(
+                    "failed to start hotkey capture: {e}; dictation has no hotkey until the \
+                     app is restarted"
                 )),
             )
         }
@@ -454,6 +502,15 @@ mod tests {
             "http://localhost:11434/v1",
             ""
         )));
+    }
+
+    #[test]
+    fn refine_missing_key_notice_only_fires_when_key_is_absent() {
+        let notice = refine_missing_key_notice(false).expect("missing key should notice");
+        assert!(notice.contains("without an API key"));
+        assert!(notice.contains("Ollama"));
+
+        assert_eq!(refine_missing_key_notice(true), None);
     }
 
     #[test]

@@ -69,14 +69,19 @@ pub fn run() -> Result<(), String> {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Closing the main settings window hides it to the tray rather
-            // than quitting the app; the only way to fully exit is the
-            // tray's "Quit" item, which shuts the runtime down explicitly.
-            if window.label() == "main" {
+            // Closing either window hides it to the tray rather than
+            // quitting the app; the only way to fully exit is the tray's
+            // "Quit" item, which shuts the runtime down explicitly. The HUD
+            // has no decorations/close button so it is never *user*-closable
+            // this way, but guarding it too is cheap and keeps both windows
+            // symmetric against any programmatic or platform-triggered close
+            // request.
+            let label = window.label();
+            if label == "main" || label == "hud" {
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     if let Err(e) = window.hide() {
-                        tracing::warn!("failed to hide main window on close: {e}");
+                        tracing::warn!("failed to hide {label} window on close: {e}");
                     }
                 }
             }

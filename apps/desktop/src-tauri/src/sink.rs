@@ -13,6 +13,14 @@ const HUD_WINDOW_LABEL: &str = "hud";
 /// The desktop notification title shown for error notices.
 const NOTIFICATION_TITLE: &str = "Utter";
 
+/// Emits a `"warning"` notice via a fresh sink — used when a UI action (tray
+/// toggle, HUD cancel) reaches for the dictation runtime but none is running
+/// (e.g. `runtime_boot::boot` itself failed outright at startup), so the
+/// user gets feedback instead of a silent no-op.
+pub(crate) fn notify_no_session(app: &AppHandle) {
+    TauriEventSink::new(app.clone()).notify("warning", "dictation engine is not running");
+}
+
 /// Emits `dictation-state`/`notice` events to every window and shows a
 /// desktop notification for errors. Cheap to construct (just an `AppHandle`
 /// clone), so callers build a fresh one whenever they need to emit rather

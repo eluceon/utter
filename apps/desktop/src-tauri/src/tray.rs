@@ -77,8 +77,12 @@ fn toggle_dictation(app: &AppHandle) {
         .session_ctl
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(handle) = guard.as_ref() {
-        handle.toggle();
+    match guard.as_ref() {
+        Some(handle) => handle.toggle(),
+        None => {
+            drop(guard);
+            crate::sink::notify_no_session(app);
+        }
     }
 }
 

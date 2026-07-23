@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import { defineConfig } from 'vite'
 import { svelte } from '@sveltejs/vite-plugin-svelte'
 
@@ -18,5 +19,12 @@ export default defineConfig({
       // Don't watch the Rust side; the Cargo build handles its own reloads.
       ignored: ['**/src-tauri/**'],
     },
+  },
+
+  // Store/type logic under test is plain TS with no DOM dependency, so the
+  // default `node` environment is enough — no jsdom/happy-dom needed.
+  test: {
+    environment: 'node',
+    include: ['src/**/*.test.ts'],
   },
 })

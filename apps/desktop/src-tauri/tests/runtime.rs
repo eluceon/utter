@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
@@ -309,14 +309,29 @@ fn fake_sink() -> (Arc<FakeSink>, Receiver<Emission>, Notices) {
 }
 
 /// Retrieves the `Sender<AudioFrame>` a `FakeCaptureBackend` stashed once
-/// capture started. Callers must have already observed at least one
-/// `"recording"` state emission (i.e. `Effect::StartCapture` has run) before
-/// calling this.
+/// capture started.
+///
+/// Observing the `"recording"` state emission only proves `dispatch` has
+/// called `session.handle` and emitted the new phase — `emit_state` runs
+/// *before* the loop over effects that actually executes `Effect::StartCapture`
+/// (see `dispatch` in runtime.rs), and that execution happens on the worker
+/// thread while this call runs on the test thread. So there is no
+/// happens-before edge guaranteeing `ctx.capture.start()` (and therefore this
+/// stash) has completed by the time a test's `recv_state` call returns —
+/// only that it's *about to*. Poll with a bounded total wait instead of
+/// asserting immediately.
 fn capture_tx(slot: &Arc<Mutex<Option<Sender<AudioFrame>>>>) -> Sender<AudioFrame> {
-    slot.lock()
-        .expect("lock")
-        .clone()
-        .expect("capture should have started and stashed its sender")
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if let Some(tx) = slot.lock().expect("lock").clone() {
+            return tx;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "capture should have started and stashed its sender within {WAIT:?}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 // ---- tests --------------------------------------------------------------

@@ -8,10 +8,22 @@ license.workspace = true
 utter-core = { path = "../utter-core" }
 whisper-rs = { version = "0.16", optional = true, features = ["tracing_backend"] }
 vosk = { version = "0.3.1", optional = true }
+# reqwest's blocking multipart form types live behind the `multipart` feature,
+# separately from `blocking` itself; added on top of the workspace's base
+# feature set (blocking, json, rustls-tls).
+reqwest = { workspace = true, optional = true, features = ["multipart"] }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+hound = { version = "3", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"
 
 [features]
-default = ["whisper"]
+default = ["whisper", "cloud"]
 whisper = ["dep:whisper-rs"]
 # Not in `default`: requires the libvosk shared library to be discoverable by
 # the linker (see scripts/setup-libvosk.sh), which most machines lack.
 vosk = ["dep:vosk"]
+cloud = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:hound"]

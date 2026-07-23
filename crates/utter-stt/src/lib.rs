@@ -11,3 +11,9 @@ pub mod vosk;
 
 #[cfg(feature = "vosk")]
 pub use vosk::VoskEngine;
+
+#[cfg(feature = "cloud")]
+pub mod cloud;
+
+#[cfg(feature = "cloud")]
+pub use cloud::{CloudEngine, CloudSttConfig};

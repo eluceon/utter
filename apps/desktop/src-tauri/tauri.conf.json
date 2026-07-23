@@ -1,0 +1,57 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Utter",
+  "version": "0.1.0",
+  "identifier": "dev.utter.app",
+  "build": {
+    "frontendDist": "../ui/dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev --prefix ui",
+    "beforeBuildCommand": "npm run build --prefix ui"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Utter",
+        "width": 900,
+        "height": 640,
+        "resizable": true,
+        "fullscreen": false,
+        "visible": true
+      },
+      {
+        "label": "hud",
+        "title": "Utter HUD",
+        "width": 280,
+        "height": 64,
+        "resizable": false,
+        "fullscreen": false,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "shadow": false,
+        "focus": false
+      }
+    ],
+    "trayIcon": {
+      "iconPath": "icons/icon.png"
+    },
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

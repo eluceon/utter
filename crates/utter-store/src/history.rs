@@ -6,12 +6,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, Row};
+use serde::Serialize;
 
 /// The current on-disk schema version, tracked via SQLite's `user_version` pragma.
 const SCHEMA_VERSION: i64 = 1;
 
 /// A single stored dictation history entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HistoryEntry {
     pub id: i64,
     pub created_at: i64,

@@ -10,6 +10,7 @@ use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use serde::Serialize;
 use thiserror::Error;
 
 /// How often the Linux backends (`hotkey_evdev`, `hotkey_x11`) wake up to
@@ -245,7 +246,7 @@ pub fn create_source(spec: &HotkeySpec) -> anyhow::Result<Box<dyn HotkeySource>>
 
 /// A snapshot of the OS-level permissions needed for evdev hotkeys and
 /// uinput-based text injection to work.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PermissionReport {
     /// Whether at least one `/dev/input/event*` node is readable by the
     /// current user (a proxy for `input` group membership).

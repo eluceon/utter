@@ -10,6 +10,7 @@ arboard = { version = "3.6", features = ["wayland-data-control"] }
 crossbeam-channel = { workspace = true }
 evdev = "0.13"
 global-hotkey = "0.8"
+serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 utter-core = { path = "../utter-core" }

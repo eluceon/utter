@@ -2,6 +2,7 @@
 //! command through `tauri::State<AppState>`.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result};
@@ -31,6 +32,15 @@ pub struct AppState {
     /// the next successful `save_settings` spins one up (see
     /// `runtime_boot::rebuild`).
     pub session_ctl: Mutex<Option<RuntimeHandle>>,
+    /// Live mirror of `settings.dictation.hud`, shared with every
+    /// `TauriEventSink` (see `crate::sink`). A plain `RwLock<Settings>` read
+    /// isn't enough on its own: the sink used by an already-running
+    /// dictation `Runtime` is constructed once (at boot or the next
+    /// `rebuild`) and kept for that runtime's whole lifetime, so this needs
+    /// to be a shared, in-place-updatable cell rather than a value read
+    /// fresh at sink-construction time, or a settings change wouldn't reach
+    /// a sink that already exists.
+    pub hud_enabled: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -40,6 +50,7 @@ impl AppState {
     pub fn new() -> Result<Self> {
         let settings =
             utter_store::load(&utter_store::config_path()).context("failed to load settings")?;
+        let hud_enabled = Arc::new(AtomicBool::new(settings.dictation.hud));
 
         let models = Arc::new(ModelManager::new(data_dir()?));
         let history =
@@ -50,6 +61,7 @@ impl AppState {
             models,
             history: Mutex::new(history),
             session_ctl: Mutex::new(None),
+            hud_enabled,
         })
     }
 }

@@ -1,11 +1,15 @@
 //! [`EventSink`] implementation that emits Tauri events to every window and
 //! drives the HUD window's visibility from the dictation phase.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::events::{DictationPhase, DictationState, Notice, NoticeKind};
 use crate::runtime::EventSink;
+use crate::state::AppState;
 
 /// The Tauri window label the HUD lives at (see `tauri.conf.json`).
 const HUD_WINDOW_LABEL: &str = "hud";
@@ -21,23 +25,40 @@ pub(crate) fn notify_no_session(app: &AppHandle) {
     TauriEventSink::new(app.clone()).notify("warning", "dictation engine is not running");
 }
 
+/// Decides whether the HUD window should actually be shown for a given
+/// dictation phase, given the current "Show HUD" preference. Hiding is
+/// never gated on the preference — a HUD that was visible before the
+/// setting was turned off still needs to hide on the next transition back
+/// to idle — only *showing* it is.
+fn should_show_hud(phase_wants_visible: bool, hud_enabled: bool) -> bool {
+    phase_wants_visible && hud_enabled
+}
+
 /// Emits `dictation-state`/`notice` events to every window and shows a
 /// desktop notification for errors. Cheap to construct (just an `AppHandle`
-/// clone), so callers build a fresh one whenever they need to emit rather
-/// than threading one instance around.
+/// clone plus a shared flag lookup), so callers build a fresh one whenever
+/// they need to emit rather than threading one instance around.
 pub struct TauriEventSink {
     app: AppHandle,
+    /// Shared with `AppState::hud_enabled` (see its docs): a live mirror of
+    /// `settings.dictation.hud`, kept in-place-updatable so a sink built at
+    /// boot (or a previous `rebuild`) still observes later settings changes
+    /// without needing to be reconstructed.
+    hud_enabled: Arc<AtomicBool>,
 }
 
 impl TauriEventSink {
     pub fn new(app: AppHandle) -> Self {
-        Self { app }
+        let hud_enabled = app.state::<AppState>().hud_enabled.clone();
+        Self { app, hud_enabled }
     }
 
     /// Shows or hides the HUD window, logging (rather than propagating) any
     /// failure to find or toggle it — a missing HUD window should never take
     /// the dictation pipeline down with it.
     fn set_hud_visible(&self, visible: bool) {
+        let visible = should_show_hud(visible, self.hud_enabled.load(Ordering::Relaxed));
+
         let Some(hud) = self.app.get_webview_window(HUD_WINDOW_LABEL) else {
             tracing::warn!(
                 "hud window not found; cannot {}",
@@ -143,5 +164,17 @@ mod tests {
         assert_eq!(parse_kind("error"), NoticeKind::Error);
         assert_eq!(parse_kind("info"), NoticeKind::Info);
         assert_eq!(parse_kind("whatever"), NoticeKind::Info);
+    }
+
+    #[test]
+    fn hud_never_shown_when_disabled_regardless_of_phase() {
+        assert!(!should_show_hud(true, false));
+        assert!(!should_show_hud(false, false));
+    }
+
+    #[test]
+    fn hud_follows_phase_when_enabled() {
+        assert!(should_show_hud(true, true));
+        assert!(!should_show_hud(false, true));
     }
 }

@@ -29,6 +29,22 @@ mod linux_impl {
     /// not per injection.
     const DEVICE_SETTLE_DELAY: Duration = Duration::from_millis(200);
 
+    /// Pause after each synthesized character while typing.
+    ///
+    /// Without it, a long string is written to `/dev/uinput` as one
+    /// uninterrupted burst: dozens of key events land in the kernel's
+    /// per-reader evdev queue faster than the reading side (the
+    /// compositor's input thread) can drain it, and once that queue fills
+    /// the kernel silently drops the oldest queued events instead of
+    /// blocking — the synthesized text arrives with a chunk missing from
+    /// the middle, with no error surfaced anywhere. Confirmed by capturing
+    /// the raw event stream from this backend's own uinput device while
+    /// typing an unthrottled ~200-character string: events were missing
+    /// entirely from the capture (not just delayed), with one abnormally
+    /// large gap in an otherwise sub-millisecond event cadence. Spacing
+    /// characters out gives the reader a chance to keep the queue drained.
+    const INTER_KEY_DELAY: Duration = Duration::from_millis(8);
+
     /// Maps an ASCII character to the evdev key code that types it on a
     /// standard US QWERTY layout, plus whether Shift must be held.
     ///
@@ -150,7 +166,8 @@ mod linux_impl {
         pub fn type_text(&mut self, text: &str) -> Result<(), InjectError> {
             validate_typeable(text)?;
 
-            for c in text.chars() {
+            let mut chars = text.chars().peekable();
+            while let Some(c) = chars.next() {
                 // Unwrap-free by construction: validate_typeable already
                 // confirmed every character maps to a key.
                 if let Some((code, shift)) = char_to_key(c) {
@@ -159,6 +176,11 @@ mod linux_impl {
                     } else {
                         self.chord(&[code])?;
                     }
+                }
+                // See `INTER_KEY_DELAY`: skip the sleep after the very last
+                // character, there is nothing left to race.
+                if chars.peek().is_some() {
+                    std::thread::sleep(INTER_KEY_DELAY);
                 }
             }
 

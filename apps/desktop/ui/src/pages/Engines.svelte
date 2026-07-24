@@ -46,12 +46,18 @@
   }
 
   onMount(async () => {
-    await refreshModels()
-    try {
-      sttConfigured = await api.hasApiKey('stt')
-    } catch {
-      sttConfigured = false
-    }
+    // These two loads are independent of each other — run them concurrently
+    // instead of stalling the whole mount on the first one finishing.
+    await Promise.all([
+      refreshModels(),
+      (async () => {
+        try {
+          sttConfigured = await api.hasApiKey('stt')
+        } catch {
+          sttConfigured = false
+        }
+      })(),
+    ])
     api.onModelProgress((p) => {
       progress = { ...progress, [p.id]: { done: p.done, total: p.total } }
     }).then((fn) => {

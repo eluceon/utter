@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Utter desktop app shell (Tauri)"
-rust-version = "1.77.2"
 
 [lib]
 name = "utter_desktop_lib"

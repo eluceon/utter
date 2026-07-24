@@ -73,7 +73,8 @@ guide](https://tauri.app/start/prerequisites/) for other distributions):
 
 ```sh
 sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev \
-  libayatana-appindicator3-dev librsvg2-dev
+  libayatana-appindicator3-dev librsvg2-dev \
+  pkg-config build-essential cmake
 ```
 
 You'll also need Node.js 20+ and a stable Rust toolchain.

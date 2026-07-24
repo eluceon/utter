@@ -47,10 +47,12 @@ struct FakeSttEngine {
     calls: Arc<Mutex<Vec<CallRecord>>>,
     partial: Option<String>,
     finish_delay: Duration,
+    begin_opts: Arc<Mutex<Vec<TranscribeOptions>>>,
 }
 
 impl SttEngine for FakeSttEngine {
-    fn begin(&mut self, _opts: &TranscribeOptions) -> Result<(), SttError> {
+    fn begin(&mut self, opts: &TranscribeOptions) -> Result<(), SttError> {
+        self.begin_opts.lock().expect("lock").push(opts.clone());
         Ok(())
     }
 
@@ -237,6 +239,8 @@ struct DepsBuilder {
     history: Option<HistoryRepo>,
     silence: Option<Duration>,
     capture_tx_slot: Arc<Mutex<Option<Sender<AudioFrame>>>>,
+    dictionary_terms: Vec<String>,
+    begin_opts: Arc<Mutex<Vec<TranscribeOptions>>>,
 }
 
 impl DepsBuilder {
@@ -256,6 +260,8 @@ impl DepsBuilder {
             history: None,
             silence: None,
             capture_tx_slot: Arc::new(Mutex::new(None)),
+            dictionary_terms: Vec::new(),
+            begin_opts: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -273,6 +279,7 @@ impl DepsBuilder {
                 calls: self.calls,
                 partial: self.partial,
                 finish_delay: self.finish_delay,
+                begin_opts: self.begin_opts,
             }),
             refiner,
             injector: Box::new(FakeInjector {
@@ -292,6 +299,7 @@ impl DepsBuilder {
             tone: Tone::Clean,
             language: None,
             engine_label: "fake-engine".to_string(),
+            dictionary_terms: self.dictionary_terms,
         }
     }
 }
@@ -454,6 +462,65 @@ fn dictionary_rule_applied_before_injection_and_history() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].raw_text, "open the pod bay doors");
     assert_eq!(entries[0].final_text, "open the airlock bay doors");
+}
+
+#[test]
+fn dictionary_terms_are_passed_to_engine_as_initial_prompt() {
+    let begin_opts = Arc::new(Mutex::new(Vec::new()));
+    let (sink, states_rx, _notices) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
+    builder.dictionary_terms = vec!["SQLite".to_string(), "Tauri".to_string()];
+    builder.begin_opts = begin_opts.clone();
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+    hotkey_tx
+        .send(HotkeyEvent::Released)
+        .expect("send released");
+    assert_eq!(recv_state(&states_rx), "transcribing");
+    assert_eq!(recv_state(&states_rx), "injecting");
+    assert_eq!(recv_state(&states_rx), "idle");
+
+    let opts = begin_opts.lock().expect("lock");
+    assert_eq!(opts.len(), 1);
+    assert_eq!(opts[0].initial_prompt, Some("SQLite, Tauri".to_string()));
+    drop(opts);
+
+    handle.shutdown();
+}
+
+#[test]
+fn empty_dictionary_terms_produce_no_initial_prompt() {
+    let begin_opts = Arc::new(Mutex::new(Vec::new()));
+    let (sink, states_rx, _notices) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
+    builder.begin_opts = begin_opts.clone();
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+    hotkey_tx
+        .send(HotkeyEvent::Released)
+        .expect("send released");
+    assert_eq!(recv_state(&states_rx), "transcribing");
+    assert_eq!(recv_state(&states_rx), "injecting");
+    assert_eq!(recv_state(&states_rx), "idle");
+
+    let opts = begin_opts.lock().expect("lock");
+    assert_eq!(opts.len(), 1);
+    assert_eq!(opts[0].initial_prompt, None);
+    drop(opts);
+
+    handle.shutdown();
 }
 
 #[test]

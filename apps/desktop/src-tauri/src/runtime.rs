@@ -184,6 +184,11 @@ pub struct RuntimeDeps {
     pub language: Option<String>,
     /// Recorded on each history entry (e.g. `"whisper"`, `"vosk"`, `"cloud"`).
     pub engine_label: String,
+    /// User-configured dictionary terms (proper nouns, jargon, ...), passed
+    /// to the STT engine as an `initial_prompt` hint on every `begin()` call
+    /// so the engine is more likely to recognize them in the first place —
+    /// distinct from `rules`, which rewrite the transcript after the fact.
+    pub dictionary_terms: Vec<String>,
 }
 
 /// Messages sent from a [`RuntimeHandle`] to the worker thread.
@@ -301,6 +306,7 @@ struct WorkerCtx {
     language: Option<String>,
     engine_label: String,
     mode: DictationMode,
+    dictionary_terms: Vec<String>,
 
     sink: Arc<dyn EventSink>,
     // Kept alive for the runtime's whole lifetime (even with no capture
@@ -351,6 +357,7 @@ impl WorkerCtx {
             language: deps.language,
             engine_label: deps.engine_label,
             mode: deps.mode,
+            dictionary_terms: deps.dictionary_terms,
             sink,
             audio_tx,
             audio_rx,
@@ -530,9 +537,14 @@ fn start_capture(ctx: &mut WorkerCtx) {
         .silence
         .map(|hold| SilenceDetector::new(ctx.vad_sensitivity, hold));
 
+    let initial_prompt = if ctx.dictionary_terms.is_empty() {
+        None
+    } else {
+        Some(ctx.dictionary_terms.join(", "))
+    };
     let opts = TranscribeOptions {
         language: ctx.language.clone(),
-        initial_prompt: None,
+        initial_prompt,
     };
     // `Session` has no event for "capture failed to start" (see the module
     // doc comment): the cleanest recovery available here is to notify and

@@ -182,6 +182,7 @@ fn build_deps(
         tone: settings.refine.tone,
         language: settings.general.language.clone(),
         engine_label: engine_label(settings.engine.active).to_string(),
+        dictionary_terms: settings.dictionary.terms.clone(),
     };
 
     (deps, notices)

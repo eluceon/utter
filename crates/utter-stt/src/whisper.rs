@@ -172,6 +172,14 @@ fn run_full_inference(
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
+    // Ask whisper.cpp itself to suppress blank output and non-speech
+    // tokens. This reduces but does not eliminate bracketed placeholders
+    // like `[BLANK_AUDIO]` for a silent/non-speech segment, since those are
+    // emitted as a segment's whole text rather than produced by individual
+    // suppressible tokens — see `is_non_speech_annotation` for the
+    // second, defensive layer.
+    params.set_suppress_blank(true);
+    params.set_suppress_nst(true);
     // `None` means "auto" to whisper.cpp, same as not setting a language at all.
     params.set_language(opts.language.as_deref());
     if let Some(prompt) = &opts.initial_prompt {
@@ -184,19 +192,17 @@ fn run_full_inference(
 
     // `set_single_segment(true)` above means whisper.cpp should only ever
     // produce one segment, but segments are still joined defensively (with a
-    // single space, dropping any empty ones) rather than assumed to be
-    // exactly one, so a future change to that parameter can't silently glue
-    // words together with no separator.
-    let mut segments = Vec::new();
+    // single space, dropping any empty or non-speech-annotation ones)
+    // rather than assumed to be exactly one, so a future change to that
+    // parameter can't silently glue words together with no separator.
+    let mut raw_segments = Vec::new();
     for segment in state.as_iter() {
         let segment_text = segment
             .to_str_lossy()
             .map_err(|e| SttError::Engine(format!("failed to read segment text: {e}")))?;
-        let trimmed = segment_text.trim();
-        if !trimmed.is_empty() {
-            segments.push(trimmed.to_string());
-        }
+        raw_segments.push(segment_text.into_owned());
     }
+    let text = join_speech_segments(raw_segments.iter().map(String::as_str));
 
     let language = match &opts.language {
         Some(lang) => Some(lang.clone()),
@@ -206,10 +212,76 @@ fn run_full_inference(
         }
     };
 
-    Ok(Transcript {
-        text: segments.join(" "),
-        language,
-    })
+    Ok(Transcript { text, language })
+}
+
+/// Reports whether `s`, once trimmed, is *entirely* one of whisper.cpp's
+/// known non-speech placeholder annotations rather than real transcribed
+/// speech: `[BLANK_AUDIO]`, `[_BEG_]`, `[BLANK]`, and the bracketed or
+/// parenthesized single-topic family (`[silence]`, `(silence)`, `[music]`,
+/// `[applause]`, `[noise]`, `[inaudible]`, `[no speech]`), allowing extra
+/// whitespace inside the brackets (e.g. `[ Silence ]`) and any case.
+///
+/// Deliberately conservative: a segment is only ever dropped if it matches
+/// one of these known shapes *exactly* over its whole (trimmed) text, never
+/// as a substring. A segment like `[BLANK_AUDIO] and more words` — real
+/// speech alongside an annotation, however unlikely — is left alone, as is
+/// arbitrary bracketed text a user might legitimately dictate, e.g.
+/// `[TODO]`.
+fn is_non_speech_annotation(s: &str) -> bool {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    const EXACT_MARKERS: [&str; 3] = ["[BLANK_AUDIO]", "[_BEG_]", "[BLANK]"];
+    if EXACT_MARKERS
+        .iter()
+        .any(|marker| trimmed.eq_ignore_ascii_case(marker))
+    {
+        return true;
+    }
+
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('(')
+                .and_then(|rest| rest.strip_suffix(')'))
+        });
+
+    let Some(inner) = inner else {
+        return false;
+    };
+
+    const NON_SPEECH_TOPICS: [&str; 6] = [
+        "silence",
+        "music",
+        "applause",
+        "noise",
+        "inaudible",
+        "no speech",
+    ];
+    let inner_lower = inner.trim().to_ascii_lowercase();
+    NON_SPEECH_TOPICS.contains(&inner_lower.as_str())
+}
+
+/// Joins whisper.cpp's raw segment texts into one trimmed transcript,
+/// dropping any segment that is empty (after trimming) or is entirely a
+/// known non-speech annotation (see [`is_non_speech_annotation`]).
+///
+/// Pulled out of [`run_full_inference`] as a free function over plain
+/// strings — rather than whisper.cpp segment handles — so the filtering
+/// behavior is unit-testable without loading a real model, including the
+/// "an utterance that was pure non-speech becomes an empty transcript"
+/// case that the runtime relies on to skip injecting `[BLANK_AUDIO]`.
+fn join_speech_segments<'a>(raw_segments: impl Iterator<Item = &'a str>) -> String {
+    raw_segments
+        .map(str::trim)
+        .filter(|trimmed| !trimmed.is_empty() && !is_non_speech_annotation(trimmed))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// whisper-rs converts strings to `CString` internally and panics on
@@ -261,6 +333,83 @@ mod tests {
         // present-but-invalid file is reported as a generic engine error
         // rather than `ModelNotFound`.
         assert!(matches!(err, SttError::Engine(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn recognizes_known_non_speech_markers() {
+        for marker in [
+            "[BLANK_AUDIO]",
+            "[_BEG_]",
+            "[BLANK]",
+            "[blank_audio]",
+            "[Blank_Audio]",
+        ] {
+            assert!(
+                is_non_speech_annotation(marker),
+                "{marker:?} should be recognized as a non-speech marker"
+            );
+        }
+    }
+
+    #[test]
+    fn recognizes_bracketed_or_parenthesized_topic_words_with_odd_spacing_and_case() {
+        for marker in [
+            "[silence]",
+            "[ Silence ]",
+            "(silence)",
+            "[MUSIC]",
+            "[ music ]",
+            "[applause]",
+            "[noise]",
+            "[inaudible]",
+            "[no speech]",
+            "[No Speech]",
+        ] {
+            assert!(
+                is_non_speech_annotation(marker),
+                "{marker:?} should be recognized as a non-speech marker"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_flag_legitimate_bracketed_user_text() {
+        for text in ["[TODO]", "hello", "[todo item]", "(reminder)", ""] {
+            assert!(
+                !is_non_speech_annotation(text),
+                "{text:?} must not be treated as a non-speech marker"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_flag_a_segment_that_merely_contains_a_marker_as_a_substring() {
+        // Only a segment whose *entire* trimmed text is the annotation is
+        // dropped — real speech alongside one is left alone.
+        assert!(!is_non_speech_annotation("[BLANK_AUDIO] and more words"));
+        assert!(!is_non_speech_annotation("well [BLANK_AUDIO] anyway"));
+    }
+
+    #[test]
+    fn join_speech_segments_drops_pure_non_speech_segments_to_empty() {
+        let joined = join_speech_segments(std::iter::once("[BLANK_AUDIO]"));
+        assert_eq!(
+            joined, "",
+            "an utterance that was pure non-speech must join to empty text"
+        );
+    }
+
+    #[test]
+    fn join_speech_segments_keeps_real_speech_and_drops_annotations_alongside_it() {
+        let joined =
+            join_speech_segments(["hello there", "[BLANK_AUDIO]", "how are you"].into_iter());
+        assert_eq!(joined, "hello there how are you");
+    }
+
+    #[test]
+    fn join_speech_segments_trims_and_drops_empty_segments() {
+        let joined = join_speech_segments(["  hello  ", "", "   "].into_iter());
+        assert_eq!(joined, "hello");
     }
 
     #[test]

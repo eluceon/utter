@@ -62,6 +62,34 @@ a:focus-visible,
   color: var(--accent-contrast);
 }
 
+/* Interactive-control affordance, defined once for every real button/select
+   in the app rather than copy-pasted per component or page: a pointer
+   cursor, a subtle hover surface shift, and a pressed state. Anything more
+   specific (a component's own `:hover`/`:active` rule, e.g. an accent
+   "primary" button) naturally wins on specificity and can override this.
+   Scoped to plain `button`/`select` elements — the HUD's `role="button"`
+   div is a separate, bespoke-styled floating overlay, not a themed settings
+   control, and isn't part of this affordance system. */
+button:not(:disabled),
+select:not(:disabled) {
+  cursor: pointer;
+}
+
+button:disabled,
+select:disabled {
+  cursor: not-allowed;
+}
+
+button:not(:disabled):hover,
+select:not(:disabled):hover {
+  background-color: var(--surface-hover);
+}
+
+button:not(:disabled):active,
+select:not(:disabled):active {
+  transform: translateY(1px);
+}
+
 code,
 pre {
   font-family: var(--font-mono);

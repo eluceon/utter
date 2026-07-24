@@ -452,9 +452,18 @@
     font-weight: 600;
   }
 
+  button.primary:not(:disabled):hover {
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
+  }
+
   button.ghost {
     background: none;
     border-color: transparent;
     color: var(--text-muted);
+  }
+
+  button.ghost:not(:disabled):hover {
+    background: var(--surface-hover);
   }
 </style>

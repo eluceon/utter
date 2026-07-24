@@ -199,6 +199,10 @@
     background: var(--bg-elevated);
   }
 
+  a:active:not(.active) {
+    background: var(--surface-hover);
+  }
+
   a.active {
     background: var(--accent);
     color: var(--accent-contrast);

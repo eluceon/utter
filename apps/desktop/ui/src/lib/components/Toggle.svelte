@@ -74,6 +74,14 @@
     transform: translateX(16px);
   }
 
+  .toggle:not(.disabled):hover .track {
+    filter: brightness(1.15);
+  }
+
+  .toggle:not(.disabled):active .track {
+    filter: brightness(0.9);
+  }
+
   input:focus-visible + .track {
     outline: 2px solid var(--accent);
     outline-offset: 2px;

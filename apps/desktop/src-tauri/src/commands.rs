@@ -1,6 +1,19 @@
 //! Tauri command handlers. Every command returns `Result<_, String>` (never
 //! panics) so a failure surfaces as a rejected promise in the frontend
 //! rather than crashing the app.
+//!
+//! In Tauri 2, a *non-async* `#[tauri::command]` runs on the main thread —
+//! the same thread that pumps the window/webview event loop. Every command
+//! here that touches disk, the keyring (a D-Bus round trip to Secret
+//! Service), SQLite, ALSA, or the network is therefore `async fn` and hands
+//! its actual work to `tauri::async_runtime::spawn_blocking`, mirroring
+//! `download_model`'s existing pattern: fetch `AppState` from the moved
+//! `AppHandle` *inside* the blocking closure (a `tauri::State` guard can't
+//! itself be moved across the closure's `'static` boundary). `cancel_dictation`
+//! is the one exception left synchronous: per `RuntimeHandle`'s own docs,
+//! every method besides `shutdown` just posts a message to a channel and
+//! returns immediately, so there is no blocking I/O to move off the main
+//! thread there.
 
 use std::time::{Duration, Instant};
 
@@ -27,25 +40,42 @@ const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(500);
 const PROGRESS_MIN_PERCENT_STEP: u64 = 1;
 
 #[tauri::command]
-pub fn get_settings(state: State<AppState>) -> Settings {
-    // A poisoned lock only indicates some other reader/writer panicked while
-    // holding it; the settings value itself is still intact, so recover it
-    // rather than propagating a panic through a command that can't return
-    // an error per its (binding) signature.
-    state
-        .settings
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+pub async fn get_settings(app: AppHandle) -> Settings {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        // A poisoned lock only indicates some other reader/writer panicked
+        // while holding it; the settings value itself is still intact, so
+        // recover it rather than propagating a panic through a command that
+        // can't return an error per its (binding) signature.
+        //
+        // Bound to a local rather than returned directly: the read guard
+        // borrows from `state`, and as the closure's tail expression its
+        // temporary scope would otherwise outlive `state` itself.
+        let settings = state
+            .settings
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        settings
+    })
+    .await
+    // A `JoinError` here means the blocking task itself panicked, not that
+    // settings are unavailable; falling back to defaults keeps this
+    // infallible command from needing to propagate an error it was never
+    // designed to carry.
+    .unwrap_or_default()
 }
 
 #[tauri::command]
-pub fn save_settings(
-    app: AppHandle,
-    state: State<AppState>,
-    settings: Settings,
-) -> Result<(), String> {
-    persist_and_apply(&app, &state, settings)
+pub async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        persist_and_apply(&app, &state, settings)
+    })
+    .await
+    .map_err(|e| format!("save_settings task failed to run: {e}"))?;
+
+    result
 }
 
 /// Saves `settings` to disk, rebuilds the live dictation runtime from them
@@ -58,9 +88,10 @@ pub fn save_settings(
 /// Holds the write lock across persist + apply + in-memory update so two
 /// concurrent callers are fully serialized instead of interleaving their
 /// disk write / apply / in-memory steps (which could otherwise leave the
-/// on-disk file and in-memory state with different winners). This runs on
-/// tauri's threadpool rather than an async/UI thread, and `utter_store::save`
-/// is a small TOML write, so holding a `std::sync::RwLock` write guard across
+/// on-disk file and in-memory state with different winners). Callers run
+/// this on a blocking-task thread (see `save_settings` above) or a tray menu
+/// callback, never the async/UI thread directly, and `utter_store::save` is
+/// a small TOML write, so holding a `std::sync::RwLock` write guard across
 /// it (and the runtime rebuild) is fine.
 pub(crate) fn persist_and_apply(
     app: &AppHandle,
@@ -75,6 +106,13 @@ pub(crate) fn persist_and_apply(
     utter_store::save(&utter_store::config_path(), &settings)
         .map_err(|e| format!("failed to save settings: {e}"))?;
 
+    // Keep the live HUD-visibility flag (shared with every `TauriEventSink`,
+    // including one built long before this call — see
+    // `AppState::hud_enabled`'s docs) in sync with the new setting.
+    state
+        .hud_enabled
+        .store(settings.dictation.hud, std::sync::atomic::Ordering::Relaxed);
+
     crate::runtime_boot::rebuild(app, state, &settings)?;
 
     *guard = settings;
@@ -84,6 +122,10 @@ pub(crate) fn persist_and_apply(
 
 /// Cancels the in-flight dictation session, if any (a no-op while idle).
 /// Backs the HUD's "click anywhere to cancel" affordance.
+///
+/// Left synchronous: `RuntimeHandle::cancel` only posts a message to the
+/// worker thread's channel and returns immediately (see its docs), so there
+/// is no blocking I/O here to move off the main thread.
 #[tauri::command]
 pub fn cancel_dictation(app: AppHandle, state: State<AppState>) -> Result<(), String> {
     let guard = state
@@ -101,13 +143,20 @@ pub fn cancel_dictation(app: AppHandle, state: State<AppState>) -> Result<(), St
 }
 
 #[tauri::command]
-pub fn list_devices() -> Vec<String> {
-    utter_audio::list_input_devices()
+pub async fn list_devices() -> Vec<String> {
+    tauri::async_runtime::spawn_blocking(utter_audio::list_input_devices)
+        .await
+        .unwrap_or_default()
 }
 
 #[tauri::command]
-pub fn list_models(state: State<AppState>) -> Vec<ModelInfo> {
-    state.models.catalog()
+pub async fn list_models(app: AppHandle) -> Vec<ModelInfo> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        state.models.catalog()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 #[tauri::command]
@@ -190,47 +239,75 @@ fn should_emit_progress(
 }
 
 #[tauri::command]
-pub fn remove_model(state: State<AppState>, id: String) -> Result<(), String> {
-    state
-        .models
-        .remove(&id)
-        .map_err(|e| format!("failed to remove model '{id}': {e}"))
+pub async fn remove_model(app: AppHandle, id: String) -> Result<(), String> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        state
+            .models
+            .remove(&id)
+            .map_err(|e| format!("failed to remove model '{id}': {e}"))
+    })
+    .await
+    .map_err(|e| format!("remove_model task failed to run: {e}"))?;
+
+    result
 }
 
 #[tauri::command]
-pub fn history_list(
-    state: State<AppState>,
+pub async fn history_list(
+    app: AppHandle,
     query: Option<String>,
 ) -> Result<Vec<HistoryEntry>, String> {
-    let history = state
-        .history
-        .lock()
-        .map_err(|_| "history lock poisoned".to_string())?;
-    history
-        .list(query.as_deref(), HISTORY_LIST_LIMIT)
-        .map_err(|e| format!("failed to list history: {e}"))
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let history = state
+            .history
+            .lock()
+            .map_err(|_| "history lock poisoned".to_string())?;
+        history
+            .list(query.as_deref(), HISTORY_LIST_LIMIT)
+            .map_err(|e| format!("failed to list history: {e}"))
+    })
+    .await
+    .map_err(|e| format!("history_list task failed to run: {e}"))?;
+
+    result
 }
 
 #[tauri::command]
-pub fn history_delete(state: State<AppState>, id: i64) -> Result<(), String> {
-    let history = state
-        .history
-        .lock()
-        .map_err(|_| "history lock poisoned".to_string())?;
-    history
-        .delete(id)
-        .map_err(|e| format!("failed to delete history entry {id}: {e}"))
+pub async fn history_delete(app: AppHandle, id: i64) -> Result<(), String> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let history = state
+            .history
+            .lock()
+            .map_err(|_| "history lock poisoned".to_string())?;
+        history
+            .delete(id)
+            .map_err(|e| format!("failed to delete history entry {id}: {e}"))
+    })
+    .await
+    .map_err(|e| format!("history_delete task failed to run: {e}"))?;
+
+    result
 }
 
 #[tauri::command]
-pub fn history_clear(state: State<AppState>) -> Result<(), String> {
-    let history = state
-        .history
-        .lock()
-        .map_err(|_| "history lock poisoned".to_string())?;
-    history
-        .clear()
-        .map_err(|e| format!("failed to clear history: {e}"))
+pub async fn history_clear(app: AppHandle) -> Result<(), String> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let history = state
+            .history
+            .lock()
+            .map_err(|_| "history lock poisoned".to_string())?;
+        history
+            .clear()
+            .map_err(|e| format!("failed to clear history: {e}"))
+    })
+    .await
+    .map_err(|e| format!("history_clear task failed to run: {e}"))?;
+
+    result
 }
 
 /// Validates that `service` is one of the two api-key identities the app
@@ -245,50 +322,72 @@ fn validate_key_service(service: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn set_api_key(service: String, key: String) -> Result<(), String> {
-    validate_key_service(&service)?;
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &service)
-        .map_err(|e| format!("failed to open keyring entry for '{service}': {e}"))?;
-    entry
-        .set_password(&key)
-        .map_err(|e| format!("failed to store api key for '{service}': {e}"))
+pub async fn set_api_key(service: String, key: String) -> Result<(), String> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        validate_key_service(&service)?;
+        let entry = keyring::Entry::new(KEYRING_SERVICE, &service)
+            .map_err(|e| format!("failed to open keyring entry for '{service}': {e}"))?;
+        entry
+            .set_password(&key)
+            .map_err(|e| format!("failed to store api key for '{service}': {e}"))
+    })
+    .await
+    .map_err(|e| format!("set_api_key task failed to run: {e}"))?;
+
+    result
 }
 
 #[tauri::command]
-pub fn has_api_key(service: String) -> bool {
-    if validate_key_service(&service).is_err() {
-        return false;
-    }
-    keyring_password(&service).is_some()
+pub async fn has_api_key(service: String) -> bool {
+    tauri::async_runtime::spawn_blocking(move || {
+        if validate_key_service(&service).is_err() {
+            return false;
+        }
+        keyring_password(&service).is_some()
+    })
+    .await
+    .unwrap_or(false)
 }
 
 #[tauri::command]
-pub fn permissions_report() -> PermissionReport {
-    utter_inject::check_permissions()
+pub async fn permissions_report() -> PermissionReport {
+    tauri::async_runtime::spawn_blocking(utter_inject::check_permissions)
+        .await
+        // Only reachable if the blocking task itself panicked; re-probing
+        // synchronously here is a fallback for that exceptional path, not
+        // the normal one (which never blocks the caller's own thread).
+        .unwrap_or_else(|_| utter_inject::check_permissions())
 }
 
 #[tauri::command]
-pub fn test_refine(state: State<AppState>, sample: String) -> Result<String, String> {
-    let settings = state
-        .settings
-        .read()
-        .map_err(|_| "settings lock poisoned".to_string())?
-        .clone();
+pub async fn test_refine(app: AppHandle, sample: String) -> Result<String, String> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let settings = state
+            .settings
+            .read()
+            .map_err(|_| "settings lock poisoned".to_string())?
+            .clone();
 
-    let api_key = keyring_password(REFINE_KEY_SERVICE);
+        let api_key = keyring_password(REFINE_KEY_SERVICE);
 
-    let refiner = LlmRefiner::new(
-        LlmConfig {
-            base_url: settings.refine.base_url,
-            api_key,
-            model: settings.refine.model,
-            timeout: Duration::from_secs(settings.refine.timeout_secs),
-        },
-        settings.dictionary.terms,
-    );
+        let refiner = LlmRefiner::new(
+            LlmConfig {
+                base_url: settings.refine.base_url,
+                api_key,
+                model: settings.refine.model,
+                timeout: Duration::from_secs(settings.refine.timeout_secs),
+            },
+            settings.dictionary.terms,
+        );
 
-    TextRefiner::refine(&refiner, &sample, settings.refine.tone)
-        .map_err(|e| format!("refine failed: {e}"))
+        TextRefiner::refine(&refiner, &sample, settings.refine.tone)
+            .map_err(|e| format!("refine failed: {e}"))
+    })
+    .await
+    .map_err(|e| format!("test_refine task failed to run: {e}"))?;
+
+    result
 }
 
 #[cfg(test)]
@@ -395,6 +494,8 @@ mod tests {
 
     #[test]
     fn has_api_key_rejects_unknown_service_without_touching_keyring() {
-        assert!(!has_api_key("nonsense".to_string()));
+        assert!(!tauri::async_runtime::block_on(has_api_key(
+            "nonsense".to_string()
+        )));
     }
 }

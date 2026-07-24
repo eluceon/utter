@@ -82,10 +82,22 @@
     }, 2000)
   }
 
-  let testSample = $state('hello world this is a test of the refinement pipeline')
+  // The sample text is a testing convenience, not a real app setting, so it
+  // is not part of the Rust `Settings` schema. It's persisted to
+  // localStorage instead (mirroring the ONBOARDED_KEY pattern in App.svelte)
+  // so it survives both page navigation (which unmounts/remounts this
+  // component) and an app restart.
+  const SAMPLE_TEXT_KEY = 'utter.refinement.sampleText'
+  const DEFAULT_SAMPLE_TEXT = 'hello world this is a test of the refinement pipeline'
+
+  let testSample = $state(localStorage.getItem(SAMPLE_TEXT_KEY) ?? DEFAULT_SAMPLE_TEXT)
   let testResult = $state('')
   let testError = $state('')
   let testing = $state(false)
+
+  $effect(() => {
+    localStorage.setItem(SAMPLE_TEXT_KEY, testSample)
+  })
 
   async function runTest() {
     testing = true

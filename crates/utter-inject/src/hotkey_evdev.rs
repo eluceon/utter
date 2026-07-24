@@ -52,7 +52,10 @@ const ALPHABET_KEYS: [KeyCode; 26] = [
 
 /// True if `dev` supports every letter key, i.e. it looks like an actual
 /// keyboard rather than a mouse, joystick, or media-control device.
-fn looks_like_keyboard(dev: &Device) -> bool {
+///
+/// `pub(crate)` so `crate::modifier_wait`'s live evdev probe can reuse the
+/// same "is this device a keyboard" heuristic rather than duplicating it.
+pub(crate) fn looks_like_keyboard(dev: &Device) -> bool {
     let Some(keys) = dev.supported_keys() else {
         return false;
     };

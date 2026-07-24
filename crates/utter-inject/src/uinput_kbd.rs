@@ -15,9 +15,19 @@
 mod linux_impl {
     use std::str::FromStr;
 
+    use std::time::Duration;
+
     use evdev::uinput::VirtualDevice;
     use evdev::{AttributeSet, InputEvent, KeyCode, KeyEvent};
     use utter_core::InjectError;
+
+    /// How long to wait, once, right after registering a brand-new uinput
+    /// device, before it is used to synthesize any key events. Compositors
+    /// (Wayland in particular) enumerate input devices asynchronously; a
+    /// device used the instant it's created can be invisible to the
+    /// compositor for the first event or two. Paid once at construction,
+    /// not per injection.
+    const DEVICE_SETTLE_DELAY: Duration = Duration::from_millis(200);
 
     /// Maps an ASCII character to the evdev key code that types it on a
     /// standard US QWERTY layout, plus whether Shift must be held.
@@ -122,6 +132,10 @@ mod linux_impl {
                 .map_err(|e| {
                     InjectError::Backend(format!("failed to create uinput device: {e}"))
                 })?;
+
+            // Let the compositor pick up the new device before it's ever
+            // used; see `DEVICE_SETTLE_DELAY`.
+            std::thread::sleep(DEVICE_SETTLE_DELAY);
 
             Ok(Self { device })
         }

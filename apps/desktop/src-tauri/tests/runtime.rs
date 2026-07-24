@@ -412,6 +412,51 @@ fn refiner_failure_injects_raw_and_notifies() {
 }
 
 #[test]
+fn dictionary_rule_applied_before_injection_and_history() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("history.sqlite3");
+    let history = HistoryRepo::open(&db_path).expect("open history db");
+
+    let injected = Arc::new(Mutex::new(Vec::new()));
+    let (sink, states_rx, _notices) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("open the pod bay doors")));
+    builder.rules = vec![ReplaceRule {
+        heard: "pod".to_string(),
+        write: "airlock".to_string(),
+    }];
+    builder.injected = injected.clone();
+    builder.history = Some(history);
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+    hotkey_tx
+        .send(HotkeyEvent::Released)
+        .expect("send released");
+    assert_eq!(recv_state(&states_rx), "transcribing");
+    assert_eq!(recv_state(&states_rx), "injecting");
+    assert_eq!(recv_state(&states_rx), "idle");
+
+    assert_eq!(
+        *injected.lock().expect("lock"),
+        vec!["open the airlock bay doors"],
+        "the dictionary rule must be applied to the raw transcript before injection"
+    );
+
+    handle.shutdown();
+
+    let verify = HistoryRepo::open(&db_path).expect("reopen history db");
+    let entries = verify.list(None, 10).expect("list history");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].raw_text, "open the pod bay doors");
+    assert_eq!(entries[0].final_text, "open the airlock bay doors");
+}
+
+#[test]
 fn snippet_trigger_bypasses_refiner() {
     let refine_calls = Arc::new(AtomicUsize::new(0));
     let injected = Arc::new(Mutex::new(Vec::new()));

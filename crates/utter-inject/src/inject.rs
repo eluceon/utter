@@ -94,6 +94,14 @@ impl TypeInjector {
 
 impl TextInjector for TypeInjector {
     fn inject(&mut self, text: &str) -> Result<InjectionMethod, InjectError> {
+        // Same push-to-talk modifier-release race as `ClipboardPasteInjector`
+        // (see `crate::modifier_wait`): `type_text` synthesizes Shift+letter
+        // chords through the same virtual keyboard, so a physical Super/Ctrl
+        // still down would just as readily turn one into an intercepted
+        // shortcut instead of a typed character. Bounded (at most ~1s), so
+        // it can never hang injection indefinitely even on an unmappable
+        // `text` that `type_text` will go on to reject.
+        modifier_wait::wait_for_modifiers_released();
         self.keyboard.type_text(text)?;
         Ok(InjectionMethod::Type)
     }

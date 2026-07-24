@@ -758,6 +758,7 @@ fn history_entry_recorded_with_raw_and_final_text() {
 fn reload_swaps_deps_between_sessions() {
     let injected_a = Arc::new(Mutex::new(Vec::new()));
     let injected_b = Arc::new(Mutex::new(Vec::new()));
+    let begin_opts_b = Arc::new(Mutex::new(Vec::new()));
     let (sink, states_rx, _notices) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
@@ -768,10 +769,13 @@ fn reload_swaps_deps_between_sessions() {
     let handle = Runtime::spawn(deps_a, sink);
 
     // Still idle (no session started yet): the new deps, including a fresh
-    // hotkey channel, apply immediately rather than being queued.
+    // hotkey channel and updated dictionary terms, apply immediately rather
+    // than being queued.
     let (hotkey_tx_b, hotkey_rx_b) = unbounded();
     let mut builder_b = DepsBuilder::new(Ok(transcript("second session")));
     builder_b.injected = injected_b.clone();
+    builder_b.dictionary_terms = vec!["SQLite".to_string(), "Tauri".to_string()];
+    builder_b.begin_opts = begin_opts_b.clone();
     let deps_b = builder_b.build(hotkey_rx_b);
     handle.reload(deps_b);
 
@@ -788,6 +792,14 @@ fn reload_swaps_deps_between_sessions() {
 
     assert!(injected_a.lock().expect("lock").is_empty());
     assert_eq!(*injected_b.lock().expect("lock"), vec!["second session"]);
+
+    // The reloaded deps' dictionary terms must reach the STT engine as an
+    // `initial_prompt`, proving `WorkerCtx::apply` copies `dictionary_terms`
+    // just like every other field (not just at `WorkerCtx::new`).
+    let opts_b = begin_opts_b.lock().expect("lock");
+    assert_eq!(opts_b.len(), 1);
+    assert_eq!(opts_b[0].initial_prompt, Some("SQLite, Tauri".to_string()));
+    drop(opts_b);
 
     // The old hotkey channel's receiver was dropped by `reload`; sending on
     // it now simply fails rather than resurrecting the old session.

@@ -393,6 +393,7 @@ impl WorkerCtx {
         self.language = deps.language;
         self.engine_label = deps.engine_label;
         self.mode = deps.mode;
+        self.dictionary_terms = deps.dictionary_terms;
     }
 }
 

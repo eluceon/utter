@@ -14,6 +14,11 @@ Audio never touches disk, API keys live in the OS keyring, and the app makes
 no network calls except the ones you configure yourself (a refinement
 endpoint, a model download).
 
+<p align="center">
+  <img src="docs/img/hero-light.png" alt="Utter settings window, General page, light theme" width="49%">
+  <img src="docs/img/hero-dark.png" alt="Utter settings window, General page, dark theme" width="49%">
+</p>
+
 ## Features
 
 - **Dictation session** — push-to-talk or toggle mode, a small always-on-top
@@ -42,6 +47,29 @@ endpoint, a model download).
 - **Tray and settings UI** — quick toggles for engine and refinement, a full
   settings window, and a first-run onboarding flow that walks through mic
   check, model download, hotkey choice, and permissions.
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/img/hud.png" alt="The always-on-top HUD showing a live recording level meter and partial transcript">
+</p>
+
+The HUD floats above whatever window has focus while dictating, showing the
+current phase (listening, transcribing, refining, injecting), a live input
+level meter, and the partial transcript as it comes in.
+
+| | |
+|---|---|
+| ![Engines settings page listing whisper.cpp and Vosk models with install state](docs/img/settings-engines-light.png) | ![Refinement settings page with a provider preset, tone selector, and a live test result](docs/img/settings-refinement-light.png) |
+| **Engines** — install and switch between whisper.cpp models, Vosk models, or a cloud STT endpoint. | **Refinement** — pick a tone, point at any OpenAI-compatible chat endpoint, and test it against a sample transcript. |
+| ![Dictionary settings page with custom terms and heard/write replacement rules](docs/img/settings-dictionary-light.png) | ![Snippets settings page with trigger phrases and their expansion bodies](docs/img/settings-snippets-light.png) |
+| **Dictionary** — custom terms and literal replacement rules applied to every transcript. | **Snippets** — a spoken trigger expands to a stored template, bypassing refinement. |
+
+<p align="center">
+  <img src="docs/img/settings-history-light.png" alt="History settings page listing past dictations with search, copy, and delete" width="70%">
+</p>
+
+**History** — a searchable log of past dictations; copy or delete any entry.
 
 ## Utter vs. the alternatives
 

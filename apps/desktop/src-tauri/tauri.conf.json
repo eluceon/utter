@@ -33,7 +33,8 @@
         "skipTaskbar": true,
         "visible": false,
         "shadow": false,
-        "focus": false
+        "focus": false,
+        "focusable": false
       }
     ],
     "trayIcon": {

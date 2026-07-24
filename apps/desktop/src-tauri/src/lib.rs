@@ -53,6 +53,9 @@ pub fn run() -> Result<(), String> {
 
             let handle = app.handle().clone();
 
+            #[cfg(target_os = "linux")]
+            sink::configure_hud_window(&handle);
+
             // Boot degrades, it doesn't fail: a missing model, no hotkey
             // permissions, or an unconfigured refiner all still leave a
             // running runtime with a notice queued (see

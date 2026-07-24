@@ -29,6 +29,14 @@ utter-refine = { path = "../../../crates/utter-refine" }
 utter-store = { path = "../../../crates/utter-store" }
 utter-stt = { path = "../../../crates/utter-stt" }
 
+# Linux-only, matching the version tauri's own GTK/wry backend already
+# depends on: used to set the HUD window's GTK type hint so the Wayland
+# compositor excludes it from keyboard focus entirely (see sink.rs's HUD
+# focus-stealing doc comment for why `tauri.conf.json`'s window config
+# alone is not enough on GNOME/Mutter).
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", features = ["v3_24"] }
+
 [features]
 default = []
 # Vosk needs the libvosk shared library discoverable by the linker at build

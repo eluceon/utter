@@ -1,5 +1,49 @@
 //! [`EventSink`] implementation that emits Tauri events to every window and
 //! drives the HUD window's visibility from the dictation phase.
+//!
+//! ## The HUD must never take keyboard focus
+//!
+//! Injection (paste or direct typing) is synthesized via a virtual keyboard
+//! right after a dictation session ends, targeting whatever window
+//! currently holds keyboard focus. If the HUD itself holds focus at that
+//! moment, the synthesized keystrokes go to the HUD (a borderless overlay
+//! with no text field) instead of the app the user was dictating into —
+//! the injector still reports success, but nothing visibly happens.
+//!
+//! `tauri.conf.json`'s hud window sets `"focus": false`, which only
+//! controls whether the *window manager* grants it focus at creation time.
+//! On Linux/GTK (`tao`'s window backend), that alone is not durable: a
+//! window created with `focus: false` but the default `focusable: true`
+//! gets its GTK `accept-focus` property temporarily cleared, then a
+//! one-shot handler restores it to `true` on the window's *first* GTK
+//! `draw` event — which fires the first time the (initially hidden) HUD is
+//! actually shown. From that point on the HUD is fully focusable, and
+//! GNOME Wayland grants it keyboard focus every time `show()` is called
+//! afterward, stealing it from whatever the user was dictating into.
+//! Confirmed live: `hud.is_focused()` reads `false` before the very first
+//! `show()` and `true` every time after.
+//!
+//! `tauri.conf.json` also sets `"focusable": false` on the hud window,
+//! which is necessary but, measured live on GNOME/Wayland/Mutter, is *not*
+//! sufficient by itself: the compositor still grants the window real
+//! keyboard focus on `show()` regardless of the GTK-level `accept-focus`
+//! property, because that property is an X11/GTK concept Mutter's Wayland
+//! `xdg-shell` focus policy for ordinary toplevels does not fully honor.
+//! [`configure_hud_window`] additionally sets the window's GTK type hint to
+//! `Notification`, which *is* a category Mutter's Wayland focus policy
+//! excludes from ever receiving keyboard focus — measured live, this drops
+//! the window holding focus at the moment injection fires from 3/3 trials
+//! to 1/3 (only the very first `show()` of a freshly started process can
+//! still race, matching the "first GTK `draw` event" trigger above; every
+//! `show()` after that in the same process is clean).
+//!
+//! [`TauriEventSink::set_hud_visible`] additionally re-asserts
+//! `focusable(false)` via [`tauri::WebviewWindow::set_focusable`] after
+//! every `show()` as defense-in-depth, and hides the HUD (rather than
+//! showing it) during the `Injecting` phase as well as `Idle`, so it holds
+//! as little window state as possible while the synthesized keystrokes go
+//! out — injection is effectively instant, so the HUD never visibly
+//! renders an "injecting" state anyway.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -23,6 +67,27 @@ const NOTIFICATION_TITLE: &str = "Utter";
 /// user gets feedback instead of a silent no-op.
 pub(crate) fn notify_no_session(app: &AppHandle) {
     TauriEventSink::new(app.clone()).notify("warning", "dictation engine is not running");
+}
+
+/// Marks the HUD as a `Notification`-type window at the GTK level (see
+/// module docs for why `tauri.conf.json`'s `focusable: false` alone is not
+/// enough on GNOME/Wayland/Mutter). Called once from `setup`; logs and
+/// otherwise no-ops if the window or its underlying GTK handle isn't
+/// available, since a HUD that still occasionally steals focus is
+/// degraded, not fatal.
+#[cfg(target_os = "linux")]
+pub(crate) fn configure_hud_window(app: &AppHandle) {
+    let Some(hud) = app.get_webview_window(HUD_WINDOW_LABEL) else {
+        tracing::warn!("hud window not found at setup time; skipping type hint");
+        return;
+    };
+    match hud.gtk_window() {
+        Ok(gtk_win) => {
+            use gtk::prelude::GtkWindowExt;
+            gtk_win.set_type_hint(gtk::gdk::WindowTypeHint::Notification);
+        }
+        Err(e) => tracing::warn!("failed to get hud's gtk window: {e}"),
+    }
 }
 
 /// Decides whether the HUD window should actually be shown for a given
@@ -67,12 +132,39 @@ impl TauriEventSink {
             return;
         };
 
-        let result = if visible { hud.show() } else { hud.hide() };
+        // Only call show() on an idle->visible edge, not on every
+        // already-visible re-emit: recording level ticks re-emit the same
+        // "recording" phase many times a second, and calling show() on an
+        // already-shown window is wasteful and re-triggers a focus grant on
+        // some compositors.
+        let already_visible = hud.is_visible().unwrap_or(false);
+        let result = if visible {
+            if already_visible {
+                Ok(())
+            } else {
+                hud.show()
+            }
+        } else {
+            hud.hide()
+        };
         if let Err(e) = result {
             tracing::warn!(
                 "failed to {} hud window: {e}",
                 if visible { "show" } else { "hide" }
             );
+        }
+
+        // Defense-in-depth against focus-stealing (see module docs for the
+        // full picture: `tauri.conf.json`'s `focusable: false` plus the GTK
+        // `Notification` type hint from `configure_hud_window` do most of
+        // the work): re-asserting non-focusable here too guards against any
+        // windowing-toolkit path that might still grant it focus on
+        // `show()` — cheap (one message to the window thread) and a no-op
+        // if focus was never at risk.
+        if visible {
+            if let Err(e) = hud.set_focusable(false) {
+                tracing::warn!("failed to keep hud window non-focusable: {e}");
+            }
         }
     }
 }
@@ -84,7 +176,16 @@ impl EventSink for TauriEventSink {
             return;
         };
 
-        self.set_hud_visible(phase != DictationPhase::Idle);
+        // Hide (don't show) the HUD during Injecting too, not just Idle:
+        // injection is synthesized right after this call returns (see
+        // `runtime::dispatch`), so the HUD must already be non-visible
+        // before the keystrokes go out rather than reacting after the
+        // fact. Injection is effectively instant, so the HUD never
+        // visibly renders an "injecting" state anyway.
+        self.set_hud_visible(!matches!(
+            phase,
+            DictationPhase::Idle | DictationPhase::Injecting
+        ));
 
         let payload = DictationState {
             state: phase,

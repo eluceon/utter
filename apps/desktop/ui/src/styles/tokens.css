@@ -30,6 +30,7 @@
   --bg: #ffffff;
   --bg-elevated: #f7f6fb;
   --bg-sunken: #f0eef6;
+  --surface-hover: #edebf3;
   --border: #e2e0eb;
   --text: #1c1b22;
   --text-muted: #6b6875;
@@ -42,9 +43,18 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
+    /* Native form controls (e.g. a <select>'s option popup) render using the
+       browser/webview's UA colors for whichever schemes `color-scheme`
+       claims to support. Leaving this as `light dark` and relying on the OS
+       preference alone is unreliable in WebKitGTK — it can pick light UA
+       chrome for the option list even though the page itself has gone dark,
+       producing white-on-white text. Pin it to the scheme actually in
+       effect so native popups match. */
+    color-scheme: dark;
     --bg: #17161c;
     --bg-elevated: #1f1e26;
     --bg-sunken: #131217;
+    --surface-hover: #282630;
     --border: #302e3a;
     --text: #efeef4;
     --text-muted: #a29fae;
@@ -57,9 +67,11 @@
 }
 
 :root[data-theme='dark'] {
+  color-scheme: dark;
   --bg: #17161c;
   --bg-elevated: #1f1e26;
   --bg-sunken: #131217;
+  --surface-hover: #282630;
   --border: #302e3a;
   --text: #efeef4;
   --text-muted: #a29fae;
@@ -71,9 +83,11 @@
 }
 
 :root[data-theme='light'] {
+  color-scheme: light;
   --bg: #ffffff;
   --bg-elevated: #f7f6fb;
   --bg-sunken: #f0eef6;
+  --surface-hover: #edebf3;
   --border: #e2e0eb;
   --text: #1c1b22;
   --text-muted: #6b6875;

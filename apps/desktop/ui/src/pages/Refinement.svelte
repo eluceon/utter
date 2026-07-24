@@ -27,14 +27,15 @@
   }
 
   const PRESETS: Record<string, Preset> = {
-    openai: { label: 'OpenAI', base_url: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+    deepseek: { label: 'DeepSeek', base_url: 'https://api.deepseek.com', model: 'deepseek-v4-flash' },
     groq: { label: 'Groq', base_url: 'https://api.groq.com/openai/v1', model: 'llama-3.1-8b-instant' },
+    ollama: { label: 'Ollama (local)', base_url: 'http://localhost:11434/v1', model: 'llama3.2' },
+    openai: { label: 'OpenAI', base_url: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
     openrouter: {
       label: 'OpenRouter',
       base_url: 'https://openrouter.ai/api/v1',
       model: 'openai/gpt-4o-mini',
     },
-    ollama: { label: 'Ollama (local)', base_url: 'http://localhost:11434/v1', model: 'llama3.2' },
   }
 
   const PRESET_OPTIONS = [

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The configured Vosk model is now resolved through the model manager like
+  the Whisper one. It was passed to the engine as a filesystem path, so it
+  resolved relative to the working directory and a downloaded model was
+  reported as missing.
+
 ## [0.1.0] - 2026-07-25
 
 ### Added

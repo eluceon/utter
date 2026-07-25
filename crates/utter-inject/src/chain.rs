@@ -7,10 +7,20 @@ use utter_core::{InjectError, InjectionMethod, TextInjector};
 ///
 /// `"auto"` tries the full layered fallback: clipboard+paste, then direct
 /// typing, then clipboard-only as the universal last resort. Any recognized
-/// explicit method name is tried first, with clipboard-only appended as the
-/// last resort (and deduplicated when the preference already *is*
-/// clipboard-only). An unrecognized preference string falls back to the
-/// `"auto"` order rather than failing outright.
+/// explicit method name is tried first. `"type"` (direct uinput typing) can
+/// only map ASCII-ish characters to US-QWERTY key codes (see
+/// `VirtualKeyboard::type_text` / `validate_typeable` in `uinput_kbd.rs`),
+/// so a non-ASCII transcript (Cyrillic, CJK, emoji, ...) always fails that
+/// backend outright; falling straight through to clipboard-only would then
+/// leave the text merely copied, with nothing inserted into the focused
+/// app. Clipboard-paste has no such character-set restriction and still
+/// auto-inserts, so it is interposed between the preferred backend and the
+/// clipboard-only last resort for every preference except clipboard-only
+/// itself (already first there, and clipboard-paste is a strict superset of
+/// what it can insert, so listing it twice would be pure dead weight).
+/// Deduplicated when the preference already *is* one of the appended
+/// backends. An unrecognized preference string falls back to the `"auto"`
+/// order rather than failing outright.
 pub fn injection_order(preference: &str) -> Vec<InjectionMethod> {
     use InjectionMethod::{ClipboardOnly, ClipboardPaste, Type};
 
@@ -25,7 +35,12 @@ pub fn injection_order(preference: &str) -> Vec<InjectionMethod> {
     if preferred == ClipboardOnly {
         vec![ClipboardOnly]
     } else {
-        vec![preferred, ClipboardOnly]
+        let mut order = vec![preferred];
+        if preferred != ClipboardPaste {
+            order.push(ClipboardPaste);
+        }
+        order.push(ClipboardOnly);
+        order
     }
 }
 
@@ -91,11 +106,22 @@ mod tests {
     }
 
     #[test]
-    fn explicit_preference_is_tried_first_then_clipboard_only() {
+    fn type_preference_falls_back_to_clipboard_paste_before_clipboard_only() {
+        // "type" can't map non-ASCII text at all (see `uinput_kbd.rs`), so
+        // it must land on clipboard-paste (which still auto-inserts)
+        // instead of skipping straight to clipboard-only (copy-only).
         assert_eq!(
             injection_order("type"),
-            vec![InjectionMethod::Type, InjectionMethod::ClipboardOnly]
+            vec![
+                InjectionMethod::Type,
+                InjectionMethod::ClipboardPaste,
+                InjectionMethod::ClipboardOnly,
+            ]
         );
+    }
+
+    #[test]
+    fn clipboard_paste_preference_is_not_duplicated() {
         assert_eq!(
             injection_order("clipboard_paste"),
             vec![

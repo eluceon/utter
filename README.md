@@ -44,6 +44,9 @@ endpoint, a model download).
   don't want it. Audio itself is never stored, history setting or not.
 - **Text injection** — clipboard-paste (fastest, default), direct typing, or
   clipboard-only as a universal fallback, tried in order until one works.
+  Direct typing synthesizes individual key presses and so covers only what a
+  US-QWERTY layout can reach; anything else (Cyrillic, CJK, emoji) falls
+  through to clipboard-paste rather than being dropped.
 - **Tray and settings UI** — quick toggles for engine and refinement, a full
   settings window, and a first-run onboarding flow that walks through mic
   check, model download, hotkey choice, and permissions.
@@ -154,10 +157,15 @@ rejected, so the format tolerates being hand-edited or partially upgraded.
   speech-to-text engine; whisper models download to
   `~/.local/share/utter/models`.
 - **Refinement** — point `refine.base_url` / `refine.model` at any
-  OpenAI-compatible chat endpoint. For a fully local setup, run
+  OpenAI-compatible chat endpoint; the settings UI ships presets for OpenAI,
+  Groq, OpenRouter, DeepSeek, and Ollama. For a fully local setup, run
   [Ollama](https://ollama.com) and use its default `http://localhost:11434/v1`
   — no API key required. Cloud providers store their key in the OS keyring,
   never in `config.toml`.
+- **Injection** — `advanced.injection` picks the strategy: `auto` (try every
+  backend in order), or pin `clipboard_paste`, `type`, or `clipboard_only`.
+  `auto` suits most desktops; `type` is the more reliable choice for
+  terminals, where `Ctrl+V` is not the paste shortcut.
 - **Dictionary and snippets** — custom terms and replacement rules live
   under `[dictionary]`; snippets are a list of trigger/body pairs under
   `[[snippets]]`. Both are editable from the settings UI.

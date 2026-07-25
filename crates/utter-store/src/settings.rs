@@ -79,7 +79,14 @@ impl Default for Dictation {
 #[serde(default)]
 pub struct EngineCfg {
     pub active: EngineKind,
+    /// Catalog id of the whisper model, resolved to an on-disk path through
+    /// [`ModelManager::path_for`](crate::ModelManager::path_for) — never a
+    /// filesystem path itself.
     pub whisper_model: String,
+    /// Catalog id of the vosk model, resolved the same way as
+    /// [`whisper_model`](Self::whisper_model). Vosk models install as a
+    /// directory rather than a file, which makes it tempting to read this as
+    /// a path; it is not one.
     pub vosk_model: Option<String>,
     pub cloud: CloudSttCfg,
 }

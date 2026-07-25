@@ -107,6 +107,7 @@ fn resolve_alternatives(token: KeyToken) -> Vec<KeyCode> {
         KeyToken::Function(n) => KeyCode::from_str(&format!("KEY_F{n}"))
             .into_iter()
             .collect(),
+        KeyToken::Space => vec![KeyCode::KEY_SPACE],
     };
 
     if codes.is_empty() {
@@ -239,6 +240,13 @@ mod tests {
         let spec = parse_hotkey("f1").unwrap();
         let groups = resolve_groups(&spec);
         assert_eq!(groups, vec![vec![KeyCode::KEY_F1]]);
+    }
+
+    #[test]
+    fn resolves_space_base_key() {
+        let spec = parse_hotkey("ctrl+space").unwrap();
+        let groups = resolve_groups(&spec);
+        assert!(groups.iter().any(|g| g == &vec![KeyCode::KEY_SPACE]));
     }
 
     /// Manual, hardware-touching verification: press-and-release the given

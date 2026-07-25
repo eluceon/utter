@@ -5,8 +5,9 @@
 // one of `ctrl`/`alt`/`shift`/`super` (the modifier names, canonicalized —
 // the Rust parser also accepts `control` and `meta`/`win` as aliases for
 // `ctrl`/`super`, but this picker only ever emits the canonical short forms)
-// or a single letter/digit/`f1`..`f24` base key. A chord made entirely of
-// modifiers (e.g. the default `ctrl+super`) is valid and accepted here too.
+// or a single letter/digit/`f1`..`f24`/`space` base key. A chord made
+// entirely of modifiers (e.g. the default `ctrl+super`) is valid and
+// accepted here too.
 
 export const MODIFIER_ORDER = ['ctrl', 'alt', 'shift', 'super'] as const
 export type ModifierToken = (typeof MODIFIER_ORDER)[number]
@@ -32,6 +33,11 @@ const MODIFIER_KEY_NAMES: Record<string, ModifierToken> = {
 export function tokenFor(code: string, key: string): string | null {
   if (key in MODIFIER_KEY_NAMES) return MODIFIER_KEY_NAMES[key]
   if (/^F(?:[1-9]|1[0-9]|2[0-4])$/.test(key)) return key.toLowerCase()
+
+  // `code === 'Space'` is the layout-independent signal; `key === ' '` is
+  // kept as a fallback for the same synthetic-event case the letter/digit
+  // fallback below handles (code missing/non-standard).
+  if (code === 'Space' || key === ' ') return 'space'
 
   const letterMatch = /^Key([A-Z])$/.exec(code)
   if (letterMatch) return letterMatch[1].toLowerCase()

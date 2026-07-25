@@ -34,6 +34,14 @@ describe('tokenFor', () => {
     expect(tokenFor('F24', 'F24')).toBe('f24')
   })
 
+  it('recognizes the space bar from `code`', () => {
+    expect(tokenFor('Space', ' ')).toBe('space')
+  })
+
+  it('recognizes the space bar from `key` when `code` is absent', () => {
+    expect(tokenFor('', ' ')).toBe('space')
+  })
+
   it('rejects keys outside the accepted grammar', () => {
     expect(tokenFor('Escape', 'Escape')).toBeNull()
     expect(tokenFor('Tab', 'Tab')).toBeNull()

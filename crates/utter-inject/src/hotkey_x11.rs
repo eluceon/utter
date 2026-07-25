@@ -101,6 +101,7 @@ fn to_global_hotkey(spec: &HotkeySpec) -> anyhow::Result<HotKey> {
             KeyToken::Char(c) if c.is_ascii_digit() => key = Some(code_for(&format!("Digit{c}"))?),
             KeyToken::Char(c) => key = Some(code_for(&format!("Key{}", c.to_ascii_uppercase()))?),
             KeyToken::Function(n) => key = Some(code_for(&format!("F{n}"))?),
+            KeyToken::Space => key = Some(code_for("Space")?),
         }
     }
 
@@ -145,5 +146,13 @@ mod tests {
 
         let spec = parse_hotkey("ctrl+f1").unwrap();
         assert_eq!(to_global_hotkey(&spec).unwrap().key, Code::F1);
+    }
+
+    #[test]
+    fn converts_space_base_key() {
+        let spec = parse_hotkey("ctrl+space").unwrap();
+        let hotkey = to_global_hotkey(&spec).expect("should convert");
+        assert_eq!(hotkey.key, Code::Space);
+        assert!(hotkey.mods.contains(Modifiers::CONTROL));
     }
 }

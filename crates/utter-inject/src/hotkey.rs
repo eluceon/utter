@@ -88,6 +88,10 @@ pub(crate) enum KeyToken {
     Char(char),
     /// `Fn` function key, 1..=24.
     Function(u8),
+    /// The space bar. Kept as its own variant rather than folded into
+    /// `Char` since it is not alphanumeric and needs its own evdev/X11
+    /// key-code resolution (`KEY_SPACE` / `Code::Space`).
+    Space,
 }
 
 impl KeyToken {
@@ -145,11 +149,11 @@ pub enum HotkeyParseError {
 /// `"ctrl+alt+d"` into a [`HotkeySpec`].
 ///
 /// Tokens are case-insensitive. Recognized modifier names: `ctrl`/`control`,
-/// `alt`, `shift`, `super`/`meta`/`win`. A single letter, single digit, or
-/// `f1`..`f24` is accepted as the (at most one) base key — a second one
-/// (e.g. `"a+b"`) is rejected with [`HotkeyParseError::MultipleBaseKeys`]. A
-/// chord made up entirely of modifiers is valid (see
-/// [`HotkeySpec::is_modifier_only`]).
+/// `alt`, `shift`, `super`/`meta`/`win`. A single letter, single digit,
+/// `f1`..`f24`, or `space` is accepted as the (at most one) base key — a
+/// second one (e.g. `"a+b"`) is rejected with
+/// [`HotkeyParseError::MultipleBaseKeys`]. A chord made up entirely of
+/// modifiers is valid (see [`HotkeySpec::is_modifier_only`]).
 pub fn parse_hotkey(s: &str) -> Result<HotkeySpec, HotkeyParseError> {
     let mut tokens = HashSet::new();
     let mut saw_any = false;
@@ -187,6 +191,7 @@ fn parse_token(token: &str) -> Result<KeyToken, HotkeyParseError> {
         "alt" => return Ok(KeyToken::Alt),
         "shift" => return Ok(KeyToken::Shift),
         "super" | "meta" | "win" => return Ok(KeyToken::Super),
+        "space" => return Ok(KeyToken::Space),
         _ => {}
     }
 
@@ -413,6 +418,16 @@ mod tests {
         assert_eq!(
             spec.tokens,
             HashSet::from([KeyToken::Ctrl, KeyToken::Function(1)])
+        );
+    }
+
+    #[test]
+    fn parses_space_as_a_base_key() {
+        let spec = parse_hotkey("ctrl+space").expect("should parse");
+        assert!(!spec.is_modifier_only());
+        assert_eq!(
+            spec.tokens,
+            HashSet::from([KeyToken::Ctrl, KeyToken::Space])
         );
     }
 

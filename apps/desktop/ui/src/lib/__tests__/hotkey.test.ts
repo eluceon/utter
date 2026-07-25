@@ -29,6 +29,19 @@ describe('tokenFor', () => {
     expect(tokenFor('MetaLeft', 'Meta')).toBe('super')
   })
 
+  it('recognizes Super via WebKitGTK\'s non-standard `key`/`code` values', () => {
+    // Confirmed against a real WebKitGTK 2.50 webview (the Linux desktop
+    // build's actual engine): it reports `key: 'Super'` and
+    // `code: 'OSLeft'/'OSRight'` for the Super key instead of the UI Events
+    // spec's `'Meta'`/`'MetaLeft'`/`'MetaRight'`.
+    expect(tokenFor('OSLeft', 'Super')).toBe('super')
+    expect(tokenFor('OSRight', 'Super')).toBe('super')
+  })
+
+  it('recognizes Super from `code` alone, e.g. if `key` is ever unrecognized', () => {
+    expect(tokenFor('MetaRight', 'SomethingUnexpected')).toBe('super')
+  })
+
   it('recognizes function keys F1..F24', () => {
     expect(tokenFor('F1', 'F1')).toBe('f1')
     expect(tokenFor('F24', 'F24')).toBe('f24')

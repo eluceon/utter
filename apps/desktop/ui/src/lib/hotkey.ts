@@ -17,7 +17,26 @@ const MODIFIER_KEY_NAMES: Record<string, ModifierToken> = {
   Alt: 'alt',
   Shift: 'shift',
   Meta: 'super',
+  // WebKitGTK — the webview engine the Linux desktop build actually runs in
+  // (Tauri on Linux) — reports the Super/Windows key with the pre-standard
+  // `key: 'Super'` value (and `code: 'OSLeft'/'OSRight'`) instead of the UI
+  // Events spec's `'Meta'`/`'MetaLeft'`/`'MetaRight'` that Chromium and
+  // Firefox use. Confirmed directly against the installed WebKitGTK 2.50 by
+  // driving a real keydown through a uinput-synthesized key press: holding
+  // Ctrl then pressing Super produced `key: 'Super', code: 'OSLeft'` with
+  // `metaKey` staying `false` throughout. Without this alias, Ctrl+Super
+  // (the app's own default hotkey) can never be captured — Super's keydown
+  // resolves to no token at all, so only `ctrl` ends up in the chord.
+  Super: 'super',
 }
+
+/** `code` values for the Super/Windows key across engines: the UI Events
+ * spec's `MetaLeft`/`MetaRight` (Chromium, Firefox) and WebKitGTK's
+ * pre-standard `OSLeft`/`OSRight` (see `MODIFIER_KEY_NAMES` above). Matched
+ * on `code` too, not just `key`, so the token still resolves even if a
+ * future engine reports a `key` this map doesn't yet know about but keeps
+ * a recognizable physical-key `code`. */
+const SUPER_CODES = new Set(['MetaLeft', 'MetaRight', 'OSLeft', 'OSRight'])
 
 /** Derives the normalized hotkey token for a keyboard event, given both its
  * `code` (the physical key — layout- and modifier-independent) and `key`
@@ -32,6 +51,7 @@ const MODIFIER_KEY_NAMES: Record<string, ModifierToken> = {
  * read from `key`, which is already stable for them across modifier state. */
 export function tokenFor(code: string, key: string): string | null {
   if (key in MODIFIER_KEY_NAMES) return MODIFIER_KEY_NAMES[key]
+  if (SUPER_CODES.has(code)) return 'super'
   if (/^F(?:[1-9]|1[0-9]|2[0-4])$/.test(key)) return key.toLowerCase()
 
   // `code === 'Space'` is the layout-independent signal; `key === ' '` is

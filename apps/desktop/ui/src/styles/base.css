@@ -1,0 +1,96 @@
+/* Base element styles: resets and defaults shared by every page. Component-
+   specific styles live with their `.svelte` files. */
+
+@import './tokens.css';
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+a {
+  color: var(--accent);
+}
+
+/* A single, consistent focus-visible ring for every real interactive
+   element in the app — keyboard users always get it, mouse users never see
+   it on click (that's what `:focus-visible` buys over plain `:focus`). */
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+a:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--accent-contrast);
+}
+
+/* Interactive-control affordance, defined once for every real button/select
+   in the app rather than copy-pasted per component or page: a pointer
+   cursor, a subtle hover surface shift, and a pressed state. Anything more
+   specific (a component's own `:hover`/`:active` rule, e.g. an accent
+   "primary" button) naturally wins on specificity and can override this.
+   Scoped to plain `button`/`select` elements — the HUD's `role="button"`
+   div is a separate, bespoke-styled floating overlay, not a themed settings
+   control, and isn't part of this affordance system. */
+button:not(:disabled),
+select:not(:disabled) {
+  cursor: pointer;
+}
+
+button:disabled,
+select:disabled {
+  cursor: not-allowed;
+}
+
+button:not(:disabled):hover,
+select:not(:disabled):hover {
+  background-color: var(--surface-hover);
+}
+
+button:not(:disabled):active,
+select:not(:disabled):active {
+  transform: translateY(1px);
+}
+
+code,
+pre {
+  font-family: var(--font-mono);
+}

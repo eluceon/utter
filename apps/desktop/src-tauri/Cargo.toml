@@ -1,0 +1,51 @@
+[package]
+name = "utter-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Utter desktop app shell (Tauri)"
+
+[lib]
+name = "utter_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6", features = [] }
+
+[dependencies]
+anyhow = { workspace = true }
+crossbeam-channel = { workspace = true }
+directories = "6"
+serde = { workspace = true }
+tauri = { version = "2.11", features = ["tray-icon"] }
+tauri-plugin-notification = "2"
+keyring = "4"
+tracing = { workspace = true }
+
+utter-core = { path = "../../../crates/utter-core" }
+utter-audio = { path = "../../../crates/utter-audio" }
+utter-inject = { path = "../../../crates/utter-inject" }
+utter-refine = { path = "../../../crates/utter-refine" }
+utter-store = { path = "../../../crates/utter-store" }
+utter-stt = { path = "../../../crates/utter-stt" }
+
+# Linux-only, matching the version tauri's own GTK/wry backend already
+# depends on: used to set the HUD window's GTK type hint so the Wayland
+# compositor excludes it from keyboard focus entirely (see sink.rs's HUD
+# focus-stealing doc comment for why `tauri.conf.json`'s window config
+# alone is not enough on GNOME/Mutter).
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", features = ["v3_24"] }
+
+[features]
+default = []
+# Vosk needs the libvosk shared library discoverable by the linker at build
+# time (see crates/utter-stt's own `vosk` feature doc and
+# scripts/setup-libvosk.sh); it is NOT part of the default feature set so a
+# plain `cargo build` / `cargo build -p utter-desktop` keeps working on
+# machines without libvosk installed. Packaging builds that want the Vosk
+# engine enable it explicitly with `--features vosk`.
+vosk = ["utter-stt/vosk"]
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,99 @@
+/* Design tokens: colors, spacing, radius, type. Light is the default
+   palette; dark is applied both when the OS prefers it and when the user
+   has explicitly picked "dark" in General settings (`data-theme="dark"` on
+   <html>, see `lib/theme.ts`). A `data-theme="light"` override forces light
+   even when the OS prefers dark. */
+
+:root {
+  color-scheme: light dark;
+
+  --accent: #6e56cf;
+  --accent-hover: #7c66d9;
+  --accent-contrast: #ffffff;
+
+  --radius: 10px;
+  --radius-sm: 6px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Helvetica Neue',
+    system-ui, sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+
+  /* Light palette (default). */
+  --bg: #ffffff;
+  --bg-elevated: #f7f6fb;
+  --bg-sunken: #f0eef6;
+  --surface-hover: #edebf3;
+  --border: #e2e0eb;
+  --text: #1c1b22;
+  --text-muted: #6b6875;
+  --danger: #d64545;
+  --danger-bg: #fbe9e9;
+  --success: #2f9e5b;
+  --warning-bg: #fdf3df;
+  --warning-text: #8a5c00;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* Native form controls (e.g. a <select>'s option popup) render using the
+       browser/webview's UA colors for whichever schemes `color-scheme`
+       claims to support. Leaving this as `light dark` and relying on the OS
+       preference alone is unreliable in WebKitGTK — it can pick light UA
+       chrome for the option list even though the page itself has gone dark,
+       producing white-on-white text. Pin it to the scheme actually in
+       effect so native popups match. */
+    color-scheme: dark;
+    --bg: #17161c;
+    --bg-elevated: #1f1e26;
+    --bg-sunken: #131217;
+    --surface-hover: #282630;
+    --border: #302e3a;
+    --text: #efeef4;
+    --text-muted: #a29fae;
+    --danger: #ff6b6b;
+    --danger-bg: #3a1f22;
+    --success: #4ade80;
+    --warning-bg: #3a3120;
+    --warning-text: #f2c94c;
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #17161c;
+  --bg-elevated: #1f1e26;
+  --bg-sunken: #131217;
+  --surface-hover: #282630;
+  --border: #302e3a;
+  --text: #efeef4;
+  --text-muted: #a29fae;
+  --danger: #ff6b6b;
+  --danger-bg: #3a1f22;
+  --success: #4ade80;
+  --warning-bg: #3a3120;
+  --warning-text: #f2c94c;
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg: #ffffff;
+  --bg-elevated: #f7f6fb;
+  --bg-sunken: #f0eef6;
+  --surface-hover: #edebf3;
+  --border: #e2e0eb;
+  --text: #1c1b22;
+  --text-muted: #6b6875;
+  --danger: #d64545;
+  --danger-bg: #fbe9e9;
+  --success: #2f9e5b;
+  --warning-bg: #fdf3df;
+  --warning-text: #8a5c00;
+}

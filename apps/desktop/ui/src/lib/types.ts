@@ -183,8 +183,6 @@ export interface ModelInfo {
   engine: string
   label: string
   size_mb: number
-  url: string
-  sha256: string
   installed: boolean
 }
 

@@ -331,6 +331,14 @@ pub fn decoding_method(hotwords: &[String]) -> &'static str {
     }
 }
 
+/// Half the machine's cores, at least one and at most four.
+///
+/// Saturating every core freezes the desktop exactly while the user is
+/// waiting for text to appear, which is the worst possible moment.
+pub fn default_threads(available: usize) -> usize {
+    (available / 2).clamp(1, 4)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -492,6 +500,14 @@ mod tests {
             "modified_beam_search",
             "hotwords require beam search; without them the user must not pay for it"
         );
+    }
+
+    #[test]
+    fn thread_default_leaves_headroom_for_the_desktop() {
+        assert_eq!(default_threads(1), 1, "never zero");
+        assert_eq!(default_threads(2), 1);
+        assert_eq!(default_threads(8), 4);
+        assert_eq!(default_threads(32), 4, "capped: more threads stop helping");
     }
 
     #[test]

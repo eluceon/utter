@@ -88,6 +88,12 @@ pub struct EngineCfg {
     /// directory rather than a file, which makes it tempting to read this as
     /// a path; it is not one.
     pub vosk_model: Option<String>,
+    /// Catalog id of the sherpa-onnx model, resolved the same way as
+    /// [`whisper_model`](Self::whisper_model) — never a filesystem path
+    /// itself. Sherpa models install as a directory of several artifacts
+    /// (encoder, decoder, joiner, tokens), which makes the same mistake as
+    /// [`vosk_model`](Self::vosk_model) easy to reintroduce.
+    pub sherpa_model: Option<String>,
     pub cloud: CloudSttCfg,
 }
 
@@ -97,6 +103,7 @@ impl Default for EngineCfg {
             active: EngineKind::Whisper,
             whisper_model: "small".to_string(),
             vosk_model: None,
+            sherpa_model: None,
             cloud: CloudSttCfg::default(),
         }
     }
@@ -110,6 +117,7 @@ pub enum EngineKind {
     Whisper,
     Vosk,
     Cloud,
+    Sherpa,
 }
 
 /// Configuration for an OpenAI-compatible cloud speech-to-text endpoint.

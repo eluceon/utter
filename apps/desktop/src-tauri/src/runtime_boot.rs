@@ -144,7 +144,8 @@ fn build_deps(
 ) -> (RuntimeDeps, Vec<QueuedNotice>) {
     let mut notices = Vec::new();
 
-    let (engine, engine_notice) = build_engine(&settings.engine, models);
+    let (engine, engine_notice) =
+        build_engine(&settings.engine, models, &settings.dictionary.terms);
     if let Some(msg) = engine_notice {
         notices.push(("warning", msg));
     }
@@ -194,6 +195,7 @@ fn engine_label(kind: EngineKind) -> &'static str {
         EngineKind::Whisper => "whisper",
         EngineKind::Vosk => "vosk",
         EngineKind::Cloud => "cloud",
+        EngineKind::Sherpa => "sherpa",
     }
 }
 
@@ -234,11 +236,16 @@ fn unavailable_engine(reason: String) -> Box<dyn SttEngine> {
     Box::new(UnavailableEngine { reason })
 }
 
-fn build_engine(cfg: &EngineCfg, models: &ModelManager) -> (Box<dyn SttEngine>, Option<String>) {
+fn build_engine(
+    cfg: &EngineCfg,
+    models: &ModelManager,
+    dictionary_terms: &[String],
+) -> (Box<dyn SttEngine>, Option<String>) {
     match cfg.active {
         EngineKind::Whisper => build_whisper(&cfg.whisper_model, models),
         EngineKind::Vosk => build_vosk(cfg.vosk_model.as_deref(), models),
         EngineKind::Cloud => build_cloud(&cfg.cloud),
+        EngineKind::Sherpa => build_sherpa(cfg.sherpa_model.as_deref(), models, dictionary_terms),
     }
 }
 
@@ -292,6 +299,65 @@ fn build_vosk(
 ) -> (Box<dyn SttEngine>, Option<String>) {
     let reason = "this build was compiled without vosk support; switch engines in Settings, \
                    or install a build with the vosk feature enabled"
+        .to_string();
+    (unavailable_engine(reason.clone()), Some(reason))
+}
+
+/// The number of onnxruntime inference threads sherpa-onnx is allowed to
+/// use: half the detected core count, clamped by
+/// `utter_stt::sherpa::default_threads` (Task 6's policy, so the desktop
+/// stays responsive while transcribing). `available_parallelism` can fail on
+/// some platforms/sandboxes; a single thread is a safe, always-available
+/// fallback rather than propagating that as a boot failure.
+#[cfg(feature = "sherpa")]
+fn sherpa_thread_count() -> usize {
+    let available = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    utter_stt::sherpa::default_threads(available)
+}
+
+#[cfg(feature = "sherpa")]
+fn build_sherpa(
+    model_id: Option<&str>,
+    models: &ModelManager,
+    dictionary_terms: &[String],
+) -> (Box<dyn SttEngine>, Option<String>) {
+    let Some(model_id) = model_id else {
+        let reason =
+            "no sherpa model configured; open Settings > Models to download one".to_string();
+        return (unavailable_engine(reason.clone()), Some(reason));
+    };
+
+    let Some(path) = models.path_for(model_id) else {
+        let reason = format!(
+            "sherpa model \"{model_id}\" is not downloaded; open Settings > Models to download it"
+        );
+        return (unavailable_engine(reason.clone()), Some(reason));
+    };
+
+    let cfg = utter_stt::SherpaConfig {
+        num_threads: sherpa_thread_count(),
+        hotwords: dictionary_terms.to_vec(),
+    };
+
+    match utter_stt::SherpaOfflineEngine::load(&path, cfg) {
+        Ok(engine) => (Box::new(engine), None),
+        Err(e) => {
+            let reason = format!("failed to load sherpa model \"{model_id}\": {e}");
+            (unavailable_engine(reason.clone()), Some(reason))
+        }
+    }
+}
+
+#[cfg(not(feature = "sherpa"))]
+fn build_sherpa(
+    _model_id: Option<&str>,
+    _models: &ModelManager,
+    _dictionary_terms: &[String],
+) -> (Box<dyn SttEngine>, Option<String>) {
+    let reason = "this build was compiled without sherpa support; switch engines in Settings, \
+                   or install a build with the sherpa feature enabled"
         .to_string();
     (unavailable_engine(reason.clone()), Some(reason))
 }
@@ -472,6 +538,7 @@ mod tests {
         assert_eq!(engine_label(EngineKind::Whisper), "whisper");
         assert_eq!(engine_label(EngineKind::Vosk), "vosk");
         assert_eq!(engine_label(EngineKind::Cloud), "cloud");
+        assert_eq!(engine_label(EngineKind::Sherpa), "sherpa");
     }
 
     #[test]
@@ -587,6 +654,44 @@ mod tests {
 
         let notice = notice.expect("a build without vosk support should produce a notice");
         assert!(notice.contains("vosk"));
+
+        let err = engine
+            .begin(&TranscribeOptions::default())
+            .expect_err("an unavailable engine must fail begin() informatively");
+        assert!(matches!(err, SttError::ModelNotFound(_)));
+    }
+
+    /// A configured sherpa model is a catalog id, not a filesystem path: it
+    /// has to be resolved through the `ModelManager` the same way whisper and
+    /// vosk ids are. Passing the id straight to the engine is the exact
+    /// mistake that broke Vosk model resolution in v0.1.
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn missing_sherpa_model_degrades_with_a_notice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = ModelManager::new(dir.path().to_path_buf());
+
+        let (mut engine, notice) = build_sherpa(Some("gigaam-v3-e2e-rnnt"), &models, &[]);
+
+        let notice = notice.expect("missing model should produce a notice");
+        assert!(notice.contains("not downloaded"));
+
+        let err = engine
+            .begin(&TranscribeOptions::default())
+            .expect_err("an unavailable engine must fail begin() informatively");
+        assert!(matches!(err, SttError::ModelNotFound(_)));
+    }
+
+    #[cfg(not(feature = "sherpa"))]
+    #[test]
+    fn sherpa_without_the_feature_degrades_with_a_notice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = ModelManager::new(dir.path().to_path_buf());
+
+        let (mut engine, notice) = build_sherpa(Some("gigaam-v3-e2e-rnnt"), &models, &[]);
+
+        let notice = notice.expect("a build without sherpa support should produce a notice");
+        assert!(notice.contains("sherpa"));
 
         let err = engine
             .begin(&TranscribeOptions::default())

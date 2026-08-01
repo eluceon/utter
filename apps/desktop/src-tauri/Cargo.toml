@@ -46,6 +46,12 @@ default = []
 # machines without libvosk installed. Packaging builds that want the Vosk
 # engine enable it explicitly with `--features vosk`.
 vosk = ["utter-stt/vosk"]
+# Sherpa's build script downloads a prebuilt native archive on first build
+# (see crates/utter-stt's own `sherpa` feature doc); NOT part of the default
+# feature set so a plain `cargo build -p utter-desktop` stays offline-capable.
+# Packaging builds that want the sherpa-onnx engine enable it explicitly
+# with `--features sherpa`.
+sherpa = ["utter-stt/sherpa"]
 
 [dev-dependencies]
 tempfile = "3"

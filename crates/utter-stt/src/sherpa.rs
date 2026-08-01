@@ -72,11 +72,15 @@ impl SherpaOfflineEngine {
     /// a path is the exact mistake that broke Vosk model resolution in v0.1.
     ///
     /// # Errors
-    /// Returns [`SttError::ModelNotFound`] if `dir` does not exist, if any of
-    /// the expected encoder/decoder/joiner/tokens files are missing from it,
-    /// or if sherpa-onnx itself refuses to build a recognizer from the
-    /// resolved files. Returns [`SttError::Engine`] if `cfg.hotwords`
-    /// contains an interior null byte.
+    /// Returns [`SttError::ModelNotFound`] if `dir` does not exist, or if any
+    /// of the expected encoder/decoder/joiner/tokens files are missing from
+    /// it. Returns [`SttError::Engine`] if `cfg.hotwords` contains an
+    /// interior null byte, if any resolved path is not valid UTF-8, or if
+    /// sherpa-onnx refuses to build a recognizer from files that are all
+    /// present (a corrupt or truncated download, the wrong ONNX format, or a
+    /// model-family mismatch) — by the time that call happens every expected
+    /// file has already been confirmed to exist, so a rejection there is an
+    /// engine problem, not a missing-model one.
     ///
     /// `OfflineRecognizer::create` reports failure as `None` rather than an
     /// error value, so in that last case the path that was tried is the only
@@ -96,12 +100,12 @@ impl SherpaOfflineEngine {
         let config = OfflineRecognizerConfig {
             model_config: OfflineModelConfig {
                 transducer: OfflineTransducerModelConfig {
-                    encoder: Some(path_to_string(&encoder)),
-                    decoder: Some(path_to_string(&decoder)),
-                    joiner: Some(path_to_string(&joiner)),
+                    encoder: Some(path_to_string(&encoder)?),
+                    decoder: Some(path_to_string(&decoder)?),
+                    joiner: Some(path_to_string(&joiner)?),
                 },
-                tokens: Some(path_to_string(&tokens)),
-                num_threads: cfg.num_threads.max(1) as i32,
+                tokens: Some(path_to_string(&tokens)?),
+                num_threads: cfg.num_threads.clamp(1, i32::MAX as usize) as i32,
                 // Every model in the catalog (GigaAM-v3, Parakeet English) is
                 // a NeMo transducer export; without this hint sherpa-onnx
                 // assumes the icefall transducer layout and fails to load.
@@ -111,8 +115,12 @@ impl SherpaOfflineEngine {
             ..Default::default()
         };
 
+        // Every expected file is already confirmed present above, so a
+        // rejection here means sherpa-onnx itself refused their contents
+        // (corrupt/truncated download, wrong format, family mismatch) —
+        // that is an engine failure, not a missing-model one.
         let recognizer = OfflineRecognizer::create(&config).ok_or_else(|| {
-            SttError::ModelNotFound(format!(
+            SttError::Engine(format!(
                 "sherpa-onnx rejected the model in {}",
                 dir.display()
             ))
@@ -252,8 +260,16 @@ fn resolve_required_file(dir: &Path, candidates: &[&str]) -> Result<PathBuf, Stt
 
 /// Renders `path` as a `String` for the sherpa-onnx config, which takes file
 /// paths as owned UTF-8 strings rather than `Path`s.
-fn path_to_string(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+///
+/// # Errors
+/// Returns [`SttError::Engine`] if `path` is not valid UTF-8, rather than
+/// silently lossy-converting it into a path that would no longer point at
+/// the file on disk (mirrors `vosk::VoskEngine::load`'s handling of the same
+/// problem).
+fn path_to_string(path: &Path) -> Result<String, SttError> {
+    path.to_str().map(str::to_string).ok_or_else(|| {
+        SttError::Engine(format!("model path is not valid UTF-8: {}", path.display()))
+    })
 }
 
 /// Joins `hotwords` into the single newline-separated string
@@ -327,6 +343,20 @@ mod tests {
 
         assert!(matches!(err, SttError::ModelNotFound(_)), "got {err:?}");
     }
+
+    // No in-process test exercises `OfflineRecognizer::create` returning
+    // `None` for present-but-invalid files (the `SttError::Engine` branch in
+    // `load`). Both ways of constructing such a fixture were tried and both
+    // crash the whole test binary rather than failing gracefully: a
+    // malformed `tokens.txt` makes sherpa-onnx's C++ layer log and call
+    // `exit()` directly (process exit status 255, no signal), and malformed
+    // `.onnx` files make onnxruntime throw a C++ exception while parsing the
+    // protobuf, which unwinds across the FFI boundary uncaught and aborts
+    // the process (SIGABRT: "Rust cannot catch foreign exceptions"). Unlike
+    // whisper.cpp/Vosk's C APIs, sherpa-onnx does not appear to guarantee a
+    // graceful `None`/error return for every malformed-input shape, so this
+    // branch is verified by inspection and the doc comment on `load` rather
+    // than by a test that would otherwise take down the whole suite.
 
     #[test]
     fn feed_before_begin_returns_engine_error() {

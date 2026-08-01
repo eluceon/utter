@@ -23,11 +23,12 @@ jobs:
           cache: npm
           cache-dependency-path: apps/desktop/ui/package-lock.json
       - run: cargo fmt --check
-      # Deliberately `--all-targets` without `--all-features`: the `vosk`
-      # feature (utter-stt, utter-desktop) needs libvosk discoverable by the
-      # linker (see scripts/setup-libvosk.sh), which this runner doesn't
-      # have. The default feature set (whisper.cpp + cloud STT) is what's
-      # linted and tested here, matching CONTRIBUTING.md's documented gate.
+      # Deliberately `--all-targets` without `--all-features`: the `sherpa`
+      # feature (utter-stt, utter-desktop) downloads a prebuilt native
+      # archive on first build (see crates/utter-stt/Cargo.toml), which CI
+      # and offline builds must opt into deliberately. The default feature
+      # set (whisper.cpp + cloud STT) is what's linted and tested here,
+      # matching CONTRIBUTING.md's documented gate.
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - working-directory: apps/desktop/ui
@@ -57,7 +58,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # windows/macos check with the default feature set only (whisper.cpp +
-      # cloud STT, no `vosk`); utter-inject's evdev/uinput backends are
+      # cloud STT, no `sherpa`); utter-inject's evdev/uinput backends are
       # `#[cfg(target_os = "linux")]`-gated behind non-Linux stubs, so the
       # workspace compiles everywhere without platform-specific features.
       - run: cargo check --workspace

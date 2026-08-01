@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 utter-core = { path = "../utter-core" }
 whisper-rs = { version = "0.16", optional = true, features = ["tracing_backend"] }
-vosk = { version = "0.3.1", optional = true }
 sherpa-onnx = { workspace = true, optional = true }
 # reqwest's blocking multipart form types live behind the `multipart` feature,
 # separately from `blocking` itself; added on top of the workspace's base
@@ -28,9 +27,6 @@ required-features = ["sherpa"]
 [features]
 default = ["whisper", "cloud"]
 whisper = ["dep:whisper-rs"]
-# Not in `default`: requires the libvosk shared library to be discoverable by
-# the linker (see scripts/setup-libvosk.sh), which most machines lack.
-vosk = ["dep:vosk"]
 cloud = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:hound"]
 # Not in `default`: the build script downloads a prebuilt native archive on
 # first build, which CI and offline builds must opt into deliberately.

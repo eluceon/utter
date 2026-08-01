@@ -5,7 +5,7 @@
 Utter is a privacy-first, Linux-first desktop dictation app. Press a global
 hotkey, speak, and clean, formatted text lands in whatever field currently
 has focus — a terminal, an editor, a chat window, anything. Speech recognition
-runs locally by default (whisper.cpp or Vosk); an optional LLM pass cleans up
+runs locally by default (whisper.cpp or sherpa-onnx); an optional LLM pass cleans up
 filler words and punctuation before the text is typed. Nothing about the
 pipeline is fixed: engine, model, refinement provider, and injection method
 are all swappable in settings.
@@ -25,9 +25,9 @@ endpoint, a model download).
   HUD showing recording/transcribing/refining state and a live input level
   meter, cancel with Escape or a hotkey tap.
 - **Speech-to-text engines** — `whisper.cpp` for accurate batch transcription
-  (tiny through large-v3-turbo, quantized variants included), `Vosk` for
-  low-latency streaming with live partial results, or any OpenAI-compatible
-  cloud `/audio/transcriptions` endpoint (BYOK).
+  (tiny through large-v3-turbo, quantized variants included), `sherpa-onnx`
+  for fast offline transcription with hotword biasing, or any
+  OpenAI-compatible cloud `/audio/transcriptions` endpoint (BYOK).
 - **AI text refinement** — optional pass over the transcript: removes filler
   words, fixes punctuation and casing, applies a tone preset (`verbatim`,
   `clean`, `formal`, `notes`, `code-comment`). Works against any
@@ -63,8 +63,8 @@ level meter, and the partial transcript as it comes in.
 
 | | |
 |---|---|
-| ![Engines settings page listing whisper.cpp and Vosk models with install state](docs/img/settings-engines-light.png) | ![Refinement settings page with a provider preset, tone selector, and a live test result](docs/img/settings-refinement-light.png) |
-| **Engines** — install and switch between whisper.cpp models, Vosk models, or a cloud STT endpoint. | **Refinement** — pick a tone, point at any OpenAI-compatible chat endpoint, and test it against a sample transcript. |
+| ![Engines settings page listing whisper.cpp and sherpa-onnx models with install state](docs/img/settings-engines-light.png) | ![Refinement settings page with a provider preset, tone selector, and a live test result](docs/img/settings-refinement-light.png) |
+| **Engines** — install and switch between whisper.cpp models, sherpa-onnx models, or a cloud STT endpoint. | **Refinement** — pick a tone, point at any OpenAI-compatible chat endpoint, and test it against a sample transcript. |
 | ![Dictionary settings page with custom terms and heard/write replacement rules](docs/img/settings-dictionary-light.png) | ![Snippets settings page with trigger phrases and their expansion bodies](docs/img/settings-snippets-light.png) |
 | **Dictionary** — custom terms and literal replacement rules applied to every transcript. | **Snippets** — a spoken trigger expands to a stored template, bypassing refinement. |
 
@@ -120,11 +120,12 @@ cargo tauri dev     # run in development
 cargo tauri build   # produce a release bundle
 ```
 
-The `vosk` engine links against `libvosk`, a shared library not distributed
-on crates.io. If you want it, run `scripts/setup-libvosk.sh` first and build
-with `--features vosk` (`cargo tauri dev --features vosk` /
-`cargo build -p utter-stt --features vosk`); without it, whisper.cpp and
-cloud STT still work out of the box.
+The `sherpa` engine links sherpa-onnx statically; its build script downloads
+a prebuilt native archive on first build, so building with `--features
+sherpa` (`cargo tauri dev --features sherpa` /
+`cargo build -p utter-stt --features sherpa`) needs network access the first
+time but no extra linker setup; without it, whisper.cpp and cloud STT still
+work out of the box.
 
 ## Quick start
 
@@ -153,7 +154,7 @@ config dir), reloaded automatically when changed through the settings UI. A
 missing file just means defaults; unknown keys are ignored rather than
 rejected, so the format tolerates being hand-edited or partially upgraded.
 
-- **Engines** — pick `whisper`, `vosk`, or `cloud` as the active
+- **Engines** — pick `whisper`, `sherpa`, or `cloud` as the active
   speech-to-text engine; whisper models download to
   `~/.local/share/utter/models`.
 - **Refinement** — point `refine.base_url` / `refine.model` at any
@@ -189,9 +190,10 @@ including dev setup and test/lint gates, are in
 
 ## Roadmap
 
-- **v0.2** — Windows text-injection adapter, a hybrid mode (live Vosk draft
-  replaced by a final Whisper pass), per-app tone profiles.
-- **v0.3** — macOS adapter, sherpa-onnx as an additional streaming engine.
+- **v0.2** — Windows text-injection adapter, sherpa-onnx as an additional
+  offline engine, per-app tone profiles.
+- **v0.3** — macOS adapter, a streaming sherpa-onnx engine with live partial
+  results.
 - **Later** — voice commands ("new line", "undo that"), translation mode.
 
 ## License

@@ -12,7 +12,7 @@ plugged in at the edge.
 |---|---|
 | `utter-core` | Domain: the `Session` state machine, ports (`SttEngine`, `TextRefiner`, `TextInjector`), and shared types (`Transcript`, `Tone`, `InjectionMethod`). No I/O. |
 | `utter-audio` | Microphone capture via `cpal`, resampling to 16 kHz mono `i16` (`rubato`), RMS level and silence detection. |
-| `utter-stt` | Speech-to-text adapters behind Cargo features: `whisper` (whisper.cpp via `whisper-rs`), `vosk` (streaming, via the `vosk` crate), `cloud` (any OpenAI-compatible `/audio/transcriptions` endpoint). |
+| `utter-stt` | Speech-to-text adapters behind Cargo features: `whisper` (whisper.cpp via `whisper-rs`), `sherpa` (offline sherpa-onnx transducer via the `sherpa-onnx` crate), `cloud` (any OpenAI-compatible `/audio/transcriptions` endpoint). |
 | `utter-refine` | Transcript post-processing: dictionary replacement rules, snippet matching, prompt construction, and the LLM client (any OpenAI-compatible `/chat/completions` endpoint). |
 | `utter-inject` | Global hotkey capture (evdev, with an X11 `global-hotkey` fallback) and text injection backends (clipboard-paste, direct typing, clipboard-only), chained with automatic fallback. |
 | `utter-store` | TOML settings persistence, the SQLite-backed history repository, and the STT model catalog/downloader. |
@@ -31,7 +31,7 @@ graph LR
     end
 
     Whisper["utter-stt: WhisperEngine"] -->|implements| SttEngine
-    Vosk["utter-stt: VoskEngine"] -->|implements| SttEngine
+    Sherpa["utter-stt: SherpaOfflineEngine"] -->|implements| SttEngine
     Cloud["utter-stt: CloudEngine"] -->|implements| SttEngine
 
     LlmRefiner["utter-refine: LlmRefiner"] -->|implements| TextRefiner
@@ -87,10 +87,13 @@ stateDiagram-v2
     Injecting --> Idle : CancelRequested
 ```
 
-Streaming engines (Vosk) additionally surface partial transcripts while in
-`Recording`, handled outside the state machine by the runtime orchestrator
+A streaming engine can additionally surface partial transcripts while in
+`Recording` through `SttEngine::feed`'s `Option<String>` return, handled
+outside the state machine by the runtime orchestrator
 (`apps/desktop/src-tauri/src/runtime.rs`), which forwards them straight to
-the HUD without affecting `Session`'s state.
+the HUD without affecting `Session`'s state. Neither current engine uses
+this seam — whisper.cpp and sherpa-onnx are both batch, producing text only
+at `finish()` — it exists for a future streaming engine.
 
 ## Data flow
 
@@ -100,9 +103,9 @@ the HUD without affecting `Session`'s state.
 2. **Capture** — `Session::handle` turns a press into `Effect::StartCapture`;
    the runtime starts `utter-audio`'s `Capture`, which pulls frames from
    `cpal` and resamples them to 16 kHz mono `i16`.
-3. **Engine feed** — each audio frame is fed to the active `SttEngine`.
-   Vosk streams back partial text as it goes; whisper.cpp buffers until
-   `finish()`.
+3. **Engine feed** — each audio frame is fed to the active `SttEngine`. Both
+   current engines (whisper.cpp, sherpa-onnx) buffer until `finish()`; a
+   streaming engine could instead return partial text as it goes.
 4. **Finish** — releasing the hotkey (or a silence timeout) stops capture
    and calls `engine.finish()`, producing a `Transcript`.
 5. **Rules and snippets** — the runtime applies dictionary replacement rules
@@ -149,18 +152,17 @@ the HUD without affecting `Session`'s state.
   calls (cloud STT, LLM refinement) use `reqwest`'s blocking client from the
   runtime's own worker thread rather than pulling `tokio` into the domain
   or adapter crates.
-- **Batch whisper.cpp + streaming Vosk, not one unified interface trying to
-  do both** — the two engines have genuinely different shapes: whisper.cpp
-  only produces a result at `finish()`, Vosk produces partials throughout.
-  `SttEngine::feed` returning `Option<String>` lets both fit one trait
-  without forcing whisper.cpp to fake partial output or Vosk to discard its
-  main advantage.
+- **One trait for both batch and streaming engines** — `SttEngine::feed`
+  returns `Option<String>` rather than `()` so a batch engine (whisper.cpp,
+  sherpa-onnx — both only produce a result at `finish()`) and a future
+  streaming engine can share one trait, without forcing a batch engine to
+  fake partial output or a streaming one to discard its main advantage.
 - **TOML settings, SQLite history** — settings are small, human-editable,
   and benefit from being diffable and hand-fixable (TOML); history is an
   append-heavy, queryable log where a real database (SQLite via `rusqlite`,
   bundled — no system dependency) is a better fit than a flat file.
 - **Degradation over failure** — a missing model, an unset refine API key,
-  an invalid hotkey, or a build without the `vosk` feature all boot the app
+  an invalid hotkey, or a build without the `sherpa` feature all boot the app
   anyway, with the affected feature reporting an error only when actually
   used (or an upfront notice), rather than the whole app refusing to start.
   Runtime boot (`apps/desktop/src-tauri/src/runtime_boot.rs`) formalizes

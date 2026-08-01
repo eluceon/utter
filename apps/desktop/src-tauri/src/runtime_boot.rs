@@ -6,8 +6,9 @@
 //!
 //! Every piece of configuration that can plausibly be wrong or unavailable
 //! (no whisper model downloaded yet, no hotkey permissions, an unconfigured
-//! refiner, a build without the `vosk` feature) degrades to a stand-in that
-//! boots the runtime anyway and reports a notice, rather than aborting boot.
+//! refiner, a build without the `sherpa` feature) degrades to a stand-in
+//! that boots the runtime anyway and reports a notice, rather than aborting
+//! boot.
 //! [`boot`] only ever returns `Err` for genuinely unexpected failures (e.g.
 //! the platform data directory can't be resolved at all).
 //!
@@ -193,7 +194,6 @@ fn build_deps(
 fn engine_label(kind: EngineKind) -> &'static str {
     match kind {
         EngineKind::Whisper => "whisper",
-        EngineKind::Vosk => "vosk",
         EngineKind::Cloud => "cloud",
         EngineKind::Sherpa => "sherpa",
     }
@@ -243,7 +243,6 @@ fn build_engine(
 ) -> (Box<dyn SttEngine>, Option<String>) {
     match cfg.active {
         EngineKind::Whisper => build_whisper(&cfg.whisper_model, models),
-        EngineKind::Vosk => build_vosk(cfg.vosk_model.as_deref(), models),
         EngineKind::Cloud => build_cloud(&cfg.cloud),
         EngineKind::Sherpa => build_sherpa(cfg.sherpa_model.as_deref(), models, dictionary_terms),
     }
@@ -264,43 +263,6 @@ fn build_whisper(model_id: &str, models: &ModelManager) -> (Box<dyn SttEngine>, 
             (unavailable_engine(reason.clone()), Some(reason))
         }
     }
-}
-
-#[cfg(feature = "vosk")]
-fn build_vosk(
-    model_id: Option<&str>,
-    models: &ModelManager,
-) -> (Box<dyn SttEngine>, Option<String>) {
-    let Some(model_id) = model_id else {
-        let reason = "no vosk model configured; open Settings > Models to download one".to_string();
-        return (unavailable_engine(reason.clone()), Some(reason));
-    };
-
-    let Some(path) = models.path_for(model_id) else {
-        let reason = format!(
-            "vosk model \"{model_id}\" is not downloaded; open Settings > Models to download it"
-        );
-        return (unavailable_engine(reason.clone()), Some(reason));
-    };
-
-    match utter_stt::VoskEngine::load(&path) {
-        Ok(engine) => (Box::new(engine), None),
-        Err(e) => {
-            let reason = format!("failed to load vosk model \"{model_id}\": {e}");
-            (unavailable_engine(reason.clone()), Some(reason))
-        }
-    }
-}
-
-#[cfg(not(feature = "vosk"))]
-fn build_vosk(
-    _model_id: Option<&str>,
-    _models: &ModelManager,
-) -> (Box<dyn SttEngine>, Option<String>) {
-    let reason = "this build was compiled without vosk support; switch engines in Settings, \
-                   or install a build with the vosk feature enabled"
-        .to_string();
-    (unavailable_engine(reason.clone()), Some(reason))
 }
 
 /// The number of onnxruntime inference threads sherpa-onnx is allowed to
@@ -536,7 +498,6 @@ mod tests {
     #[test]
     fn engine_label_matches_each_kind() {
         assert_eq!(engine_label(EngineKind::Whisper), "whisper");
-        assert_eq!(engine_label(EngineKind::Vosk), "vosk");
         assert_eq!(engine_label(EngineKind::Cloud), "cloud");
         assert_eq!(engine_label(EngineKind::Sherpa), "sherpa");
     }
@@ -620,51 +581,10 @@ mod tests {
         assert!(matches!(err, SttError::ModelNotFound(_)));
     }
 
-    /// A configured vosk model is a catalog id, not a filesystem path: it has
-    /// to be resolved through the `ModelManager` the same way whisper ids are.
-    /// Passing the id straight to the engine made it resolve relative to the
-    /// process working directory, so a downloaded model was never found.
-    #[cfg(feature = "vosk")]
-    #[test]
-    fn missing_vosk_model_degrades_with_a_notice() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let models = ModelManager::new(dir.path().to_path_buf());
-
-        let (mut engine, notice) = build_vosk(Some("vosk-model-small-en-us-0.15"), &models);
-
-        let notice = notice.expect("missing model should produce a notice");
-        assert!(
-            notice.contains("not downloaded"),
-            "the id must be resolved through the model manager, got: {notice}"
-        );
-
-        let err = engine
-            .begin(&TranscribeOptions::default())
-            .expect_err("an unavailable engine must fail begin() informatively");
-        assert!(matches!(err, SttError::ModelNotFound(_)));
-    }
-
-    #[cfg(not(feature = "vosk"))]
-    #[test]
-    fn vosk_without_the_feature_degrades_with_a_notice() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let models = ModelManager::new(dir.path().to_path_buf());
-
-        let (mut engine, notice) = build_vosk(Some("vosk-model-small-en-us-0.15"), &models);
-
-        let notice = notice.expect("a build without vosk support should produce a notice");
-        assert!(notice.contains("vosk"));
-
-        let err = engine
-            .begin(&TranscribeOptions::default())
-            .expect_err("an unavailable engine must fail begin() informatively");
-        assert!(matches!(err, SttError::ModelNotFound(_)));
-    }
-
     /// A configured sherpa model is a catalog id, not a filesystem path: it
-    /// has to be resolved through the `ModelManager` the same way whisper and
-    /// vosk ids are. Passing the id straight to the engine is the exact
-    /// mistake that broke Vosk model resolution in v0.1.
+    /// has to be resolved through the `ModelManager` the same way whisper ids
+    /// are. Passing the id straight to the engine is an easy mistake that has
+    /// bitten this codebase before (v0.1).
     #[cfg(feature = "sherpa")]
     #[test]
     fn missing_sherpa_model_degrades_with_a_notice() {

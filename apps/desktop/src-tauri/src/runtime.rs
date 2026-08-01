@@ -182,7 +182,7 @@ pub struct RuntimeDeps {
     pub refine_timeout: Duration,
     pub tone: Tone,
     pub language: Option<String>,
-    /// Recorded on each history entry (e.g. `"whisper"`, `"vosk"`, `"cloud"`).
+    /// Recorded on each history entry (e.g. `"whisper"`, `"sherpa"`, `"cloud"`).
     pub engine_label: String,
     /// User-configured dictionary terms (proper nouns, jargon, ...), passed
     /// to the STT engine as an `initial_prompt` hint on every `begin()` call

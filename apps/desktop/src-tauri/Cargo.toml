@@ -39,13 +39,6 @@ gtk = { version = "0.18", features = ["v3_24"] }
 
 [features]
 default = []
-# Vosk needs the libvosk shared library discoverable by the linker at build
-# time (see crates/utter-stt's own `vosk` feature doc and
-# scripts/setup-libvosk.sh); it is NOT part of the default feature set so a
-# plain `cargo build` / `cargo build -p utter-desktop` keeps working on
-# machines without libvosk installed. Packaging builds that want the Vosk
-# engine enable it explicitly with `--features vosk`.
-vosk = ["utter-stt/vosk"]
 # Sherpa's build script downloads a prebuilt native archive on first build
 # (see crates/utter-stt's own `sherpa` feature doc); NOT part of the default
 # feature set so a plain `cargo build -p utter-desktop` stays offline-capable.

@@ -1,17 +1,17 @@
 //! STT model catalog and downloader.
 //!
 //! Holds the hard-coded catalog of speech-to-text models (whisper.cpp ggml
-//! models from Hugging Face, Vosk models from alphacephei.com), tracks which
-//! ones are installed under `data_dir/models/`, and performs checksum-verified
-//! downloads. A catalog entry is one or more artifacts: a whisper model is a
-//! single `.bin` file, a vosk model is a single `.zip` archive that gets
-//! unpacked, and a model with several artifacts (e.g. a sherpa-onnx
-//! transducer's encoder, decoder, joiner and tokens) is installed as a
-//! directory holding all of them. Each artifact streams to its own `.part`
-//! file while its sha256 is computed incrementally, and a model only becomes
-//! visible at its final path once every one of its artifacts has verified —
-//! a checksum mismatch or an interrupted download always leaves the staging
-//! area cleaned up rather than reporting a half-installed model.
+//! models and sherpa-onnx transducer models, both from Hugging Face), tracks
+//! which ones are installed under `data_dir/models/`, and performs
+//! checksum-verified downloads. A catalog entry is one or more artifacts: a
+//! whisper model is a single `.bin` file, and a model with several artifacts
+//! (e.g. a sherpa-onnx transducer's encoder, decoder, joiner and tokens) is
+//! installed as a directory holding all of them. Each artifact streams to
+//! its own `.part` file while its sha256 is computed incrementally, and a
+//! model only becomes visible at its final path once every one of its
+//! artifacts has verified — a checksum mismatch or an interrupted download
+//! always leaves the staging area cleaned up rather than reporting a
+//! half-installed model.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -46,14 +46,12 @@ struct Artifact {
 
 /// Static metadata for one catalog entry.
 ///
-/// `engine` distinguishes how a download is installed: `"vosk"` models have
-/// a single artifact, a `.zip` archive, whose sha256 is verified before it
-/// is unpacked into a same-named directory under `models/`. Every other
-/// engine installs its artifacts by their catalog `name`: a single file
-/// directly under `models/` when there is exactly one artifact (e.g.
-/// `"whisper"`), or a directory named after the entry's `id` holding every
-/// artifact when there is more than one (e.g. a sherpa-onnx transducer's
-/// encoder, decoder, joiner and tokens).
+/// `engine` distinguishes the STT engine a model belongs to; installation
+/// itself is driven purely by artifact count: a single file directly under
+/// `models/` when there is exactly one artifact (e.g. `"whisper"`), or a
+/// directory named after the entry's `id` holding every artifact when there
+/// is more than one (e.g. a sherpa-onnx transducer's encoder, decoder,
+/// joiner and tokens).
 #[derive(Debug, Clone, Copy)]
 struct CatalogEntry {
     id: &'static str,
@@ -66,10 +64,8 @@ struct CatalogEntry {
 /// The hard-coded catalog of downloadable speech-to-text models.
 ///
 /// Whisper sha256 values were read from the Hugging Face tree API for
-/// `ggerganov/whisper.cpp` (`lfs.oid` per file). Vosk sha256 values were
-/// computed locally from the zip archives published at
-/// `https://alphacephei.com/vosk/models/`, and cross-checked against the
-/// md5 values listed in `https://alphacephei.com/vosk/models/model-list.json`.
+/// `ggerganov/whisper.cpp` (`lfs.oid` per file). Sherpa-onnx sha256 values
+/// were read from the Hugging Face tree API for each model's repository.
 const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         id: "tiny",
@@ -125,28 +121,6 @@ const CATALOG: &[CatalogEntry] = &[
                 "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
             sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
             name: "ggml-large-v3-turbo-q5_0.bin",
-        }],
-    },
-    CatalogEntry {
-        id: "vosk-model-small-en-us-0.15",
-        engine: "vosk",
-        label: "Vosk Small (English)",
-        size_mb: 39,
-        artifacts: &[Artifact {
-            url: "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
-            sha256: "30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498",
-            name: "vosk-model-small-en-us-0.15.zip",
-        }],
-    },
-    CatalogEntry {
-        id: "vosk-model-small-ru-0.22",
-        engine: "vosk",
-        label: "Vosk Small (Russian)",
-        size_mb: 44,
-        artifacts: &[Artifact {
-            url: "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip",
-            sha256: "961d5ff98a17f4aa6de69864d0aa71fa5bac682301d2b5d17a3f24c5c99a46d4",
-            name: "vosk-model-small-ru-0.22.zip",
         }],
     },
     CatalogEntry {
@@ -251,7 +225,7 @@ impl ModelManager {
     }
 
     /// Returns the installed path for `id` (a file for single-artifact
-    /// models, a directory for vosk and multi-artifact models), or `None` if
+    /// models, a directory for multi-artifact models), or `None` if
     /// it is unknown, or not installed. A multi-artifact model is only
     /// reported as installed once every one of its artifacts is present —
     /// a partially downloaded model must never report as ready.
@@ -277,10 +251,8 @@ impl ModelManager {
     /// Only once every artifact has verified does the model become visible
     /// at its final path: a single-artifact model (e.g. whisper) is renamed
     /// directly into place as one file, and a multi-artifact model (e.g. a
-    /// future sherpa-onnx entry) has its whole staging directory renamed
-    /// into place at once. Vosk models are the remaining special case: their
-    /// one artifact is a zip archive that is unpacked into a staging
-    /// directory before that directory is swapped into place.
+    /// sherpa-onnx entry) has its whole staging directory renamed into place
+    /// at once.
     pub fn download(&self, id: &str, progress: &mut dyn FnMut(u64, u64)) -> Result<PathBuf> {
         let entry = *self
             .find(id)
@@ -290,11 +262,7 @@ impl ModelManager {
         fs::create_dir_all(&models_dir)
             .with_context(|| format!("failed to create {}", models_dir.display()))?;
 
-        if entry.engine == "vosk" {
-            self.download_vosk(id, &entry, &models_dir, progress)
-        } else {
-            self.download_artifacts(id, &entry, &models_dir, progress)
-        }
+        self.download_artifacts(id, &entry, &models_dir, progress)
     }
 
     /// Downloads and verifies every artifact of `entry` into a staging
@@ -358,85 +326,6 @@ impl ModelManager {
         Ok(final_path)
     }
 
-    /// Downloads the single zip artifact of a vosk `entry`, verifies its
-    /// sha256, then unpacks it into a staging directory before swapping that
-    /// directory into place.
-    fn download_vosk(
-        &self,
-        id: &str,
-        entry: &CatalogEntry,
-        models_dir: &Path,
-        progress: &mut dyn FnMut(u64, u64),
-    ) -> Result<PathBuf> {
-        let Some(artifact) = entry.artifacts.first() else {
-            bail!("model '{id}' has no artifacts defined");
-        };
-
-        let part_path = models_dir.join(format!("{}.part", artifact.name));
-        let digest = match stream_to_part(artifact.url, &part_path, progress) {
-            Ok(digest) => digest,
-            Err(err) => {
-                let _ = fs::remove_file(&part_path);
-                return Err(err);
-            }
-        };
-
-        if digest != artifact.sha256 {
-            let _ = fs::remove_file(&part_path);
-            bail!(
-                "checksum mismatch for model '{id}': expected {}, got {digest}",
-                artifact.sha256
-            );
-        }
-
-        let final_path = self.install_path(entry);
-        // Extract into a fresh staging directory first, rather than over
-        // `final_path` directly: if extraction fails partway (checksum was
-        // already verified, but e.g. disk is full or the archive is
-        // otherwise unreadable), only the staging directory is discarded and
-        // any prior good install at `final_path` is left untouched. On
-        // success, the old install (if any) is removed only after the new
-        // one has been fully unpacked, then the staged directory is renamed
-        // into place.
-        let staging_root = models_dir.join(format!("{}.staging", artifact.name));
-        let _ = fs::remove_dir_all(&staging_root);
-
-        let unpacked = unpack_zip(&part_path, &staging_root);
-        let _ = fs::remove_file(&part_path);
-        if let Err(err) = unpacked {
-            let _ = fs::remove_dir_all(&staging_root);
-            return Err(err);
-        }
-
-        let staged_dir = final_path.file_name().map(|name| staging_root.join(name));
-        let Some(staged_dir) = staged_dir.filter(|dir| dir.is_dir()) else {
-            let _ = fs::remove_dir_all(&staging_root);
-            bail!(
-                "archive for model '{id}' did not contain the expected directory '{}'",
-                final_path.display()
-            );
-        };
-
-        if final_path.exists() {
-            fs::remove_dir_all(&final_path).with_context(|| {
-                format!(
-                    "failed to remove previous install at {}",
-                    final_path.display()
-                )
-            })?;
-        }
-        fs::rename(&staged_dir, &final_path).with_context(|| {
-            format!(
-                "failed to move {} into {}",
-                staged_dir.display(),
-                final_path.display()
-            )
-        })?;
-        let _ = fs::remove_dir_all(&staging_root);
-
-        Ok(final_path)
-    }
-
     /// Removes the installed model identified by `id`, if present. A no-op
     /// (not an error) if the model is unknown or not installed.
     pub fn remove(&self, id: &str) -> Result<()> {
@@ -464,34 +353,25 @@ impl ModelManager {
         self.catalog.iter().find(|entry| entry.id == id)
     }
 
-    /// The final on-disk path a catalog entry installs to: a directory (the
-    /// zip's basename minus `.zip`) for vosk models, a directory named after
-    /// the entry's `id` for models with more than one artifact, or a single
-    /// file (the artifact's `name`) otherwise.
+    /// The final on-disk path a catalog entry installs to: a directory named
+    /// after the entry's `id` for models with more than one artifact, or a
+    /// single file (the artifact's `name`) otherwise.
     fn install_path(&self, entry: &CatalogEntry) -> PathBuf {
-        match entry.engine {
-            "vosk" => {
-                let name = entry.artifacts.first().map_or(entry.id, |a| a.name);
-                self.models_dir()
-                    .join(name.strip_suffix(".zip").unwrap_or(name))
-            }
-            _ if entry.artifacts.len() > 1 => self.models_dir().join(entry.id),
-            _ => {
-                let name = entry.artifacts.first().map_or(entry.id, |a| a.name);
-                self.models_dir().join(name)
-            }
+        if entry.artifacts.len() > 1 {
+            self.models_dir().join(entry.id)
+        } else {
+            let name = entry.artifacts.first().map_or(entry.id, |a| a.name);
+            self.models_dir().join(name)
         }
     }
 
     /// Whether every artifact of `entry` is present at `path`, the value
     /// returned by [`Self::install_path`] for it.
     fn is_installed(&self, entry: &CatalogEntry, path: &Path) -> bool {
-        match entry.engine {
-            "vosk" => path.is_dir(),
-            _ if entry.artifacts.len() > 1 => {
-                entry.artifacts.iter().all(|a| path.join(a.name).is_file())
-            }
-            _ => path.is_file(),
+        if entry.artifacts.len() > 1 {
+            entry.artifacts.iter().all(|a| path.join(a.name).is_file())
+        } else {
+            path.is_file()
         }
     }
 }
@@ -566,40 +446,6 @@ fn stream_to_part(
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Unpacks the zip archive at `zip_path` into `dest_dir`, preserving each
-/// entry's relative path. Entries with an unsafe (e.g. path-traversing) name
-/// are skipped rather than trusted.
-fn unpack_zip(zip_path: &Path, dest_dir: &Path) -> Result<()> {
-    let file = File::open(zip_path).context("failed to open downloaded archive")?;
-    let mut archive = zip::ZipArchive::new(file).context("failed to read zip archive")?;
-
-    for i in 0..archive.len() {
-        let mut entry = archive
-            .by_index(i)
-            .with_context(|| format!("failed to read zip entry {i}"))?;
-        let Some(relative) = entry.enclosed_name() else {
-            continue;
-        };
-        let out_path = dest_dir.join(relative);
-
-        if entry.is_dir() {
-            fs::create_dir_all(&out_path)
-                .with_context(|| format!("failed to create directory {}", out_path.display()))?;
-        } else {
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create directory {}", parent.display()))?;
-            }
-            let mut out_file = File::create(&out_path)
-                .with_context(|| format!("failed to create {}", out_path.display()))?;
-            std::io::copy(&mut entry, &mut out_file)
-                .with_context(|| format!("failed to extract {}", out_path.display()))?;
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,7 +453,6 @@ mod tests {
 
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-    use zip::write::SimpleFileOptions;
 
     /// Leaks a `Vec<Artifact>` into a `&'static [Artifact]`, mirroring how
     /// the real catalog's entries are `'static` data, so test entries can be
@@ -626,20 +471,6 @@ mod tests {
                 url: Box::leak(url.into_boxed_str()),
                 sha256: Box::leak(sha256.into_boxed_str()),
                 name: "ggml-test.bin",
-            }]),
-        }
-    }
-
-    fn vosk_entry(url: String, sha256: String) -> CatalogEntry {
-        CatalogEntry {
-            id: "test-vosk",
-            engine: "vosk",
-            label: "Test Vosk",
-            size_mb: 1,
-            artifacts: leak_artifacts(vec![Artifact {
-                url: Box::leak(url.into_boxed_str()),
-                sha256: Box::leak(sha256.into_boxed_str()),
-                name: "vosk-model-test.zip",
             }]),
         }
     }
@@ -699,65 +530,6 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
         hex::encode(hasher.finalize())
-    }
-
-    /// Builds a tiny zip archive with a single top-level directory (mirroring
-    /// how real Vosk archives are laid out) containing one small file.
-    fn build_test_vosk_zip(dir_name: &str) -> Vec<u8> {
-        let mut buf = Vec::new();
-        {
-            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let options =
-                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-            writer
-                .start_file(format!("{dir_name}/README"), options)
-                .expect("start_file");
-            writer
-                .write_all(b"tiny vosk model fixture")
-                .expect("write fixture body");
-            writer.finish().expect("finish zip");
-        }
-        buf
-    }
-
-    /// Builds a structurally valid zip archive (two Stored entries under
-    /// `dir_name`) whose second entry's data has been corrupted in place so
-    /// its CRC32 no longer matches: the archive opens fine, but extracting
-    /// the second entry fails partway through. Used to test that a checksum
-    /// can pass (it is computed over these exact, already-corrupt bytes)
-    /// while the subsequent unpack still fails.
-    fn build_corrupt_vosk_zip(dir_name: &str) -> Vec<u8> {
-        let mut buf = Vec::new();
-        let second_content = b"second file content, will be corrupted";
-        {
-            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let options =
-                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-            writer
-                .start_file(format!("{dir_name}/first"), options)
-                .expect("start_file first");
-            writer
-                .write_all(b"first file content, extracted fine")
-                .expect("write first");
-            writer
-                .start_file(format!("{dir_name}/second"), options)
-                .expect("start_file second");
-            writer.write_all(second_content).expect("write second");
-            writer.finish().expect("finish zip");
-        }
-
-        // Flip one byte inside the second entry's stored (uncompressed) data.
-        // Because compression is `Stored`, the entry's bytes appear verbatim
-        // in the archive, so this corrupts its content without touching the
-        // zip's structure or offsets; its recorded CRC32 no longer matches
-        // when read back.
-        let pos = buf
-            .windows(second_content.len())
-            .position(|window| window == second_content)
-            .expect("stored bytes should be present verbatim in the archive");
-        buf[pos] ^= 0xFF;
-
-        buf
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -937,143 +709,6 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn vosk_zip_is_verified_then_unpacked_into_a_directory() {
-        let server = MockServer::start().await;
-        let zip_bytes = build_test_vosk_zip("vosk-model-test");
-        let sha256 = sha256_hex(&zip_bytes);
-
-        Mock::given(method("GET"))
-            .and(path("/vosk-model-test.zip"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
-            .mount(&server)
-            .await;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let entry = vosk_entry(
-            format!("{}/vosk-model-test.zip", server.uri()),
-            sha256.clone(),
-        );
-        let manager = ModelManager::with_catalog(dir.path().to_path_buf(), vec![entry]);
-
-        let installed_path =
-            tokio::task::spawn_blocking(move || manager.download("test-vosk", &mut |_, _| {}))
-                .await
-                .expect("blocking task panicked")
-                .expect("download should succeed");
-
-        assert_eq!(installed_path, dir.path().join("models/vosk-model-test"));
-        assert!(installed_path.is_dir());
-        let readme = fs::read_to_string(installed_path.join("README")).expect("read README");
-        assert_eq!(readme, "tiny vosk model fixture");
-
-        // The intermediate zip must not survive as a stray artifact.
-        assert!(!dir.path().join("models/vosk-model-test.zip.part").exists());
-        assert!(!dir.path().join("models/vosk-model-test.zip").exists());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn vosk_redownload_replaces_stale_files_and_removes_old_content() {
-        let server = MockServer::start().await;
-        let zip_bytes = build_test_vosk_zip("vosk-model-test");
-        let sha256 = sha256_hex(&zip_bytes);
-
-        Mock::given(method("GET"))
-            .and(path("/vosk-model-test.zip"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
-            .mount(&server)
-            .await;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let entry = vosk_entry(
-            format!("{}/vosk-model-test.zip", server.uri()),
-            sha256.clone(),
-        );
-        let manager = ModelManager::with_catalog(dir.path().to_path_buf(), vec![entry]);
-
-        // Simulate a previously installed model containing a file the new
-        // archive does not: a naive "unpack over the same directory" would
-        // leave it behind.
-        let install_dir = dir.path().join("models/vosk-model-test");
-        fs::create_dir_all(&install_dir).expect("create stale install dir");
-        fs::write(
-            install_dir.join("stale-sentinel.txt"),
-            b"leftover from an old version",
-        )
-        .expect("write stale sentinel");
-
-        let installed_path =
-            tokio::task::spawn_blocking(move || manager.download("test-vosk", &mut |_, _| {}))
-                .await
-                .expect("blocking task panicked")
-                .expect("re-download should succeed");
-
-        assert_eq!(installed_path, install_dir);
-        let readme = fs::read_to_string(installed_path.join("README")).expect("read README");
-        assert_eq!(readme, "tiny vosk model fixture");
-        assert!(
-            !installed_path.join("stale-sentinel.txt").exists(),
-            "stale file from the previous install should be gone after re-download"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn vosk_failed_unpack_over_existing_install_leaves_old_install_untouched() {
-        let server = MockServer::start().await;
-        let corrupt_zip = build_corrupt_vosk_zip("vosk-model-test");
-        // The catalog checksum is computed over these exact (already
-        // corrupt) bytes, so checksum verification passes; the failure this
-        // test exercises happens later, while unpacking.
-        let sha256 = sha256_hex(&corrupt_zip);
-
-        Mock::given(method("GET"))
-            .and(path("/vosk-model-test.zip"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(corrupt_zip))
-            .mount(&server)
-            .await;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let entry = vosk_entry(
-            format!("{}/vosk-model-test.zip", server.uri()),
-            sha256.clone(),
-        );
-        let manager = ModelManager::with_catalog(dir.path().to_path_buf(), vec![entry]);
-
-        let install_dir = dir.path().join("models/vosk-model-test");
-        fs::create_dir_all(&install_dir).expect("create existing install dir");
-        fs::write(
-            install_dir.join("good.txt"),
-            b"the good, already-installed model",
-        )
-        .expect("write sentinel");
-
-        let result =
-            tokio::task::spawn_blocking(move || manager.download("test-vosk", &mut |_, _| {}))
-                .await
-                .expect("blocking task panicked");
-
-        assert!(result.is_err(), "unpacking a corrupt archive should fail");
-
-        // The prior good install must be completely untouched.
-        assert_eq!(
-            fs::read_to_string(install_dir.join("good.txt")).expect("read sentinel"),
-            "the good, already-installed model"
-        );
-
-        // No staging directory or leftover zip artifacts beside it.
-        let models_dir = dir.path().join("models");
-        let leftovers: Vec<_> = fs::read_dir(&models_dir)
-            .expect("read models dir")
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name())
-            .filter(|name| name != "vosk-model-test")
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "expected no leftover staging/zip artifacts, found: {leftovers:?}"
-        );
-    }
-
     #[test]
     fn multi_artifact_model_is_installed_only_when_every_file_is_present() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1206,6 +841,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn vosk_is_gone_from_the_catalog() {
+        let models = ModelManager::new(PathBuf::from("/nonexistent"));
+        assert!(
+            models.catalog().iter().all(|m| m.engine != "vosk"),
+            "vosk models must not be offered once the engine is removed"
+        );
     }
 
     #[test]

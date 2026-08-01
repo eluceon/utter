@@ -83,16 +83,11 @@ pub struct EngineCfg {
     /// [`ModelManager::path_for`](crate::ModelManager::path_for) — never a
     /// filesystem path itself.
     pub whisper_model: String,
-    /// Catalog id of the vosk model, resolved the same way as
-    /// [`whisper_model`](Self::whisper_model). Vosk models install as a
-    /// directory rather than a file, which makes it tempting to read this as
-    /// a path; it is not one.
-    pub vosk_model: Option<String>,
     /// Catalog id of the sherpa-onnx model, resolved the same way as
     /// [`whisper_model`](Self::whisper_model) — never a filesystem path
     /// itself. Sherpa models install as a directory of several artifacts
-    /// (encoder, decoder, joiner, tokens), which makes the same mistake as
-    /// [`vosk_model`](Self::vosk_model) easy to reintroduce.
+    /// (encoder, decoder, joiner, tokens), which makes treating this as a
+    /// path an easy mistake to reintroduce.
     pub sherpa_model: Option<String>,
     pub cloud: CloudSttCfg,
 }
@@ -102,7 +97,6 @@ impl Default for EngineCfg {
         Self {
             active: EngineKind::Whisper,
             whisper_model: "small".to_string(),
-            vosk_model: None,
             sherpa_model: None,
             cloud: CloudSttCfg::default(),
         }
@@ -115,7 +109,6 @@ impl Default for EngineCfg {
 pub enum EngineKind {
     #[default]
     Whisper,
-    Vosk,
     Cloud,
     Sherpa,
 }

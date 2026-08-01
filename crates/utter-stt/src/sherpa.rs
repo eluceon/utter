@@ -69,7 +69,7 @@ impl SherpaOfflineEngine {
     ///
     /// `dir` must be a model *directory* as resolved by
     /// `ModelManager::path_for` — never a bare catalog id. Treating an id as
-    /// a path is the exact mistake that broke Vosk model resolution in v0.1.
+    /// a path is an easy mistake that has bitten this codebase before (v0.1).
     ///
     /// # Errors
     /// Returns [`SttError::ModelNotFound`] if `dir` does not exist, or if any
@@ -271,8 +271,7 @@ fn resolve_required_file(dir: &Path, candidates: &[&str]) -> Result<PathBuf, Stt
 /// # Errors
 /// Returns [`SttError::Engine`] if `path` is not valid UTF-8, rather than
 /// silently lossy-converting it into a path that would no longer point at
-/// the file on disk (mirrors `vosk::VoskEngine::load`'s handling of the same
-/// problem).
+/// the file on disk.
 fn path_to_string(path: &Path) -> Result<String, SttError> {
     path.to_str().map(str::to_string).ok_or_else(|| {
         SttError::Engine(format!("model path is not valid UTF-8: {}", path.display()))
@@ -398,7 +397,7 @@ mod tests {
     // `.onnx` files make onnxruntime throw a C++ exception while parsing the
     // protobuf, which unwinds across the FFI boundary uncaught and aborts
     // the process (SIGABRT: "Rust cannot catch foreign exceptions"). Unlike
-    // whisper.cpp/Vosk's C APIs, sherpa-onnx does not appear to guarantee a
+    // whisper.cpp's C API, sherpa-onnx does not appear to guarantee a
     // graceful `None`/error return for every malformed-input shape, so this
     // branch is verified by inspection and the doc comment on `load` rather
     // than by a test that would otherwise take down the whole suite.

@@ -22,15 +22,15 @@
 
   const ENGINE_OPTIONS: { value: EngineKind; label: string }[] = [
     { value: 'whisper', label: 'Whisper (local)' },
-    { value: 'vosk', label: 'Vosk (local)' },
+    { value: 'sherpa', label: 'Sherpa-onnx (local)' },
     { value: 'cloud', label: 'Cloud (OpenAI-compatible)' },
   ]
 
   let whisperModels = $derived(models.filter((m) => m.engine === 'whisper'))
-  let voskModels = $derived(models.filter((m) => m.engine === 'vosk'))
-  let voskOptions = $derived([
+  let sherpaModels = $derived(models.filter((m) => m.engine === 'sherpa'))
+  let sherpaOptions = $derived([
     { value: '', label: 'None selected' },
-    ...voskModels.map((m) => ({ value: m.id, label: m.label })),
+    ...sherpaModels.map((m) => ({ value: m.id, label: m.label })),
   ])
   let whisperOptions = $derived(whisperModels.map((m) => ({ value: m.id, label: m.label })))
 
@@ -180,19 +180,19 @@
   </ul>
 </Section>
 
-<Section title="Vosk models" description="A lighter-weight offline alternative to Whisper.">
-  <Field label="Active model" for="vosk-model">
+<Section title="Sherpa-onnx models" description="A lighter-weight offline alternative to Whisper, with hotword biasing from your dictionary.">
+  <Field label="Active model" for="sherpa-model">
     <Select
-      id="vosk-model"
-      options={voskOptions}
+      id="sherpa-model"
+      options={sherpaOptions}
       bind:value={
-        () => settings.engine.vosk_model ?? '',
-        (v) => settingsStore.patch({ engine: { vosk_model: v === '' ? null : v } })
+        () => settings.engine.sherpa_model ?? '',
+        (v) => settingsStore.patch({ engine: { sherpa_model: v === '' ? null : v } })
       }
     />
   </Field>
   <ul class="model-list">
-    {#each voskModels as model (model.id)}
+    {#each sherpaModels as model (model.id)}
       <li>
         <div class="model-row">
           <div class="model-info">

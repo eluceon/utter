@@ -149,6 +149,62 @@ const CATALOG: &[CatalogEntry] = &[
             name: "vosk-model-small-ru-0.22.zip",
         }],
     },
+    CatalogEntry {
+        id: "gigaam-v3-e2e-rnnt",
+        engine: "sherpa",
+        label: "GigaAM-v3 (Russian)",
+        size_mb: 221,
+        artifacts: &[
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16/resolve/a6039be7cee829a9044a69ac0ebaf1c191217c97/encoder.int8.onnx",
+                sha256: "369f35a71bf288d3b8e0391fabd8dba5f2314088d440bca474056b7b4b6e66bf",
+                name: "encoder.int8.onnx",
+            },
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16/resolve/a6039be7cee829a9044a69ac0ebaf1c191217c97/decoder.onnx",
+                sha256: "38fc7475443ea2a26f63211ca350f73ac50fff824ab7a3876ee2bd610c53bbc4",
+                name: "decoder.onnx",
+            },
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16/resolve/a6039be7cee829a9044a69ac0ebaf1c191217c97/joiner.onnx",
+                sha256: "602ff7017a93311aad34df1437c8d7f49911353c13d6eae7a6ee7b041339465c",
+                name: "joiner.onnx",
+            },
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16/resolve/a6039be7cee829a9044a69ac0ebaf1c191217c97/tokens.txt",
+                sha256: "39abae20e692998290c574e606f11a9edef2902a1995463fcff63d1490cf22b7",
+                name: "tokens.txt",
+            },
+        ],
+    },
+    CatalogEntry {
+        id: "parakeet-tdt-110m-en",
+        engine: "sherpa",
+        label: "Parakeet TDT (English)",
+        size_mb: 455,
+        artifacts: &[
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000/resolve/e9bea5a06247dc3f55319ff23d34b0328f2f5ddf/encoder.onnx",
+                sha256: "db260f1073c654c37dd65006885d1ee98ff16c22463b1ef992bbcabc29780a3f",
+                name: "encoder.onnx",
+            },
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000/resolve/e9bea5a06247dc3f55319ff23d34b0328f2f5ddf/decoder.onnx",
+                sha256: "3da156bde41a04c94ef783e0bd92928e9974e08645b976a22d0c3e1063510249",
+                name: "decoder.onnx",
+            },
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000/resolve/e9bea5a06247dc3f55319ff23d34b0328f2f5ddf/joiner.onnx",
+                sha256: "b603765c0724a0768c378a23326dabbeb9cfea932d260e4fcc14384fa5fd5aff",
+                name: "joiner.onnx",
+            },
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000/resolve/e9bea5a06247dc3f55319ff23d34b0328f2f5ddf/tokens.txt",
+                sha256: "450e56bd2f036fe5b6aa821865838cc5aa9d8b0106134ce9a9ba0664abe6cd10",
+                name: "tokens.txt",
+            },
+        ],
+    },
 ];
 
 /// Manages the local install state of the speech-to-text model catalog:
@@ -1127,6 +1183,29 @@ mod tests {
             remaining.is_empty(),
             "expected no leftover files or directories, found: {remaining:?}"
         );
+    }
+
+    // `ModelInfo` (the type `ModelManager::catalog()` returns) does not carry
+    // artifacts, only installed state, so this checks the real hard-coded
+    // `CatalogEntry` data directly rather than going through the manager.
+    #[test]
+    fn catalog_entries_declare_every_artifact_they_need() {
+        for entry in CATALOG {
+            assert!(
+                !entry.artifacts.is_empty(),
+                "{} declares no artifacts",
+                entry.id
+            );
+            for artifact in entry.artifacts {
+                assert_eq!(
+                    artifact.sha256.len(),
+                    64,
+                    "{}: {} has a malformed sha256",
+                    entry.id,
+                    artifact.name
+                );
+            }
+        }
     }
 
     #[test]

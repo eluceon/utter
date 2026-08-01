@@ -112,6 +112,13 @@ impl SherpaOfflineEngine {
                 model_type: Some("nemo_transducer".to_string()),
                 ..Default::default()
             },
+            // Greedy unless the dictionary actually has terms to bias
+            // towards (spec D10). Safe to apply unconditionally here: this
+            // function only ever builds a transducer config above (encoder,
+            // decoder and joiner are all required to exist by this point),
+            // and transducer is the one model family `decoding_method`
+            // assumes — see its doc comment for why that assumption matters.
+            decoding_method: Some(decoding_method(&cfg.hotwords).to_string()),
             ..Default::default()
         };
 
@@ -294,6 +301,36 @@ fn build_hotwords_arg(hotwords: &[String]) -> Result<Option<String>, SttError> {
     Ok(Some(joined))
 }
 
+/// Chooses sherpa-onnx's `decoding_method` from whether `hotwords` is empty.
+///
+/// Per the upstream hotwords guide
+/// <https://k2-fsa.github.io/sherpa/onnx/hotwords/index.html>, sherpa-onnx's
+/// default `"greedy_search"` decoder ignores hotwords entirely; using them
+/// requires switching to `"modified_beam_search"`. Beam search is
+/// meaningfully slower than greedy search, and most users have an empty
+/// dictionary, so this is a policy rather than a setting (spec D10):
+/// nothing configures it directly, and it is derived purely from the
+/// dictionary's contents so that beam search is only ever paid for by the
+/// users who actually benefit from it.
+///
+/// This assumes the model being decoded is a transducer: the same upstream
+/// page states that hotwords only work for that model family.
+/// [`SherpaOfflineEngine::load`] only ever builds transducer configs (see
+/// its doc comment), so that assumption always holds at its call site. A
+/// loader that also accepted CTC models would need to detect that case
+/// itself, log a warning naming the limitation, and force
+/// `"greedy_search"` regardless of the dictionary — silently dropping
+/// hotwords is safer than failing the load, but applying this function's
+/// result unconditionally would silently ignore them instead of falling
+/// back deliberately.
+pub fn decoding_method(hotwords: &[String]) -> &'static str {
+    if hotwords.is_empty() {
+        "greedy_search"
+    } else {
+        "modified_beam_search"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -445,6 +482,16 @@ mod tests {
         let hotwords = vec!["bad\0word".to_string()];
         let err = build_hotwords_arg(&hotwords).expect_err("null byte must be rejected");
         assert!(matches!(err, SttError::Engine(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn beam_search_is_only_paid_for_when_hotwords_exist() {
+        assert_eq!(decoding_method(&[]), "greedy_search");
+        assert_eq!(
+            decoding_method(&["PostgreSQL".to_string()]),
+            "modified_beam_search",
+            "hotwords require beam search; without them the user must not pay for it"
+        );
     }
 
     #[test]

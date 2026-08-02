@@ -78,6 +78,7 @@ impl Default for Dictation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EngineCfg {
+    #[serde(deserialize_with = "deserialize_active_engine")]
     pub active: EngineKind,
     /// Catalog id of the whisper model, resolved to an on-disk path through
     /// [`ModelManager::path_for`](crate::ModelManager::path_for) — never a
@@ -111,6 +112,33 @@ pub enum EngineKind {
     Whisper,
     Cloud,
     Sherpa,
+}
+
+/// Deserializes `engine.active`, tolerating a name this build does not
+/// recognise (e.g. a v0.1 config's `active = "vosk"`, left behind once the
+/// Vosk engine was removed). The derived `Deserialize` for [`EngineKind`]
+/// would fail the *whole* TOML document on an unrecognised variant — the
+/// unknown-key tolerance `#[serde(default)]` gives every other field does
+/// not extend to enum values. Falling back to [`EngineKind::default`] here
+/// keeps a stale engine name from turning into a startup crash; the value
+/// is logged so the fallback is not silent.
+fn deserialize_active_engine<'de, D>(deserializer: D) -> Result<EngineKind, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(match raw.as_str() {
+        "whisper" => EngineKind::Whisper,
+        "cloud" => EngineKind::Cloud,
+        "sherpa" => EngineKind::Sherpa,
+        other => {
+            let fallback = EngineKind::default();
+            tracing::warn!(
+                "unrecognized engine.active value \"{other}\" in settings; falling back to {fallback:?}"
+            );
+            fallback
+        }
+    })
 }
 
 /// Configuration for an OpenAI-compatible cloud speech-to-text endpoint.
@@ -349,6 +377,31 @@ mod tests {
 
         let result = load(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn an_unknown_engine_name_falls_back_without_losing_other_settings() {
+        // A v0.1 config naming an engine this build no longer has. The whole
+        // document must still parse: the user's hotkey and dictionary are not
+        // collateral damage for one stale enum value.
+        let toml = r#"
+[dictation]
+hotkey = "ctrl+alt+super"
+
+[engine]
+active = "vosk"
+vosk_model = "vosk-model-small-ru-0.22"
+
+[dictionary]
+terms = ["PostgreSQL"]
+"#;
+
+        let settings: Settings =
+            toml::from_str(toml).expect("an unknown engine must not fail the file");
+
+        assert_eq!(settings.engine.active, EngineKind::default());
+        assert_eq!(settings.dictation.hotkey, "ctrl+alt+super");
+        assert_eq!(settings.dictionary.terms, vec!["PostgreSQL".to_string()]);
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! Spike: prove end-to-end offline transcription with sherpa-onnx.
 //!
-//! This is throwaway exploration code for Task 1 of the v0.2 plan — it exists
-//! to pin down the real `sherpa-onnx` API surface before any adapter code is
-//! written against it. Run with:
+//! This is throwaway exploration code that predates `SherpaOfflineEngine` —
+//! it exists to pin down the real `sherpa-onnx` API surface before any
+//! adapter code is written against it. Run with:
 //!
 //! ```bash
 //! cargo run -p utter-stt --features sherpa --example sherpa_spike -- /path/to/ru.wav

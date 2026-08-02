@@ -860,7 +860,7 @@ mod tests {
     #[test]
     fn a_truncated_artifact_is_reported_as_damaged_not_installed() {
         // The failure this guards against is not hypothetical: a 456 MB model
-        // download stalled silently partway through during Task 3, leaving a
+        // download was observed to stall silently partway through, leaving a
         // file of exactly the right name and the wrong length.
         let dir = tempfile::tempdir().expect("tempdir");
         let models = ModelManager::with_catalog(dir.path().to_path_buf(), vec![two_file_entry()]);

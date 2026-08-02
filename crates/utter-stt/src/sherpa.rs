@@ -19,8 +19,8 @@ use utter_core::{SttEngine, SttError, TranscribeOptions, Transcript, SAMPLE_RATE
 /// The catalog's two models package the same three-file transducer layout
 /// under different encoder filenames: GigaAM-v3 ships a quantized
 /// `encoder.int8.onnx`, while the English Parakeet entry ships a
-/// full-precision `encoder.onnx` (see the Task 3 catalog notes — the two are
-/// deliberately not normalized to one shared name upstream).
+/// full-precision `encoder.onnx`; upstream does not normalize the two to one
+/// shared name.
 const ENCODER_CANDIDATES: [&str; 2] = ["encoder.int8.onnx", "encoder.onnx"];
 
 /// Configuration for [`SherpaOfflineEngine::load`].
@@ -28,8 +28,8 @@ const ENCODER_CANDIDATES: [&str; 2] = ["encoder.int8.onnx", "encoder.onnx"];
 pub struct SherpaConfig {
     /// Number of onnxruntime inference threads. Clamped to at least one.
     pub num_threads: usize,
-    /// Dictionary terms to bias recognition towards (spec D9/D13 hotwords).
-    /// Only takes effect once decoding uses `modified_beam_search`.
+    /// Dictionary terms to bias recognition towards. Only takes effect once
+    /// decoding uses `modified_beam_search` — see [`decoding_method`].
     pub hotwords: Vec<String>,
 }
 
@@ -112,12 +112,12 @@ impl SherpaOfflineEngine {
                 model_type: Some("nemo_transducer".to_string()),
                 ..Default::default()
             },
-            // Greedy unless the dictionary actually has terms to bias
-            // towards (spec D10). Safe to apply unconditionally here: this
-            // function only ever builds a transducer config above (encoder,
-            // decoder and joiner are all required to exist by this point),
-            // and transducer is the one model family `decoding_method`
-            // assumes — see its doc comment for why that assumption matters.
+            // Greedy unless the dictionary actually has terms to bias towards.
+            // Safe to apply unconditionally here: this function only ever
+            // builds a transducer config above (encoder, decoder and joiner
+            // are all required to exist by this point), and transducer is
+            // the one model family `decoding_method` assumes — see its doc
+            // comment for why that assumption matters.
             decoding_method: Some(decoding_method(&cfg.hotwords).to_string()),
             ..Default::default()
         };
@@ -307,10 +307,10 @@ fn build_hotwords_arg(hotwords: &[String]) -> Result<Option<String>, SttError> {
 /// default `"greedy_search"` decoder ignores hotwords entirely; using them
 /// requires switching to `"modified_beam_search"`. Beam search is
 /// meaningfully slower than greedy search, and most users have an empty
-/// dictionary, so this is a policy rather than a setting (spec D10):
-/// nothing configures it directly, and it is derived purely from the
-/// dictionary's contents so that beam search is only ever paid for by the
-/// users who actually benefit from it.
+/// dictionary, so this is a policy rather than a setting: nothing configures
+/// it directly, and it is derived purely from the dictionary's contents so
+/// that beam search is only ever paid for by the users who actually benefit
+/// from it.
 ///
 /// This assumes the model being decoded is a transducer: the same upstream
 /// page states that hotwords only work for that model family.
@@ -370,7 +370,7 @@ mod tests {
     fn feed_buffers_without_producing_partials() {
         // The offline engine is batch: per the port contract it accumulates in
         // feed() and does all its work in finish(). Returning a partial here
-        // would make it indistinguishable from a draft engine (spec D9).
+        // would make it indistinguishable from a draft engine.
         let mut engine = test_engine();
         assert_eq!(engine.begin(&TranscribeOptions::default()), Ok(()));
         assert_eq!(engine.feed(&[0i16; 1600]), Ok(None));

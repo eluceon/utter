@@ -269,10 +269,10 @@ fn build_whisper(model_id: &str, models: &ModelManager) -> (Box<dyn SttEngine>, 
 
 /// The number of onnxruntime inference threads sherpa-onnx is allowed to
 /// use: half the detected core count, clamped by
-/// `utter_stt::sherpa::default_threads` (Task 6's policy, so the desktop
-/// stays responsive while transcribing). `available_parallelism` can fail on
-/// some platforms/sandboxes; a single thread is a safe, always-available
-/// fallback rather than propagating that as a boot failure.
+/// `utter_stt::sherpa::default_threads`, so the desktop stays responsive
+/// while transcribing. `available_parallelism` can fail on some
+/// platforms/sandboxes; a single thread is a safe, always-available fallback
+/// rather than propagating that as a boot failure.
 #[cfg(feature = "sherpa")]
 fn sherpa_thread_count() -> usize {
     let available = std::thread::available_parallelism()

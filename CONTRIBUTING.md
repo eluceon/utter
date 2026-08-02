@@ -63,6 +63,8 @@ CI (`.github/workflows/ci.yml`) runs, and any change must pass, all of:
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --workspace
+cargo clippy --workspace --all-targets --features sherpa -- -D warnings
+cargo test --workspace --features sherpa
 ```
 
 ## Commit style

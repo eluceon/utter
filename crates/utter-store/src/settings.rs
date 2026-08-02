@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
+use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 
 use utter_core::{DictationMode, Tone};
@@ -122,23 +123,41 @@ pub enum EngineKind {
 /// not extend to enum values. Falling back to [`EngineKind::default`] here
 /// keeps a stale engine name from turning into a startup crash; the value
 /// is logged so the fallback is not silent.
+///
+/// The fallback re-uses the derived `Deserialize` for [`EngineKind`] instead
+/// of hand-writing the string-to-variant mapping a second time: a mapping
+/// duplicated here would silently drift out of sync with the derive as soon
+/// as a variant is added (it would compile, and just deserialize the new
+/// name back to the default), whereas delegating to the derive means a new
+/// variant is picked up automatically.
 fn deserialize_active_engine<'de, D>(deserializer: D) -> Result<EngineKind, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let raw = String::deserialize(deserializer)?;
-    Ok(match raw.as_str() {
-        "whisper" => EngineKind::Whisper,
-        "cloud" => EngineKind::Cloud,
-        "sherpa" => EngineKind::Sherpa,
-        other => {
-            let fallback = EngineKind::default();
-            tracing::warn!(
-                "unrecognized engine.active value \"{other}\" in settings; falling back to {fallback:?}"
-            );
-            fallback
-        }
-    })
+    Ok(
+        EngineKind::deserialize(raw.as_str().into_deserializer()).unwrap_or_else(
+            |_: serde::de::value::Error| {
+                let fallback = EngineKind::default();
+                tracing::warn!(
+                    "unrecognized engine.active value \"{raw}\" in settings; falling back to \"{}\"",
+                    engine_kind_as_toml(fallback)
+                );
+                fallback
+            },
+        ),
+    )
+}
+
+/// Renders `kind` the way it appears in a TOML config file (its
+/// `#[serde(rename_all = "snake_case")]` spelling), for diagnostics aimed at
+/// someone reading their `config.toml` — not `{kind:?}`'s Rust spelling,
+/// which a user grepping their logs for `active = "whisper"` will not find.
+fn engine_kind_as_toml(kind: EngineKind) -> String {
+    toml::Value::try_from(kind)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{kind:?}"))
 }
 
 /// Configuration for an OpenAI-compatible cloud speech-to-text endpoint.

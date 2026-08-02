@@ -12,7 +12,7 @@ plugged in at the edge.
 |---|---|
 | `utter-core` | Domain: the `Session` state machine, ports (`SttEngine`, `TextRefiner`, `TextInjector`), and shared types (`Transcript`, `Tone`, `InjectionMethod`). No I/O. |
 | `utter-audio` | Microphone capture via `cpal`, resampling to 16 kHz mono `i16` (`rubato`), RMS level and silence detection. |
-| `utter-stt` | Speech-to-text adapters behind Cargo features: `whisper` (whisper.cpp via `whisper-rs`), `sherpa` (offline sherpa-onnx transducer via the `sherpa-onnx` crate), `cloud` (any OpenAI-compatible `/audio/transcriptions` endpoint). |
+| `utter-stt` | Speech-to-text adapters behind Cargo features: `whisper` (whisper.cpp via `whisper-rs`), `sherpa` (offline sherpa-onnx transducer via the `sherpa-onnx` crate — one native runtime serving two per-language models, GigaAM-v3 for Russian and Parakeet TDT 110M for English), `cloud` (any OpenAI-compatible `/audio/transcriptions` endpoint). |
 | `utter-refine` | Transcript post-processing: dictionary replacement rules, snippet matching, prompt construction, and the LLM client (any OpenAI-compatible `/chat/completions` endpoint). |
 | `utter-inject` | Global hotkey capture (evdev, with an X11 `global-hotkey` fallback) and text injection backends (clipboard-paste, direct typing, clipboard-only), chained with automatic fallback. |
 | `utter-store` | TOML settings persistence, the SQLite-backed history repository, and the STT model catalog/downloader. |
@@ -152,6 +152,16 @@ at `finish()` — it exists for a future streaming engine.
   calls (cloud STT, LLM refinement) use `reqwest`'s blocking client from the
   runtime's own worker thread rather than pulling `tokio` into the domain
   or adapter crates.
+- **One sherpa-onnx adapter for two languages, not two engines** —
+  `SherpaOfflineEngine` doesn't know or care whether the directory it was
+  given holds GigaAM-v3 or Parakeet TDT 110M: both are NeMo transducer
+  exports with the same encoder/decoder/joiner/tokens layout (only the
+  encoder filename differs — `encoder.int8.onnx` vs `encoder.onnx` — which
+  `load()` resolves by trying both). Three engines (`whisper`, `sherpa`,
+  `cloud`) are therefore backed by two native runtimes — whisper.cpp and
+  onnxruntime via sherpa-onnx, both linked statically — with the
+  onnxruntime one covering both language roles instead of one runtime per
+  language.
 - **One trait for both batch and streaming engines** — `SttEngine::feed`
   returns `Option<String>` rather than `()` so a batch engine (whisper.cpp,
   sherpa-onnx — both only produce a result at `finish()`) and a future

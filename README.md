@@ -25,9 +25,12 @@ endpoint, a model download).
   HUD showing recording/transcribing/refining state and a live input level
   meter, cancel with Escape or a hotkey tap.
 - **Speech-to-text engines** — `whisper.cpp` for accurate batch transcription
-  (tiny through large-v3-turbo, quantized variants included), `sherpa-onnx`
-  for fast offline transcription with hotword biasing, or any
-  OpenAI-compatible cloud `/audio/transcriptions` endpoint (BYOK).
+  (tiny through large-v3-turbo, quantized variants included); `sherpa-onnx`
+  for fast offline transcription, one transducer model per language
+  (GigaAM-v3, Russian only, and Parakeet TDT 110M, English), both emitting
+  punctuation and capitalization directly and both accepting personal
+  dictionary terms as hotwords; or any OpenAI-compatible cloud
+  `/audio/transcriptions` endpoint (BYOK).
 - **AI text refinement** — optional pass over the transcript: removes filler
   words, fixes punctuation and casing, applies a tone preset (`verbatim`,
   `clean`, `formal`, `notes`, `code-comment`). Works against any
@@ -155,8 +158,10 @@ missing file just means defaults; unknown keys are ignored rather than
 rejected, so the format tolerates being hand-edited or partially upgraded.
 
 - **Engines** — pick `whisper`, `sherpa`, or `cloud` as the active
-  speech-to-text engine; whisper models download to
-  `~/.local/share/utter/models`.
+  speech-to-text engine; models download to `~/.local/share/utter/models`.
+  The sherpa-onnx catalog has one model per language — GigaAM-v3 is Russian
+  only, Parakeet TDT 110M is English only — so pick the one matching what
+  you're dictating in.
 - **Refinement** — point `refine.base_url` / `refine.model` at any
   OpenAI-compatible chat endpoint; the settings UI ships presets for OpenAI,
   Groq, OpenRouter, DeepSeek, and Ollama. For a fully local setup, run

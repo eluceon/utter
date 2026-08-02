@@ -7,12 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+### Added
 
-- The configured Vosk model is now resolved through the model manager like
-  the Whisper one. It was passed to the engine as a filesystem path, so it
-  resolved relative to the working directory and a downloaded model was
-  reported as missing.
+- `sherpa-onnx` offline speech-to-text engine, with one transducer model per
+  supported language: GigaAM-v3 for Russian and Parakeet TDT 110M for
+  English. Both emit punctuation and capitalization directly from audio and
+  both accept personal dictionary terms as recognition hotwords.
+- Model catalog support for models made of several files (encoder, decoder,
+  joiner, tokens), installed and verified as a set.
+- Artifact size verification before a downloaded model is handed to the
+  sherpa-onnx engine, so a truncated download is reported as a "damaged
+  model" notice instead of reaching a native decoder that cannot fail
+  gracefully.
+
+### Changed
+
+- Decoding switches from greedy to beam search automatically once the
+  dictionary has terms, so hotword biasing is available without the
+  latency cost falling on users with an empty dictionary.
+- sherpa-onnx inference threads default to half the available CPU cores,
+  capped at four, to keep the desktop responsive during transcription.
+- An unrecognized `engine.active` value in `config.toml` (for example
+  `"vosk"`, left over from a v0.1 install) now falls back to the default
+  engine at startup instead of preventing the app from starting.
+
+### Removed
+
+- **Breaking:** the Vosk speech-to-text engine has been removed, replaced
+  by sherpa-onnx. `scripts/setup-libvosk.sh` and the `vosk` Cargo feature
+  are gone; sherpa-onnx links statically and needs no `RUSTFLAGS` /
+  `LD_LIBRARY_PATH` setup. A `config.toml` with `engine.active = "vosk"`
+  now falls back to the default engine rather than being migrated —
+  carrying the rest of a v0.1 config forward (including which model was
+  selected) is planned for a later release.
 
 ## [0.1.0] - 2026-07-25
 

@@ -155,6 +155,12 @@ impl SherpaOfflineEngine {
 }
 
 impl SttEngine for SherpaOfflineEngine {
+    /// Dictionary terms reach this engine as hotwords fixed at [`Self::load`]
+    /// time, not through `opts.initial_prompt`: sherpa-onnx's offline API has
+    /// no per-utterance prompt hook, so `opts.initial_prompt` is accepted for
+    /// port-contract compatibility but ignored by design. This is the
+    /// opposite lifecycle from whisper.cpp, which re-supplies it on every
+    /// `begin()` — see `RuntimeDeps::dictionary_terms` for the full picture.
     fn begin(&mut self, opts: &TranscribeOptions) -> Result<(), SttError> {
         begin_session(&mut self.opts, &mut self.buffer, opts);
         Ok(())

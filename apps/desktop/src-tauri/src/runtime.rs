@@ -184,10 +184,14 @@ pub struct RuntimeDeps {
     pub language: Option<String>,
     /// Recorded on each history entry (e.g. `"whisper"`, `"sherpa"`, `"cloud"`).
     pub engine_label: String,
-    /// User-configured dictionary terms (proper nouns, jargon, ...), passed
-    /// to the STT engine as an `initial_prompt` hint on every `begin()` call
-    /// so the engine is more likely to recognize them in the first place —
-    /// distinct from `rules`, which rewrite the transcript after the fact.
+    /// User-configured dictionary terms (proper nouns, jargon, ...), fed to
+    /// the active engine as a recognition hint so it is more likely to get
+    /// them right in the first place — distinct from `rules`, which rewrite
+    /// the transcript after the fact. How they are delivered is
+    /// engine-specific: whisper.cpp takes them as an `initial_prompt` on
+    /// every `begin()`, while sherpa-onnx takes them as hotwords fixed at
+    /// model load, which is why changing them rebuilds the runtime (see
+    /// `runtime_boot::build_sherpa`) rather than being re-supplied per call.
     pub dictionary_terms: Vec<String>,
 }
 

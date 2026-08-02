@@ -469,7 +469,7 @@ fn spawn_hotkey_source(hotkey: &str) -> (Receiver<HotkeyEvent>, Option<String>) 
         }
     };
 
-    let source = match create_source(&spec) {
+    let source = match create_source(&[spec]) {
         Ok(source) => source,
         Err(e) => {
             std::mem::forget(tx);

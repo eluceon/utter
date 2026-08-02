@@ -431,8 +431,16 @@ fn worker_loop(deps: RuntimeDeps, sink: Arc<dyn EventSink>, control_rx: Receiver
 
         select! {
             recv(ctx.hotkey_rx) -> msg => match msg {
-                Ok(HotkeyEvent::Pressed) => dispatch(&mut session, &mut ctx, Event::HotkeyPressed),
-                Ok(HotkeyEvent::Released) => dispatch(&mut session, &mut ctx, Event::HotkeyReleased),
+                // `binding` is ignored here: this runtime registers a
+                // single hotkey today, so every event belongs to it.
+                // Routing per binding (e.g. to a language profile) is a
+                // later step's job.
+                Ok(HotkeyEvent::Pressed { .. }) => {
+                    dispatch(&mut session, &mut ctx, Event::HotkeyPressed)
+                }
+                Ok(HotkeyEvent::Released { .. }) => {
+                    dispatch(&mut session, &mut ctx, Event::HotkeyReleased)
+                }
                 // Hotkey source gone (e.g. mid re-registration); nothing to
                 // do until a `reload` supplies a fresh receiver.
                 Err(_) => {}

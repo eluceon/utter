@@ -17,7 +17,7 @@ use utter_core::{
     TextRefiner, Tone, TranscribeOptions, Transcript,
 };
 use utter_desktop_lib::runtime::{ActiveCapture, CaptureBackend, EventSink, Runtime, RuntimeDeps};
-use utter_inject::HotkeyEvent;
+use utter_inject::{BindingId, HotkeyEvent};
 use utter_refine::{ReplaceRule, Snippet};
 use utter_store::HistoryRepo;
 
@@ -359,11 +359,17 @@ fn happy_path_emits_full_sequence_and_injects_refined_text() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
 
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "refining");
@@ -394,10 +400,16 @@ fn refiner_failure_injects_raw_and_notifies() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "refining");
@@ -440,10 +452,16 @@ fn dictionary_rule_applied_before_injection_and_history() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "injecting");
@@ -477,10 +495,16 @@ fn dictionary_terms_are_passed_to_engine_as_initial_prompt() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "injecting");
@@ -506,10 +530,16 @@ fn empty_dictionary_terms_produce_no_initial_prompt() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "injecting");
@@ -542,10 +572,16 @@ fn snippet_trigger_bypasses_refiner() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "refining");
@@ -576,7 +612,11 @@ fn cancel_during_recording_injects_nothing() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
 
     handle.cancel();
@@ -613,10 +653,16 @@ fn cancel_after_finish_before_transcript_ready_injects_nothing() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
 
@@ -655,10 +701,16 @@ fn cancel_during_refine_injects_nothing() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "refining");
@@ -687,10 +739,16 @@ fn empty_transcript_notifies_and_injects_nothing() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "idle");
@@ -728,10 +786,16 @@ fn history_entry_recorded_with_raw_and_final_text() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "refining");
@@ -780,11 +844,15 @@ fn reload_swaps_deps_between_sessions() {
     handle.reload(deps_b);
 
     hotkey_tx_b
-        .send(HotkeyEvent::Pressed)
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
         .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx_b
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "injecting");
@@ -803,7 +871,9 @@ fn reload_swaps_deps_between_sessions() {
 
     // The old hotkey channel's receiver was dropped by `reload`; sending on
     // it now simply fails rather than resurrecting the old session.
-    let _ = hotkey_tx.send(HotkeyEvent::Pressed);
+    let _ = hotkey_tx.send(HotkeyEvent::Pressed {
+        binding: BindingId::from(0),
+    });
 
     handle.shutdown();
 }
@@ -849,7 +919,11 @@ fn audio_frames_are_fed_to_engine_and_partial_reaches_sink() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
 
     let tx = capture_tx(&tx_slot);
@@ -890,7 +964,11 @@ fn trailing_frames_are_fed_before_finish_is_called() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
 
     let tx = capture_tx(&tx_slot);
@@ -909,7 +987,9 @@ fn trailing_frames_are_fed_before_finish_is_called() {
     })
     .expect("send frame 2");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
 
     // Depending on which the `select!` loop happens to service first, zero,

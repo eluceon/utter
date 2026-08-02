@@ -5,12 +5,13 @@
 //! This module only builds on Linux; non-Linux targets never reference it
 //! (see `create_source` and `check_permissions` in `crate::hotkey`).
 
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use evdev::{Device, EventSummary, KeyCode};
 
 use crate::hotkey::{
-    is_stale, ChordTracker, HotkeyEvent, HotkeySource, HotkeySpec, KeyToken, PermissionProbe,
+    is_stale, ChordMatcher, HotkeyEvent, HotkeySource, HotkeySpec, Key, PermissionProbe,
     SHUTDOWN_POLL_INTERVAL,
 };
 
@@ -86,28 +87,39 @@ fn uinput_writable() -> bool {
         .is_ok()
 }
 
-/// Resolves a [`HotkeySpec`]'s tokens to evdev key-code alternatives: one
-/// group per token, where any key within a group satisfies it (e.g. either
-/// physical Ctrl key satisfies a `Ctrl` token).
-fn resolve_groups(spec: &HotkeySpec) -> Vec<Vec<KeyCode>> {
-    spec.tokens()
-        .map(|token| resolve_alternatives(*token))
-        .collect()
+/// Builds the reverse mapping from physical evdev key codes to the logical
+/// [`Key`] each represents, covering every token used across `specs`. Both
+/// physical Ctrl keys (etc.) map to the same `Key::Ctrl`, so a chord like
+/// `ctrl+super` fires regardless of which physical Ctrl was held.
+///
+/// Shared by every chord in `specs` rather than resolved per-spec: a single
+/// evdev source watches all of them at once (see `create_source`), so it
+/// needs one lookup table covering their combined tokens.
+fn resolve_key_codes(specs: &[HotkeySpec]) -> HashMap<KeyCode, Key> {
+    let mut codes = HashMap::new();
+    for spec in specs {
+        for token in spec.tokens() {
+            for code in resolve_alternatives(*token) {
+                codes.insert(code, *token);
+            }
+        }
+    }
+    codes
 }
 
-fn resolve_alternatives(token: KeyToken) -> Vec<KeyCode> {
+fn resolve_alternatives(token: Key) -> Vec<KeyCode> {
     let codes = match token {
-        KeyToken::Ctrl => vec![KeyCode::KEY_LEFTCTRL, KeyCode::KEY_RIGHTCTRL],
-        KeyToken::Alt => vec![KeyCode::KEY_LEFTALT, KeyCode::KEY_RIGHTALT],
-        KeyToken::Shift => vec![KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_RIGHTSHIFT],
-        KeyToken::Super => vec![KeyCode::KEY_LEFTMETA, KeyCode::KEY_RIGHTMETA],
-        KeyToken::Char(c) => KeyCode::from_str(&format!("KEY_{}", c.to_ascii_uppercase()))
+        Key::Ctrl => vec![KeyCode::KEY_LEFTCTRL, KeyCode::KEY_RIGHTCTRL],
+        Key::Alt => vec![KeyCode::KEY_LEFTALT, KeyCode::KEY_RIGHTALT],
+        Key::Shift => vec![KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_RIGHTSHIFT],
+        Key::Super => vec![KeyCode::KEY_LEFTMETA, KeyCode::KEY_RIGHTMETA],
+        Key::Char(c) => KeyCode::from_str(&format!("KEY_{}", c.to_ascii_uppercase()))
             .into_iter()
             .collect(),
-        KeyToken::Function(n) => KeyCode::from_str(&format!("KEY_F{n}"))
+        Key::Function(n) => KeyCode::from_str(&format!("KEY_F{n}"))
             .into_iter()
             .collect(),
-        KeyToken::Space => vec![KeyCode::KEY_SPACE],
+        Key::Space => vec![KeyCode::KEY_SPACE],
     };
 
     if codes.is_empty() {
@@ -120,16 +132,19 @@ fn resolve_alternatives(token: KeyToken) -> Vec<KeyCode> {
 }
 
 /// An evdev-backed [`HotkeySource`]: spawns one reader thread per readable
-/// keyboard device and merges their key events into a single chord tracker.
+/// keyboard device and merges their key events into a single [`ChordMatcher`]
+/// watching every registered chord at once.
 pub(crate) struct EvdevHotkeySource {
-    groups: Vec<Vec<KeyCode>>,
+    key_codes: HashMap<KeyCode, Key>,
+    matcher: ChordMatcher,
     generation: u64,
 }
 
 impl EvdevHotkeySource {
-    pub(crate) fn new(spec: &HotkeySpec, generation: u64) -> Self {
+    pub(crate) fn new(specs: &[HotkeySpec], generation: u64) -> Self {
         Self {
-            groups: resolve_groups(spec),
+            key_codes: resolve_key_codes(specs),
+            matcher: ChordMatcher::new(specs),
             generation,
         }
     }
@@ -192,7 +207,8 @@ impl HotkeySource for EvdevHotkeySource {
         }
         drop(raw_tx);
 
-        let mut tracker = ChordTracker::new(self.groups);
+        let key_codes = self.key_codes;
+        let mut matcher = self.matcher;
         loop {
             if is_stale(generation) {
                 return;
@@ -200,7 +216,15 @@ impl HotkeySource for EvdevHotkeySource {
 
             match raw_rx.recv_timeout(SHUTDOWN_POLL_INTERVAL) {
                 Ok((code, is_down)) => {
-                    if let Some(event) = tracker.on_key_change(code, is_down) {
+                    let Some(&key) = key_codes.get(&code) else {
+                        continue;
+                    };
+                    let event = if is_down {
+                        matcher.on_key_down(key)
+                    } else {
+                        matcher.on_key_up(key)
+                    };
+                    if let Some(event) = event {
                         if tx.send(event).is_err() {
                             return;
                         }
@@ -221,32 +245,38 @@ mod tests {
     #[test]
     fn resolves_modifier_tokens_to_both_physical_keys() {
         let spec = parse_hotkey("ctrl+super").unwrap();
-        let groups = resolve_groups(&spec);
-        assert_eq!(groups.len(), 2);
-        assert!(groups
-            .iter()
-            .any(|g| g.contains(&KeyCode::KEY_LEFTCTRL) && g.contains(&KeyCode::KEY_RIGHTCTRL)));
-        assert!(groups
-            .iter()
-            .any(|g| g.contains(&KeyCode::KEY_LEFTMETA) && g.contains(&KeyCode::KEY_RIGHTMETA)));
+        let codes = resolve_key_codes(std::slice::from_ref(&spec));
+        assert_eq!(codes.get(&KeyCode::KEY_LEFTCTRL), Some(&Key::Ctrl));
+        assert_eq!(codes.get(&KeyCode::KEY_RIGHTCTRL), Some(&Key::Ctrl));
+        assert_eq!(codes.get(&KeyCode::KEY_LEFTMETA), Some(&Key::Super));
+        assert_eq!(codes.get(&KeyCode::KEY_RIGHTMETA), Some(&Key::Super));
     }
 
     #[test]
     fn resolves_base_key_and_function_key() {
         let spec = parse_hotkey("ctrl+alt+d").unwrap();
-        let groups = resolve_groups(&spec);
-        assert!(groups.iter().any(|g| g == &vec![KeyCode::KEY_D]));
+        let codes = resolve_key_codes(std::slice::from_ref(&spec));
+        assert_eq!(codes.get(&KeyCode::KEY_D), Some(&Key::Char('d')));
 
         let spec = parse_hotkey("f1").unwrap();
-        let groups = resolve_groups(&spec);
-        assert_eq!(groups, vec![vec![KeyCode::KEY_F1]]);
+        let codes = resolve_key_codes(std::slice::from_ref(&spec));
+        assert_eq!(codes.get(&KeyCode::KEY_F1), Some(&Key::Function(1)));
     }
 
     #[test]
     fn resolves_space_base_key() {
         let spec = parse_hotkey("ctrl+space").unwrap();
-        let groups = resolve_groups(&spec);
-        assert!(groups.iter().any(|g| g == &vec![KeyCode::KEY_SPACE]));
+        let codes = resolve_key_codes(std::slice::from_ref(&spec));
+        assert_eq!(codes.get(&KeyCode::KEY_SPACE), Some(&Key::Space));
+    }
+
+    #[test]
+    fn resolves_codes_for_every_spec_in_a_multi_chord_set() {
+        let specs = [parse_hotkey("ctrl+d").unwrap(), parse_hotkey("f1").unwrap()];
+        let codes = resolve_key_codes(&specs);
+        assert_eq!(codes.get(&KeyCode::KEY_LEFTCTRL), Some(&Key::Ctrl));
+        assert_eq!(codes.get(&KeyCode::KEY_D), Some(&Key::Char('d')));
+        assert_eq!(codes.get(&KeyCode::KEY_F1), Some(&Key::Function(1)));
     }
 
     /// Manual, hardware-touching verification: press-and-release the given
@@ -257,7 +287,7 @@ mod tests {
     #[ignore]
     fn records_hotkey_chord() {
         let spec = parse_hotkey("ctrl+alt+u").expect("valid spec");
-        let source = EvdevHotkeySource::new(&spec, crate::hotkey::next_generation());
+        let source = EvdevHotkeySource::new(&[spec], crate::hotkey::next_generation());
         let (tx, rx) = crossbeam_channel::unbounded();
 
         std::thread::spawn(move || Box::new(source).run(tx));
@@ -266,7 +296,12 @@ mod tests {
         let event = rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("expected a hotkey event from a physical chord press");
-        assert_eq!(event, HotkeyEvent::Pressed);
+        assert_eq!(
+            event,
+            HotkeyEvent::Pressed {
+                binding: crate::hotkey::BindingId::from(0)
+            }
+        );
     }
 
     /// Reads this process's live thread count from `/proc/self/status`
@@ -295,9 +330,9 @@ mod tests {
     #[test]
     #[ignore]
     fn stale_source_shuts_down_without_a_key_press() {
-        let spec = parse_hotkey("ctrl+alt+u").expect("valid spec");
+        let specs = [parse_hotkey("ctrl+alt+u").expect("valid spec")];
 
-        let first = EvdevHotkeySource::new(&spec, crate::hotkey::next_generation());
+        let first = EvdevHotkeySource::new(&specs, crate::hotkey::next_generation());
         let (tx1, rx1) = crossbeam_channel::unbounded();
         std::thread::spawn(move || Box::new(first).run(tx1));
 
@@ -309,7 +344,7 @@ mod tests {
         // Simulate `save_settings` rebuilding the source: a newer
         // generation supersedes `first`, and its receiver is dropped — but
         // the chord itself is never pressed.
-        let second = EvdevHotkeySource::new(&spec, crate::hotkey::next_generation());
+        let second = EvdevHotkeySource::new(&specs, crate::hotkey::next_generation());
         let (tx2, _rx2) = crossbeam_channel::unbounded();
         std::thread::spawn(move || Box::new(second).run(tx2));
         drop(rx1);

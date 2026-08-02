@@ -49,13 +49,47 @@ pub(crate) fn is_stale(generation: u64) -> bool {
     SOURCE_GENERATION.load(Ordering::SeqCst) != generation
 }
 
-/// A chord state transition reported by a [`HotkeySource`].
+/// Identifies one hotkey binding among the set registered together in a
+/// single [`create_source`] call, by its position in that call's `specs`
+/// slice.
+///
+/// A newtype rather than a bare `usize` so this index can't be silently
+/// confused with an unrelated integer as it travels from the hotkey port,
+/// through the runtime, to whatever it ends up mapped to (e.g. a language
+/// profile) — a mapping this crate deliberately knows nothing about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BindingId(usize);
+
+impl BindingId {
+    /// Returns the binding's position in the `specs` slice it was created
+    /// from.
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for BindingId {
+    fn from(index: usize) -> Self {
+        Self(index)
+    }
+}
+
+/// A chord state transition reported by a [`HotkeySource`], identifying
+/// which registered binding it belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyEvent {
-    /// The full chord just became held (all of its keys are down).
-    Pressed,
-    /// At least one key of a previously-held chord was just released.
-    Released,
+    /// The full chord for `binding` just became held (all of its keys are
+    /// down).
+    Pressed {
+        /// Which binding's chord fired.
+        binding: BindingId,
+    },
+    /// At least one key of `binding`'s previously-held chord was just
+    /// released.
+    Released {
+        /// Which binding's chord fired.
+        binding: BindingId,
+    },
 }
 
 /// A background hotkey monitor. `run` takes ownership of `self` because
@@ -73,13 +107,16 @@ pub trait HotkeySource: Send {
     fn run(self: Box<Self>, tx: crossbeam_channel::Sender<HotkeyEvent>);
 }
 
-/// One token of a parsed hotkey chord.
+/// One logical key: a token in a parsed hotkey chord, and also the unit
+/// [`ChordMatcher`] tracks live press/release state against.
 ///
 /// Kept free of any platform key-code type so [`HotkeySpec`] compiles and is
-/// testable on every target; platform backends resolve each token to their
-/// own key codes (see `hotkey_evdev::resolve_groups`).
+/// testable on every target; platform backends resolve their raw key codes
+/// to this type before feeding events to [`ChordMatcher`] (see
+/// `hotkey_evdev::resolve_key_codes`), so e.g. either physical Ctrl key
+/// reported by evdev becomes the same `Key::Ctrl` here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum KeyToken {
+pub(crate) enum Key {
     Ctrl,
     Alt,
     Shift,
@@ -94,19 +131,16 @@ pub(crate) enum KeyToken {
     Space,
 }
 
-impl KeyToken {
+impl Key {
     fn is_modifier(self) -> bool {
-        matches!(
-            self,
-            KeyToken::Ctrl | KeyToken::Alt | KeyToken::Shift | KeyToken::Super
-        )
+        matches!(self, Key::Ctrl | Key::Alt | Key::Shift | Key::Super)
     }
 }
 
 /// A parsed hotkey chord, e.g. `ctrl+alt+d` or the modifier-only `ctrl+super`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotkeySpec {
-    pub(crate) tokens: HashSet<KeyToken>,
+    pub(crate) tokens: HashSet<Key>,
 }
 
 impl HotkeySpec {
@@ -117,7 +151,7 @@ impl HotkeySpec {
     /// method this small isn't worth losing to a future platform backend
     /// forgetting it exists.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn tokens(&self) -> impl Iterator<Item = &KeyToken> {
+    pub(crate) fn tokens(&self) -> impl Iterator<Item = &Key> {
         self.tokens.iter()
     }
 
@@ -183,22 +217,22 @@ pub fn parse_hotkey(s: &str) -> Result<HotkeySpec, HotkeyParseError> {
     Ok(HotkeySpec { tokens })
 }
 
-fn parse_token(token: &str) -> Result<KeyToken, HotkeyParseError> {
+fn parse_token(token: &str) -> Result<Key, HotkeyParseError> {
     let lower = token.to_lowercase();
 
     match lower.as_str() {
-        "ctrl" | "control" => return Ok(KeyToken::Ctrl),
-        "alt" => return Ok(KeyToken::Alt),
-        "shift" => return Ok(KeyToken::Shift),
-        "super" | "meta" | "win" => return Ok(KeyToken::Super),
-        "space" => return Ok(KeyToken::Space),
+        "ctrl" | "control" => return Ok(Key::Ctrl),
+        "alt" => return Ok(Key::Alt),
+        "shift" => return Ok(Key::Shift),
+        "super" | "meta" | "win" => return Ok(Key::Super),
+        "space" => return Ok(Key::Space),
         _ => {}
     }
 
     if let Some(rest) = lower.strip_prefix('f') {
         if let Ok(n) = rest.parse::<u8>() {
             if (1..=24).contains(&n) {
-                return Ok(KeyToken::Function(n));
+                return Ok(Key::Function(n));
             }
         }
     }
@@ -206,45 +240,53 @@ fn parse_token(token: &str) -> Result<KeyToken, HotkeyParseError> {
     let mut chars = lower.chars();
     if let (Some(c), None) = (chars.next(), chars.next()) {
         if c.is_ascii_alphanumeric() {
-            return Ok(KeyToken::Char(c));
+            return Ok(Key::Char(c));
         }
     }
 
     Err(HotkeyParseError::UnknownToken(token.to_string()))
 }
 
-/// Creates the best available [`HotkeySource`] for `spec`: the evdev backend
-/// if at least one `/dev/input/event*` device is readable, otherwise the X11
-/// (`global-hotkey`) fallback.
+/// Creates the best available [`HotkeySource`] watching every chord in
+/// `specs` at once: the evdev backend if at least one `/dev/input/event*`
+/// device is readable, otherwise the X11 (`global-hotkey`) fallback.
 ///
-/// Fails if `spec` is modifier-only and evdev is unavailable, since the X11
-/// fallback cannot represent a chord without a non-modifier base key.
-pub fn create_source(spec: &HotkeySpec) -> anyhow::Result<Box<dyn HotkeySource>> {
+/// Each [`HotkeyEvent`] the returned source produces carries a [`BindingId`]
+/// equal to the firing chord's position in `specs`, so callers can register
+/// several chords (e.g. one per language profile) behind a single source
+/// rather than one source per chord — each evdev source opens every input
+/// device on the machine, so more than one running at once would duplicate
+/// that work and race for the same key presses.
+///
+/// Fails if any spec in `specs` is modifier-only and evdev is unavailable,
+/// since the X11 fallback cannot represent a chord without a non-modifier
+/// base key.
+pub fn create_source(specs: &[HotkeySpec]) -> anyhow::Result<Box<dyn HotkeySource>> {
     #[cfg(target_os = "linux")]
     {
         let generation = next_generation();
 
         if crate::hotkey_evdev::any_input_device_readable() {
             return Ok(Box::new(crate::hotkey_evdev::EvdevHotkeySource::new(
-                spec, generation,
+                specs, generation,
             )));
         }
 
-        if spec.is_modifier_only() {
+        if specs.iter().any(HotkeySpec::is_modifier_only) {
             anyhow::bail!(
-                "modifier-only hotkey {spec:?} requires the evdev backend; the X11 fallback \
+                "modifier-only hotkeys require the evdev backend; the X11 fallback \
                  (global-hotkey) cannot represent a chord without a non-modifier base key"
             );
         }
 
         Ok(Box::new(crate::hotkey_x11::X11HotkeySource::new(
-            spec, generation,
+            specs, generation,
         )?))
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = spec;
+        let _ = specs;
         anyhow::bail!("hotkey capture is not implemented on this platform yet")
     }
 }
@@ -307,63 +349,88 @@ fn probe_permissions() -> PermissionProbe {
     }
 }
 
-/// Tracks a chord made of "groups" of interchangeable keys (e.g. left/right
-/// Ctrl both satisfy a `Ctrl` token) against a live stream of individual key
-/// state changes, deciding when the whole chord transitions between held and
-/// not-held.
+/// Tracks every chord in a fixed set of [`HotkeySpec`]s against a live
+/// stream of individual key state changes, reporting which binding (its
+/// position in the `specs` slice the matcher was built from) transitions
+/// between held and not-held.
 ///
-/// Generic over the key type so this logic is testable without any
-/// platform key-code type or real input device.
+/// Operates purely on the logical [`Key`] type, with no platform key-code
+/// type or real input device involved, so it is testable on every target.
+/// Physical-key alternatives (e.g. either physical Ctrl key satisfying a
+/// `Key::Ctrl` token) are resolved to `Key` values before reaching this
+/// type — see `hotkey_evdev::resolve_key_codes`, the evdev backend's only
+/// caller.
 ///
 /// Only wired up by the Linux evdev backend today; kept portable and
 /// allowed dead elsewhere (rather than cfg-gated away) so its unit tests
 /// keep running, and it stays ready, on every target.
 #[derive(Debug, Clone)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) struct ChordTracker<K> {
-    groups: Vec<Vec<K>>,
-    pressed: HashSet<K>,
-    fired: bool,
+pub(crate) struct ChordMatcher {
+    bindings: Vec<HashSet<Key>>,
+    pressed: HashSet<Key>,
+    fired: Vec<bool>,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-impl<K: Copy + Eq + Hash> ChordTracker<K> {
-    pub(crate) fn new(groups: Vec<Vec<K>>) -> Self {
+impl ChordMatcher {
+    /// Builds a matcher watching every chord in `specs`, indexed by
+    /// position: the first spec becomes `BindingId(0)`, and so on.
+    pub(crate) fn new(specs: &[HotkeySpec]) -> Self {
+        let bindings: Vec<HashSet<Key>> = specs.iter().map(|spec| spec.tokens.clone()).collect();
+        let fired = vec![false; bindings.len()];
         Self {
-            groups,
+            bindings,
             pressed: HashSet::new(),
-            fired: false,
+            fired,
         }
     }
 
-    /// Feeds one key's state change and returns the chord-level event this
-    /// caused, if any. Autorepeat (a key going down while already down) is a
-    /// no-op: the chord's held/not-held state cannot change from it, so no
-    /// event is ever re-fired while a chord stays pressed.
-    pub(crate) fn on_key_change(&mut self, key: K, is_down: bool) -> Option<HotkeyEvent> {
-        if is_down {
-            self.pressed.insert(key);
-        } else {
-            self.pressed.remove(&key);
-        }
+    /// Records `key` as pressed and returns the resulting chord-level
+    /// event, if any. See [`Self::update`] for how a transition is chosen.
+    pub(crate) fn on_key_down(&mut self, key: Key) -> Option<HotkeyEvent> {
+        self.pressed.insert(key);
+        self.update()
+    }
 
-        let full = !self.groups.is_empty()
-            && self
-                .groups
-                .iter()
-                .all(|group| group.iter().any(|k| self.pressed.contains(k)));
+    /// Records `key` as released and returns the resulting chord-level
+    /// event, if any. See [`Self::update`] for how a transition is chosen.
+    pub(crate) fn on_key_up(&mut self, key: Key) -> Option<HotkeyEvent> {
+        self.pressed.remove(&key);
+        self.update()
+    }
 
-        match (full, self.fired) {
-            (true, false) => {
-                self.fired = true;
-                Some(HotkeyEvent::Pressed)
+    /// Re-evaluates every binding against the current `pressed` set and
+    /// reports the first one whose held/not-held state just changed.
+    /// Autorepeat (a key reported down while already down) never reaches
+    /// here as a change, so no event is ever re-fired while a chord stays
+    /// pressed.
+    ///
+    /// At most one transition is reported per key change: two bindings
+    /// completing simultaneously from a single key event is not a
+    /// configuration this crate needs to support today, since each binding
+    /// maps to a distinct chord chosen independently by the caller.
+    fn update(&mut self) -> Option<HotkeyEvent> {
+        for (index, tokens) in self.bindings.iter().enumerate() {
+            let full = !tokens.is_empty() && tokens.iter().all(|k| self.pressed.contains(k));
+
+            match (full, self.fired[index]) {
+                (true, false) => {
+                    self.fired[index] = true;
+                    return Some(HotkeyEvent::Pressed {
+                        binding: BindingId(index),
+                    });
+                }
+                (false, true) => {
+                    self.fired[index] = false;
+                    return Some(HotkeyEvent::Released {
+                        binding: BindingId(index),
+                    });
+                }
+                _ => {}
             }
-            (false, true) => {
-                self.fired = false;
-                Some(HotkeyEvent::Released)
-            }
-            _ => None,
         }
+        None
     }
 }
 
@@ -375,10 +442,7 @@ mod tests {
     fn parses_modifier_only_chord_case_insensitively() {
         let spec = parse_hotkey("Ctrl+SUPER").expect("should parse");
         assert!(spec.is_modifier_only());
-        assert_eq!(
-            spec.tokens,
-            HashSet::from([KeyToken::Ctrl, KeyToken::Super])
-        );
+        assert_eq!(spec.tokens, HashSet::from([Key::Ctrl, Key::Super]));
     }
 
     #[test]
@@ -387,48 +451,33 @@ mod tests {
         assert!(!spec.is_modifier_only());
         assert_eq!(
             spec.tokens,
-            HashSet::from([KeyToken::Ctrl, KeyToken::Alt, KeyToken::Char('d')])
+            HashSet::from([Key::Ctrl, Key::Alt, Key::Char('d')])
         );
     }
 
     #[test]
     fn accepts_modifier_aliases() {
         let spec = parse_hotkey("control+meta").expect("should parse");
-        assert_eq!(
-            spec.tokens,
-            HashSet::from([KeyToken::Ctrl, KeyToken::Super])
-        );
+        assert_eq!(spec.tokens, HashSet::from([Key::Ctrl, Key::Super]));
 
         let spec = parse_hotkey("win+shift").expect("should parse");
-        assert_eq!(
-            spec.tokens,
-            HashSet::from([KeyToken::Super, KeyToken::Shift])
-        );
+        assert_eq!(spec.tokens, HashSet::from([Key::Super, Key::Shift]));
     }
 
     #[test]
     fn accepts_digit_and_function_keys() {
         let spec = parse_hotkey("ctrl+5").expect("should parse");
-        assert_eq!(
-            spec.tokens,
-            HashSet::from([KeyToken::Ctrl, KeyToken::Char('5')])
-        );
+        assert_eq!(spec.tokens, HashSet::from([Key::Ctrl, Key::Char('5')]));
 
         let spec = parse_hotkey("ctrl+f1").expect("should parse");
-        assert_eq!(
-            spec.tokens,
-            HashSet::from([KeyToken::Ctrl, KeyToken::Function(1)])
-        );
+        assert_eq!(spec.tokens, HashSet::from([Key::Ctrl, Key::Function(1)]));
     }
 
     #[test]
     fn parses_space_as_a_base_key() {
         let spec = parse_hotkey("ctrl+space").expect("should parse");
         assert!(!spec.is_modifier_only());
-        assert_eq!(
-            spec.tokens,
-            HashSet::from([KeyToken::Ctrl, KeyToken::Space])
-        );
+        assert_eq!(spec.tokens, HashSet::from([Key::Ctrl, Key::Space]));
     }
 
     #[test]
@@ -478,40 +527,70 @@ mod tests {
     }
 
     #[test]
-    fn chord_tracker_partial_chord_emits_nothing() {
-        let mut tracker = ChordTracker::new(vec![vec![1u8], vec![2u8]]);
-        assert_eq!(tracker.on_key_change(1, true), None);
+    fn chord_matcher_partial_chord_emits_nothing() {
+        let specs = [parse_hotkey("ctrl+alt").expect("valid chord")];
+        let mut matcher = ChordMatcher::new(&specs);
+        assert_eq!(matcher.on_key_down(Key::Ctrl), None);
     }
 
     #[test]
-    fn chord_tracker_fires_pressed_once_and_ignores_repeat() {
-        let mut tracker = ChordTracker::new(vec![vec![1u8], vec![2u8]]);
-        assert_eq!(tracker.on_key_change(1, true), None);
-        assert_eq!(tracker.on_key_change(2, true), Some(HotkeyEvent::Pressed));
-        // autorepeat: key 2 reported down again while already down.
-        assert_eq!(tracker.on_key_change(2, true), None);
-        assert_eq!(tracker.on_key_change(1, true), None);
-    }
-
-    #[test]
-    fn chord_tracker_fires_released_once_on_first_release() {
-        let mut tracker = ChordTracker::new(vec![vec![1u8], vec![2u8]]);
-        tracker.on_key_change(1, true);
-        assert_eq!(tracker.on_key_change(2, true), Some(HotkeyEvent::Pressed));
-
-        assert_eq!(tracker.on_key_change(1, false), Some(HotkeyEvent::Released));
-        // Second key releasing afterward should not re-fire.
-        assert_eq!(tracker.on_key_change(2, false), None);
-    }
-
-    #[test]
-    fn chord_tracker_matches_any_key_within_a_group() {
-        // left-ctrl OR right-ctrl should both satisfy the "ctrl" group.
-        let mut tracker = ChordTracker::new(vec![vec![10u8, 11u8]]);
-        assert_eq!(tracker.on_key_change(11, true), Some(HotkeyEvent::Pressed));
+    fn chord_matcher_fires_pressed_once_and_ignores_repeat() {
+        let specs = [parse_hotkey("ctrl+alt").expect("valid chord")];
+        let mut matcher = ChordMatcher::new(&specs);
+        assert_eq!(matcher.on_key_down(Key::Ctrl), None);
         assert_eq!(
-            tracker.on_key_change(11, false),
-            Some(HotkeyEvent::Released)
+            matcher.on_key_down(Key::Alt),
+            Some(HotkeyEvent::Pressed {
+                binding: BindingId(0)
+            })
+        );
+        // autorepeat: Alt reported down again while already down.
+        assert_eq!(matcher.on_key_down(Key::Alt), None);
+        assert_eq!(matcher.on_key_down(Key::Ctrl), None);
+    }
+
+    #[test]
+    fn chord_matcher_fires_released_once_on_first_release() {
+        let specs = [parse_hotkey("ctrl+alt").expect("valid chord")];
+        let mut matcher = ChordMatcher::new(&specs);
+        matcher.on_key_down(Key::Ctrl);
+        assert_eq!(
+            matcher.on_key_down(Key::Alt),
+            Some(HotkeyEvent::Pressed {
+                binding: BindingId(0)
+            })
+        );
+
+        assert_eq!(
+            matcher.on_key_up(Key::Ctrl),
+            Some(HotkeyEvent::Released {
+                binding: BindingId(0)
+            })
+        );
+        // The other key releasing afterward should not re-fire.
+        assert_eq!(matcher.on_key_up(Key::Alt), None);
+    }
+
+    #[test]
+    fn each_binding_is_reported_by_its_own_id() {
+        let specs = [
+            parse_hotkey("ctrl+super").expect("valid chord"),
+            parse_hotkey("ctrl+alt+super").expect("valid chord"),
+        ];
+        let mut matcher = ChordMatcher::new(&specs);
+
+        assert_eq!(matcher.on_key_down(Key::Ctrl), None);
+        assert_eq!(
+            matcher.on_key_down(Key::Super),
+            Some(HotkeyEvent::Pressed {
+                binding: BindingId(0)
+            })
+        );
+        assert_eq!(
+            matcher.on_key_up(Key::Super),
+            Some(HotkeyEvent::Released {
+                binding: BindingId(0)
+            })
         );
     }
 

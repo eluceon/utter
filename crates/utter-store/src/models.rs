@@ -21,6 +21,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::error::IntegrityError;
+
 /// A speech-to-text model available for download, with its installed state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelInfo {
@@ -42,6 +44,17 @@ struct Artifact {
     url: &'static str,
     sha256: &'static str,
     name: &'static str,
+    /// The artifact's exact size once fully downloaded, used by
+    /// [`ModelManager::verify_installed`] to catch a truncated file before
+    /// its path is ever handed to a native engine. This is a size check,
+    /// not a re-hash: it catches truncation — the failure mode actually
+    /// observed in practice — but not a file of the right length with
+    /// corrupted bytes inside it; that class of corruption is what the
+    /// download path's sha256 verification already guards against, and
+    /// re-hashing hundreds of megabytes on every engine load would trade a
+    /// cheap, load-time-only guard for a slow one that mostly re-checks
+    /// what already passed once.
+    size_bytes: u64,
 }
 
 /// Static metadata for one catalog entry.
@@ -63,9 +76,11 @@ struct CatalogEntry {
 
 /// The hard-coded catalog of downloadable speech-to-text models.
 ///
-/// Whisper sha256 values were read from the Hugging Face tree API for
-/// `ggerganov/whisper.cpp` (`lfs.oid` per file). Sherpa-onnx sha256 values
-/// were read from the Hugging Face tree API for each model's repository.
+/// Whisper sha256 and size_bytes values were read from the Hugging Face tree
+/// API for `ggerganov/whisper.cpp` (`lfs.oid` and `size` per file).
+/// Sherpa-onnx sha256 and size_bytes values were read from the Hugging Face
+/// tree API for each model's repository at the pinned revision in its
+/// artifact URLs.
 const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         id: "tiny",
@@ -76,6 +91,7 @@ const CATALOG: &[CatalogEntry] = &[
             url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
             sha256: "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21",
             name: "ggml-tiny.bin",
+            size_bytes: 77_691_713,
         }],
     },
     CatalogEntry {
@@ -87,6 +103,7 @@ const CATALOG: &[CatalogEntry] = &[
             url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
             sha256: "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
             name: "ggml-base.bin",
+            size_bytes: 147_951_465,
         }],
     },
     CatalogEntry {
@@ -98,6 +115,7 @@ const CATALOG: &[CatalogEntry] = &[
             url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
             sha256: "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
             name: "ggml-small.bin",
+            size_bytes: 487_601_967,
         }],
     },
     CatalogEntry {
@@ -109,6 +127,7 @@ const CATALOG: &[CatalogEntry] = &[
             url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
             sha256: "6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208",
             name: "ggml-medium.bin",
+            size_bytes: 1_533_763_059,
         }],
     },
     CatalogEntry {
@@ -121,6 +140,7 @@ const CATALOG: &[CatalogEntry] = &[
                 "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
             sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
             name: "ggml-large-v3-turbo-q5_0.bin",
+            size_bytes: 574_041_195,
         }],
     },
     CatalogEntry {
@@ -133,21 +153,25 @@ const CATALOG: &[CatalogEntry] = &[
                 url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16/resolve/a6039be7cee829a9044a69ac0ebaf1c191217c97/encoder.int8.onnx",
                 sha256: "369f35a71bf288d3b8e0391fabd8dba5f2314088d440bca474056b7b4b6e66bf",
                 name: "encoder.int8.onnx",
+                size_bytes: 224_570_820,
             },
             Artifact {
                 url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16/resolve/a6039be7cee829a9044a69ac0ebaf1c191217c97/decoder.onnx",
                 sha256: "38fc7475443ea2a26f63211ca350f73ac50fff824ab7a3876ee2bd610c53bbc4",
                 name: "decoder.onnx",
+                size_bytes: 4_600_132,
             },
             Artifact {
                 url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16/resolve/a6039be7cee829a9044a69ac0ebaf1c191217c97/joiner.onnx",
                 sha256: "602ff7017a93311aad34df1437c8d7f49911353c13d6eae7a6ee7b041339465c",
                 name: "joiner.onnx",
+                size_bytes: 2_712_896,
             },
             Artifact {
                 url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16/resolve/a6039be7cee829a9044a69ac0ebaf1c191217c97/tokens.txt",
                 sha256: "39abae20e692998290c574e606f11a9edef2902a1995463fcff63d1490cf22b7",
                 name: "tokens.txt",
+                size_bytes: 13_354,
             },
         ],
     },
@@ -161,21 +185,25 @@ const CATALOG: &[CatalogEntry] = &[
                 url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000/resolve/e9bea5a06247dc3f55319ff23d34b0328f2f5ddf/encoder.onnx",
                 sha256: "db260f1073c654c37dd65006885d1ee98ff16c22463b1ef992bbcabc29780a3f",
                 name: "encoder.onnx",
+                size_bytes: 456_050_698,
             },
             Artifact {
                 url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000/resolve/e9bea5a06247dc3f55319ff23d34b0328f2f5ddf/decoder.onnx",
                 sha256: "3da156bde41a04c94ef783e0bd92928e9974e08645b976a22d0c3e1063510249",
                 name: "decoder.onnx",
+                size_bytes: 15_753_086,
             },
             Artifact {
                 url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000/resolve/e9bea5a06247dc3f55319ff23d34b0328f2f5ddf/joiner.onnx",
                 sha256: "b603765c0724a0768c378a23326dabbeb9cfea932d260e4fcc14384fa5fd5aff",
                 name: "joiner.onnx",
+                size_bytes: 5_596_854,
             },
             Artifact {
                 url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000/resolve/e9bea5a06247dc3f55319ff23d34b0328f2f5ddf/tokens.txt",
                 sha256: "450e56bd2f036fe5b6aa821865838cc5aa9d8b0106134ce9a9ba0664abe6cd10",
                 name: "tokens.txt",
+                size_bytes: 9_953,
             },
         ],
     },
@@ -368,11 +396,79 @@ impl ModelManager {
     /// Whether every artifact of `entry` is present at `path`, the value
     /// returned by [`Self::install_path`] for it.
     fn is_installed(&self, entry: &CatalogEntry, path: &Path) -> bool {
-        if entry.artifacts.len() > 1 {
-            entry.artifacts.iter().all(|a| path.join(a.name).is_file())
-        } else {
-            path.is_file()
+        entry
+            .artifacts
+            .iter()
+            .all(|a| artifact_path(entry, path, a).is_file())
+    }
+
+    /// Verifies that every artifact of the installed model `id` is present
+    /// and has exactly the byte length recorded in the catalog, returning
+    /// its installed path (the same one [`Self::path_for`] would) only if
+    /// every check passes.
+    ///
+    /// This exists because a corrupt model file does not fail cleanly once
+    /// handed to the native speech engine: sherpa-onnx's token-table parser
+    /// calls a compiled-in `exit()` on a malformed `tokens.txt`, and a
+    /// malformed `.onnx` file makes onnxruntime throw a C++ exception that
+    /// unwinds across the FFI boundary uncaught. Neither is catchable in
+    /// Rust — both abort the whole process with nothing logged and no
+    /// notice shown. Verifying before the path is ever handed to the native
+    /// layer is the only point at which this can be prevented rather than
+    /// merely reported.
+    ///
+    /// The check is file size, not a checksum: hashing every artifact (up
+    /// to several hundred megabytes) on every engine load would add real
+    /// latency to every app start and every language switch, to guard
+    /// against corruption that the download path already checksums
+    /// against. A size mismatch is the failure actually observed in
+    /// practice — an interrupted download leaving a file of the right name
+    /// and the wrong length — but this is not a complete integrity check:
+    /// a file of the correct size with corrupted bytes inside it still
+    /// passes.
+    pub fn verify_installed(&self, id: &str) -> Result<PathBuf, IntegrityError> {
+        let entry = self
+            .find(id)
+            .ok_or_else(|| IntegrityError::UnknownModel(id.to_string()))?;
+        let path = self.install_path(entry);
+        if !self.is_installed(entry, &path) {
+            return Err(IntegrityError::NotInstalled(id.to_string()));
         }
+
+        for artifact in entry.artifacts {
+            let artifact_path = artifact_path(entry, &path, artifact);
+            let metadata = fs::metadata(&artifact_path).map_err(|source| IntegrityError::Io {
+                model: id.to_string(),
+                artifact: artifact.name.to_string(),
+                path: artifact_path.clone(),
+                source,
+            })?;
+            let actual = metadata.len();
+            if actual != artifact.size_bytes {
+                return Err(IntegrityError::SizeMismatch {
+                    model: id.to_string(),
+                    artifact: artifact.name.to_string(),
+                    path: artifact_path,
+                    expected: artifact.size_bytes,
+                    actual,
+                });
+            }
+        }
+
+        Ok(path)
+    }
+}
+
+/// Resolves the on-disk path of one artifact of `entry`, given the entry's
+/// `install_path`: the artifact itself for a single-artifact entry (where
+/// `install_path` is already a file), or `install_path` joined with the
+/// artifact's name for a multi-artifact entry (where `install_path` is a
+/// directory).
+fn artifact_path(entry: &CatalogEntry, install_path: &Path, artifact: &Artifact) -> PathBuf {
+    if entry.artifacts.len() > 1 {
+        install_path.join(artifact.name)
+    } else {
+        install_path.to_path_buf()
     }
 }
 
@@ -461,7 +557,7 @@ mod tests {
         Box::leak(artifacts.into_boxed_slice())
     }
 
-    fn whisper_entry(url: String, sha256: String) -> CatalogEntry {
+    fn whisper_entry(url: String, sha256: String, size_bytes: u64) -> CatalogEntry {
         CatalogEntry {
             id: "test-whisper",
             engine: "whisper",
@@ -471,14 +567,17 @@ mod tests {
                 url: Box::leak(url.into_boxed_str()),
                 sha256: Box::leak(sha256.into_boxed_str()),
                 name: "ggml-test.bin",
+                size_bytes,
             }]),
         }
     }
 
     /// A two-artifact entry (e.g. mirroring a sherpa-onnx model's encoder
     /// and tokens) whose artifacts are never actually downloaded in the
-    /// tests that use it — only `path_for`'s "every file present" logic is
-    /// exercised, so the URLs are unused placeholders.
+    /// tests that use it — only `path_for`'s and `verify_installed`'s
+    /// "every file present" / "every size matches" logic is exercised, so
+    /// the URLs are unused placeholders. `encoder.onnx` is expected to be
+    /// 100 bytes and `tokens.txt` 50 once genuinely installed.
     fn two_file_entry() -> CatalogEntry {
         CatalogEntry {
             id: "two-file-model",
@@ -490,11 +589,13 @@ mod tests {
                     url: "unused",
                     sha256: "unused",
                     name: "encoder.onnx",
+                    size_bytes: 100,
                 },
                 Artifact {
                     url: "unused",
                     sha256: "unused",
                     name: "tokens.txt",
+                    size_bytes: 50,
                 },
             ],
         }
@@ -503,8 +604,10 @@ mod tests {
     fn multi_artifact_entry(
         encoder_url: String,
         encoder_sha256: String,
+        encoder_size_bytes: u64,
         tokens_url: String,
         tokens_sha256: String,
+        tokens_size_bytes: u64,
     ) -> CatalogEntry {
         CatalogEntry {
             id: "test-multi",
@@ -516,11 +619,13 @@ mod tests {
                     url: Box::leak(encoder_url.into_boxed_str()),
                     sha256: Box::leak(encoder_sha256.into_boxed_str()),
                     name: "encoder.onnx",
+                    size_bytes: encoder_size_bytes,
                 },
                 Artifact {
                     url: Box::leak(tokens_url.into_boxed_str()),
                     sha256: Box::leak(tokens_sha256.into_boxed_str()),
                     name: "tokens.txt",
+                    size_bytes: tokens_size_bytes,
                 },
             ]),
         }
@@ -545,7 +650,11 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let entry = whisper_entry(format!("{}/ggml-test.bin", server.uri()), sha256.clone());
+        let entry = whisper_entry(
+            format!("{}/ggml-test.bin", server.uri()),
+            sha256.clone(),
+            body.len() as u64,
+        );
         let manager = ModelManager::with_catalog(dir.path().to_path_buf(), vec![entry]);
 
         let (result, calls) = tokio::task::spawn_blocking(move || {
@@ -614,6 +723,7 @@ mod tests {
     async fn wrong_checksum_errors_and_leaves_no_file_behind() {
         let server = MockServer::start().await;
         let body = vec![0x11u8; 1_000];
+        let body_len = body.len() as u64;
 
         Mock::given(method("GET"))
             .and(path("/ggml-test.bin"))
@@ -625,6 +735,7 @@ mod tests {
         let entry = whisper_entry(
             format!("{}/ggml-test.bin", server.uri()),
             "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            body_len,
         );
         let manager = ModelManager::with_catalog(dir.path().to_path_buf(), vec![entry]);
 
@@ -651,6 +762,7 @@ mod tests {
         let entry = whisper_entry(
             format!("{base_url}/body"),
             "irrelevant-because-body-is-truncated".to_string(),
+            500_000,
         );
         let manager = ModelManager::with_catalog(dir.path().to_path_buf(), vec![entry]);
 
@@ -672,6 +784,7 @@ mod tests {
     async fn catalog_marks_model_installed_after_download() {
         let server = MockServer::start().await;
         let body = vec![0x77u8; 10_000];
+        let body_len = body.len() as u64;
         let sha256 = sha256_hex(&body);
 
         Mock::given(method("GET"))
@@ -681,7 +794,11 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let entry = whisper_entry(format!("{}/ggml-test.bin", server.uri()), sha256.clone());
+        let entry = whisper_entry(
+            format!("{}/ggml-test.bin", server.uri()),
+            sha256.clone(),
+            body_len,
+        );
         let manager = ModelManager::with_catalog(dir.path().to_path_buf(), vec![entry]);
 
         let before = manager.catalog();
@@ -727,11 +844,70 @@ mod tests {
         assert_eq!(models.path_for("two-file-model"), Some(model_dir));
     }
 
+    #[test]
+    fn a_truncated_artifact_is_reported_as_damaged_not_installed() {
+        // The failure this guards against is not hypothetical: a 456 MB model
+        // download stalled silently partway through during Task 3, leaving a
+        // file of exactly the right name and the wrong length.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = ModelManager::with_catalog(dir.path().to_path_buf(), vec![two_file_entry()]);
+
+        let model_dir = dir.path().join("models").join("two-file-model");
+        fs::create_dir_all(&model_dir).expect("create model dir");
+        fs::write(model_dir.join("encoder.onnx"), b"truncated").expect("write encoder");
+        fs::write(model_dir.join("tokens.txt"), b"x").expect("write tokens");
+
+        let err = models
+            .verify_installed("two-file-model")
+            .expect_err("a wrong-sized artifact must not pass verification");
+        assert!(matches!(err, IntegrityError::SizeMismatch { .. }));
+    }
+
+    #[test]
+    fn verify_installed_succeeds_when_every_artifact_size_matches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = ModelManager::with_catalog(dir.path().to_path_buf(), vec![two_file_entry()]);
+
+        let model_dir = dir.path().join("models").join("two-file-model");
+        fs::create_dir_all(&model_dir).expect("create model dir");
+        fs::write(model_dir.join("encoder.onnx"), vec![0u8; 100]).expect("write encoder");
+        fs::write(model_dir.join("tokens.txt"), vec![0u8; 50]).expect("write tokens");
+
+        let verified = models
+            .verify_installed("two-file-model")
+            .expect("correctly sized artifacts must verify");
+        assert_eq!(verified, model_dir);
+    }
+
+    #[test]
+    fn verify_installed_reports_a_never_downloaded_model_as_not_installed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = ModelManager::with_catalog(dir.path().to_path_buf(), vec![two_file_entry()]);
+
+        let err = models
+            .verify_installed("two-file-model")
+            .expect_err("a never-downloaded model must not verify");
+        assert!(matches!(err, IntegrityError::NotInstalled(id) if id == "two-file-model"));
+    }
+
+    #[test]
+    fn verify_installed_rejects_an_unknown_model_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = ModelManager::with_catalog(dir.path().to_path_buf(), Vec::new());
+
+        let err = models
+            .verify_installed("does-not-exist")
+            .expect_err("an unknown id must not verify");
+        assert!(matches!(err, IntegrityError::UnknownModel(id) if id == "does-not-exist"));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn download_installs_every_artifact_of_a_multi_artifact_model() {
         let server = MockServer::start().await;
         let encoder_body = vec![0xAAu8; 5_000];
         let tokens_body = b"token list".to_vec();
+        let encoder_size_bytes = encoder_body.len() as u64;
+        let tokens_size_bytes = tokens_body.len() as u64;
         let encoder_sha256 = sha256_hex(&encoder_body);
         let tokens_sha256 = sha256_hex(&tokens_body);
 
@@ -750,8 +926,10 @@ mod tests {
         let entry = multi_artifact_entry(
             format!("{}/encoder.onnx", server.uri()),
             encoder_sha256,
+            encoder_size_bytes,
             format!("{}/tokens.txt", server.uri()),
             tokens_sha256,
+            tokens_size_bytes,
         );
         let manager = ModelManager::with_catalog(dir.path().to_path_buf(), vec![entry]);
 
@@ -779,6 +957,8 @@ mod tests {
         let server = MockServer::start().await;
         let encoder_body = vec![0xBBu8; 5_000];
         let tokens_body = b"token list".to_vec();
+        let encoder_size_bytes = encoder_body.len() as u64;
+        let tokens_size_bytes = tokens_body.len() as u64;
         let encoder_sha256 = sha256_hex(&encoder_body);
 
         Mock::given(method("GET"))
@@ -796,8 +976,10 @@ mod tests {
         let entry = multi_artifact_entry(
             format!("{}/encoder.onnx", server.uri()),
             encoder_sha256,
+            encoder_size_bytes,
             format!("{}/tokens.txt", server.uri()),
             "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            tokens_size_bytes,
         );
         let manager = ModelManager::with_catalog(dir.path().to_path_buf(), vec![entry]);
 

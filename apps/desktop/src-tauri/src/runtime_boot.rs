@@ -33,6 +33,8 @@ use utter_inject::{
 };
 use utter_refine::{LlmConfig, LlmRefiner};
 use utter_store::settings::{CloudSttCfg, EngineCfg, EngineKind, InjectionPreference, RefineCfg};
+#[cfg(feature = "sherpa")]
+use utter_store::IntegrityError;
 use utter_store::{ModelManager, Settings};
 use utter_stt::{CloudEngine, CloudSttConfig, WhisperEngine};
 
@@ -291,11 +293,22 @@ fn build_sherpa(
         return (unavailable_engine(reason.clone()), Some(reason));
     };
 
-    let Some(path) = models.path_for(model_id) else {
-        let reason = format!(
-            "sherpa model \"{model_id}\" is not downloaded; open Settings > Models to download it"
-        );
-        return (unavailable_engine(reason.clone()), Some(reason));
+    let path = match models.verify_installed(model_id) {
+        Ok(path) => path,
+        Err(IntegrityError::SizeMismatch { artifact, .. }) => {
+            let reason = format!(
+                "sherpa model \"{model_id}\" is damaged (artifact \"{artifact}\" has the wrong \
+                 size); re-download it from Settings > Models"
+            );
+            return (unavailable_engine(reason.clone()), Some(reason));
+        }
+        Err(_) => {
+            let reason = format!(
+                "sherpa model \"{model_id}\" is not downloaded; open Settings > Models to \
+                 download it"
+            );
+            return (unavailable_engine(reason.clone()), Some(reason));
+        }
     };
 
     let cfg = utter_stt::SherpaConfig {
@@ -595,6 +608,40 @@ mod tests {
 
         let notice = notice.expect("missing model should produce a notice");
         assert!(notice.contains("not downloaded"));
+
+        let err = engine
+            .begin(&TranscribeOptions::default())
+            .expect_err("an unavailable engine must fail begin() informatively");
+        assert!(matches!(err, SttError::ModelNotFound(_)));
+    }
+
+    /// A damaged model (here, a truncated `encoder.int8.onnx`) must never
+    /// reach `SherpaOfflineEngine::load`: sherpa-onnx and onnxruntime abort
+    /// the whole process on a malformed model file, uncatchable from Rust.
+    /// `build_sherpa` must instead degrade the same way a missing model
+    /// does, but name the offending artifact and tell the user to
+    /// re-download rather than saying the model was never downloaded.
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn damaged_sherpa_model_degrades_with_a_notice_naming_the_artifact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = ModelManager::new(dir.path().to_path_buf());
+
+        let model_dir = dir.path().join("models").join("gigaam-v3-e2e-rnnt");
+        std::fs::create_dir_all(&model_dir).expect("create model dir");
+        std::fs::write(model_dir.join("encoder.int8.onnx"), b"truncated")
+            .expect("write truncated encoder");
+        std::fs::write(model_dir.join("decoder.onnx"), vec![0u8; 4_600_132])
+            .expect("write decoder");
+        std::fs::write(model_dir.join("joiner.onnx"), vec![0u8; 2_712_896]).expect("write joiner");
+        std::fs::write(model_dir.join("tokens.txt"), vec![0u8; 13_354]).expect("write tokens");
+
+        let (mut engine, notice) = build_sherpa(Some("gigaam-v3-e2e-rnnt"), &models, &[]);
+
+        let notice = notice.expect("a damaged model should produce a notice");
+        assert!(notice.contains("damaged"));
+        assert!(notice.contains("encoder.int8.onnx"));
+        assert!(notice.contains("re-download"));
 
         let err = engine
             .begin(&TranscribeOptions::default())

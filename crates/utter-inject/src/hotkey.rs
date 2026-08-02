@@ -364,6 +364,12 @@ fn probe_permissions() -> PermissionProbe {
 /// Only wired up by the Linux evdev backend today; kept portable and
 /// allowed dead elsewhere (rather than cfg-gated away) so its unit tests
 /// keep running, and it stays ready, on every target.
+///
+/// Assumes no two of its registered chords can complete on the same key
+/// event: [`Self::update`] reports only the first binding whose state
+/// changes, so a second one completing on that event would sit unreported
+/// until some later, unrelated key press fires it. [`find_conflicts`] is
+/// what enforces that assumption before a matcher is ever built.
 #[derive(Debug, Clone)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct ChordMatcher {
@@ -406,10 +412,10 @@ impl ChordMatcher {
     /// here as a change, so no event is ever re-fired while a chord stays
     /// pressed.
     ///
-    /// At most one transition is reported per key change: two bindings
-    /// completing simultaneously from a single key event is not a
-    /// configuration this crate needs to support today, since each binding
-    /// maps to a distinct chord chosen independently by the caller.
+    /// At most one transition is reported per key change: if a second
+    /// binding also changed state on this event, it would be skipped here
+    /// and left stale. Callers rely on [`find_conflicts`] having rejected
+    /// any set of chords where that could happen.
     fn update(&mut self) -> Option<HotkeyEvent> {
         for (index, tokens) in self.bindings.iter().enumerate() {
             let full = !tokens.is_empty() && tokens.iter().all(|k| self.pressed.contains(k));
@@ -432,6 +438,37 @@ impl ChordMatcher {
         }
         None
     }
+}
+
+/// Finds every pair of chords in `specs` that could complete on the same
+/// key-down event — the condition [`ChordMatcher`] cannot report correctly
+/// (see its doc comment). Returns each conflicting pair once, as
+/// `(lower_index, higher_index)`.
+///
+/// Two chords conflict when their key sets overlap and neither is a subset
+/// of the other: hold every key the two chords need between them except one
+/// they share, then press that shared key — both complete at once, and only
+/// one of them would be reported. Identical chords always conflict, since a
+/// chord has no other way to complete than pressing its own last key.
+///
+/// A strict subset (e.g. `ctrl+super` inside `ctrl+alt+super`) is
+/// deliberately not reported: completing the larger chord still needs a key
+/// — here, `alt` — that the smaller one doesn't require at all, so the two
+/// stay distinguishable and both remain usable. This is the pairing the
+/// two-language profile setup this validation exists for relies on.
+pub fn find_conflicts(specs: &[HotkeySpec]) -> Vec<(usize, usize)> {
+    let mut conflicts = Vec::new();
+    for i in 0..specs.len() {
+        for j in (i + 1)..specs.len() {
+            let (a, b) = (&specs[i].tokens, &specs[j].tokens);
+            let nested = a.is_subset(b) || b.is_subset(a);
+            let conflicting = a == b || (!nested && !a.is_disjoint(b));
+            if conflicting {
+                conflicts.push((i, j));
+            }
+        }
+    }
+    conflicts
 }
 
 #[cfg(test)]
@@ -607,5 +644,27 @@ mod tests {
 
         assert!(second > first);
         assert!(is_stale(first));
+    }
+
+    #[test]
+    fn chords_that_can_complete_together_conflict_but_nested_ones_do_not() {
+        let a = parse_hotkey("ctrl+super").expect("valid");
+        let b = parse_hotkey("ctrl+super").expect("valid");
+        let nested = parse_hotkey("ctrl+alt+super").expect("valid");
+        let overlapping = parse_hotkey("alt+super").expect("valid");
+        let partner = parse_hotkey("ctrl+alt").expect("valid");
+
+        assert_eq!(find_conflicts(&[a.clone(), b]), vec![(0, 1)]);
+
+        assert!(
+            find_conflicts(&[a, nested]).is_empty(),
+            "a nested chord needs a key the shorter one lacks, so the two cannot \
+             complete on one event and both must stay usable — this is the pair \
+             the two-language setup recommends"
+        );
+
+        // Neither identical nor nested: holding ctrl+super and then pressing alt
+        // completes both at once, which the matcher cannot report.
+        assert_eq!(find_conflicts(&[partner, overlapping]), vec![(0, 1)]);
     }
 }

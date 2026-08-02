@@ -195,11 +195,13 @@ including dev setup and test/lint gates, are in
 
 ## Roadmap
 
-- **v0.2** — Windows text-injection adapter, sherpa-onnx as an additional
-  offline engine, per-app tone profiles.
-- **v0.3** — macOS adapter, a streaming sherpa-onnx engine with live partial
-  results.
-- **Later** — voice commands ("new line", "undo that"), translation mode.
+- **v0.2** — Language profiles: one hotkey per language, each with its own
+  engine, models and refinement tone; a streaming sherpa-onnx engine driving
+  a live partial-transcript preview in the HUD.
+- **v0.3** — Typing into the target application while the user speaks,
+  building on the draft engine and live preview introduced in v0.2.
+- **Later** — Windows and macOS runtime adapters, voice commands ("new
+  line", "undo that"), translation mode.
 
 ## License
 

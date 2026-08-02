@@ -180,7 +180,7 @@
   </ul>
 </Section>
 
-<Section title="Sherpa-onnx models" description="A lighter-weight offline alternative to Whisper, with hotword biasing from your dictionary.">
+<Section title="Sherpa-onnx models" description="Offline transducer models, one per language, that emit punctuation directly and bias recognition towards your dictionary terms.">
   <Field label="Active model" for="sherpa-model">
     <Select
       id="sherpa-model"

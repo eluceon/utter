@@ -267,14 +267,16 @@ impl ModelManager {
     ///
     /// Each artifact's response body streams into a `.part` file inside a
     /// fresh staging area while its sha256 is computed incrementally;
-    /// `progress(done, total)` is called after every chunk of every artifact
-    /// (`total` is 0 if the server did not send a `Content-Length`, and the
-    /// count restarts at zero for each new artifact). An artifact's digest
-    /// is checked against its catalog sha256 as soon as it finishes
-    /// downloading: on the first mismatch, or if any body is interrupted,
-    /// the whole staging area is removed and an error returned, so no
-    /// half-downloaded model is ever left where [`Self::path_for`] would
-    /// find it.
+    /// `progress(done, total)` is called after every chunk of every artifact,
+    /// with `total` the catalog's grand total across every artifact in the
+    /// entry (known upfront from each artifact's `size_bytes`, independent of
+    /// whatever the server reports as `Content-Length`) and `done` running
+    /// cumulatively across artifacts, never resetting to zero partway through
+    /// a multi-artifact model. An artifact's digest is checked against its
+    /// catalog sha256 as soon as it finishes downloading: on the first
+    /// mismatch, or if any body is interrupted, the whole staging area is
+    /// removed and an error returned, so no half-downloaded model is ever
+    /// left where [`Self::path_for`] would find it.
     ///
     /// Only once every artifact has verified does the model become visible
     /// at its final path: a single-artifact model (e.g. whisper) is renamed
@@ -314,11 +316,22 @@ impl ModelManager {
         fs::create_dir_all(&staging_dir)
             .with_context(|| format!("failed to create {}", staging_dir.display()))?;
 
+        // The catalog already knows every artifact's exact size, so the
+        // grand total is fixed up front and does not depend on the server's
+        // `Content-Length`. Reporting `completed + done` against that fixed
+        // total (rather than passing each artifact's own `stream_to_part`
+        // progress straight through) keeps the sequence handed to `progress`
+        // monotonic across the whole model, instead of resetting to zero at
+        // the start of every artifact.
+        let grand_total: u64 = entry.artifacts.iter().map(|a| a.size_bytes).sum();
+        let mut completed: u64 = 0;
         for artifact in entry.artifacts {
-            if let Err(err) = stage_one_artifact(id, artifact, &staging_dir, progress) {
+            let mut aggregate = |done: u64, _total: u64| progress(completed + done, grand_total);
+            if let Err(err) = stage_one_artifact(id, artifact, &staging_dir, &mut aggregate) {
                 let _ = fs::remove_dir_all(&staging_dir);
                 return Err(err);
             }
+            completed += artifact.size_bytes;
         }
 
         let final_path = self.install_path(entry);
@@ -880,6 +893,31 @@ mod tests {
     }
 
     #[test]
+    fn verify_installed_checks_the_size_of_a_single_file_model() {
+        // Every other `verify_installed` test uses `two_file_entry`, so this
+        // is the only one exercising `artifact_path`'s single-artifact
+        // branch (whisper's shape, and the reason the function is generic).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = whisper_entry("unused".to_string(), "unused".to_string(), 100);
+        let models = ModelManager::with_catalog(dir.path().to_path_buf(), vec![entry]);
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).expect("create models dir");
+        let file = models_dir.join("ggml-test.bin");
+
+        fs::write(&file, vec![0u8; 99]).expect("write short file");
+        assert!(matches!(
+            models.verify_installed("test-whisper"),
+            Err(IntegrityError::SizeMismatch { .. })
+        ));
+
+        fs::write(&file, vec![0u8; 100]).expect("write correct file");
+        assert_eq!(
+            models.verify_installed("test-whisper").expect("verifies"),
+            file
+        );
+    }
+
+    #[test]
     fn verify_installed_reports_a_never_downloaded_model_as_not_installed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let models = ModelManager::with_catalog(dir.path().to_path_buf(), vec![two_file_entry()]);
@@ -949,6 +987,66 @@ mod tests {
             tokens_body
         );
         assert!(!dir.path().join("models/test-multi.staging").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multi_artifact_download_reports_progress_without_resetting_between_artifacts() {
+        let server = MockServer::start().await;
+        let encoder_body = vec![0xCCu8; 5_000];
+        let tokens_body = vec![0xDDu8; 2_000];
+        let encoder_size_bytes = encoder_body.len() as u64;
+        let tokens_size_bytes = tokens_body.len() as u64;
+        let encoder_sha256 = sha256_hex(&encoder_body);
+        let tokens_sha256 = sha256_hex(&tokens_body);
+
+        Mock::given(method("GET"))
+            .and(path("/encoder.onnx"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(encoder_body.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tokens.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tokens_body.clone()))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = multi_artifact_entry(
+            format!("{}/encoder.onnx", server.uri()),
+            encoder_sha256,
+            encoder_size_bytes,
+            format!("{}/tokens.txt", server.uri()),
+            tokens_sha256,
+            tokens_size_bytes,
+        );
+        let manager = ModelManager::with_catalog(dir.path().to_path_buf(), vec![entry]);
+        let grand_total = encoder_size_bytes + tokens_size_bytes;
+
+        let calls = tokio::task::spawn_blocking(move || {
+            let mut calls: Vec<(u64, u64)> = Vec::new();
+            manager
+                .download("test-multi", &mut |done, total| calls.push((done, total)))
+                .expect("download should succeed");
+            calls
+        })
+        .await
+        .expect("blocking task panicked");
+
+        assert!(!calls.is_empty(), "expected at least one progress call");
+        assert_eq!(calls.first(), Some(&(0, grand_total)));
+        assert_eq!(calls.last(), Some(&(grand_total, grand_total)));
+        for pair in calls.windows(2) {
+            assert!(
+                pair[1].0 >= pair[0].0,
+                "progress must never decrease across artifacts: {:?} -> {:?}",
+                pair[0],
+                pair[1]
+            );
+            assert_eq!(
+                pair[0].1, grand_total,
+                "total must stay the grand total across every artifact"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

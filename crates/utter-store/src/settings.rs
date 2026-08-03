@@ -11,8 +11,10 @@ use serde::{Deserialize, Serialize};
 use utter_core::{DictationMode, Tone};
 use utter_refine::{ReplaceRule, Snippet};
 
+use crate::profile::{LanguageProfile, RefinePolicy};
+
 /// The full, on-disk application settings.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub general: General,
@@ -23,6 +25,36 @@ pub struct Settings {
     pub snippets: Vec<Snippet>,
     pub history: HistoryCfg,
     pub advanced: Advanced,
+    /// One entry per language the user dictates in, each binding a hotkey to
+    /// an engine, a model and a refinement policy.
+    pub profiles: Vec<LanguageProfile>,
+}
+
+impl Default for Settings {
+    /// A fresh install gets one profile on the local sherpa-onnx engine.
+    /// whisper.cpp remains selectable but is no longer what a new user
+    /// starts with: the sherpa models emit punctuation and casing directly,
+    /// which is what makes refinement optional rather than expected.
+    fn default() -> Self {
+        Self {
+            general: General::default(),
+            dictation: Dictation::default(),
+            engine: EngineCfg::default(),
+            refine: RefineCfg::default(),
+            dictionary: Dictionary::default(),
+            snippets: Vec::new(),
+            history: HistoryCfg::default(),
+            advanced: Advanced::default(),
+            profiles: vec![LanguageProfile {
+                id: "default".to_string(),
+                hotkey: Dictation::default().hotkey,
+                language: "en".to_string(),
+                engine: EngineCfg::sherpa("parakeet-tdt-110m-en"),
+                draft: None,
+                refine: RefinePolicy::default(),
+            }],
+        }
+    }
 }
 
 /// General application preferences.
@@ -103,6 +135,30 @@ impl Default for EngineCfg {
             cloud: CloudSttCfg::default(),
         }
     }
+}
+
+impl EngineCfg {
+    /// A configuration selecting the sherpa-onnx engine with `model`, the
+    /// catalog id of one of its multi-artifact models.
+    pub fn sherpa(model: &str) -> Self {
+        Self {
+            active: EngineKind::Sherpa,
+            sherpa_model: Some(model.to_string()),
+            ..Self::default()
+        }
+    }
+}
+
+/// Whether a transcript from a profile carrying `policy` should be refined.
+///
+/// Refinement is gated twice on purpose. [`RefineCfg::enabled`] is a master
+/// switch the tray toggles, meaning "don't touch my text right now" whichever
+/// language is about to be spoken; [`RefinePolicy::enabled`] is the profile's
+/// own standing preference, which differs by language because some engines
+/// already emit punctuation and casing on their own. Refinement runs only
+/// when both agree.
+pub fn refinement_is_on(global: &RefineCfg, policy: &RefinePolicy) -> bool {
+    global.enabled && policy.enabled
 }
 
 /// Which speech-to-text engine is active.
@@ -307,6 +363,66 @@ pub fn save(path: &Path, settings: &Settings) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn profiles_round_trip_through_toml() {
+        let settings = Settings {
+            profiles: vec![LanguageProfile {
+                id: "ru".into(),
+                hotkey: "ctrl+super".into(),
+                language: "ru".into(),
+                engine: EngineCfg::sherpa("gigaam-v3-e2e-rnnt"),
+                draft: None,
+                refine: RefinePolicy {
+                    enabled: false,
+                    tone: Tone::Clean,
+                },
+            }],
+            ..Settings::default()
+        };
+
+        let text = toml::to_string(&settings).expect("serialize");
+        let parsed: Settings = toml::from_str(&text).expect("deserialize");
+        assert_eq!(parsed, settings);
+    }
+
+    #[test]
+    fn a_fresh_install_defaults_to_the_sherpa_engines() {
+        let settings = Settings::default();
+        assert_eq!(
+            settings.profiles.len(),
+            1,
+            "one profile until the user adds more"
+        );
+
+        let profile = &settings.profiles[0];
+        assert_eq!(profile.engine.active, EngineKind::Sherpa);
+        assert!(
+            !profile.refine.enabled,
+            "the default engine already emits punctuation, so refinement starts off"
+        );
+    }
+
+    #[test]
+    fn refinement_needs_both_the_master_switch_and_the_profile_policy() {
+        let on = RefineCfg {
+            enabled: true,
+            ..RefineCfg::default()
+        };
+        let off = RefineCfg::default();
+        let wants = RefinePolicy {
+            enabled: true,
+            ..RefinePolicy::default()
+        };
+        let declines = RefinePolicy::default();
+
+        assert!(refinement_is_on(&on, &wants));
+        assert!(
+            !refinement_is_on(&off, &wants),
+            "the tray master switch wins"
+        );
+        assert!(!refinement_is_on(&on, &declines), "the profile opted out");
+    }
     use super::*;
     use std::fs;
     use std::path::Path;

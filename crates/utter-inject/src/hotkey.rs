@@ -368,13 +368,20 @@ fn probe_permissions() -> PermissionProbe {
 /// More than one registered chord can complete on the same key event — e.g.
 /// `ctrl+super` and `ctrl+alt+super` both complete on the key-down that
 /// finishes whichever of `super`/`alt` was pressed last, if the other and
-/// `ctrl` are already held. Only one binding is ever fired at a time, so
-/// [`Self::update`] resolves that case by firing the chord with the most
-/// keys: the user pressed the extra key deliberately, so the longer chord is
-/// the one they meant. The others stay unfired and remain eligible to fire
-/// later on their own. [`find_conflicts`] still rejects the overlaps this
-/// resolution cannot cover, where neither chord is more specific than the
-/// other.
+/// `ctrl` are already held. At most one binding is ever fired at a time:
+/// [`Self::update`] enforces this as a latch, not merely a same-event
+/// tie-break. When nothing is currently fired and one or more bindings
+/// newly complete, it fires the one with the most keys — the user pressed
+/// the extra key deliberately, so the longer chord is the one they meant.
+/// While a binding is fired, any other binding becoming complete is
+/// ignored entirely (no event, and it is never marked fired) until the held
+/// one releases; only then can a different binding fire. This also covers
+/// the pair above reached by the other press order: completing
+/// `ctrl+super` first fires it, and adding `alt` afterward — a later,
+/// separate key event — must not hand the session off to `ctrl+alt+super`
+/// mid-dictation. [`find_conflicts`] separately rejects same-event overlaps
+/// between two *equally* specific chords, where this tie-break has nothing
+/// to compare and would otherwise fall back to registration order.
 #[derive(Debug, Clone)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct ChordMatcher {
@@ -412,23 +419,45 @@ impl ChordMatcher {
     }
 
     /// Re-evaluates every binding against the current `pressed` set and
-    /// reports at most one transition: the newly-completed binding with the
-    /// most keys on a press, or the previously-fired binding on a release.
-    /// Autorepeat (a key reported down while already down) never reaches
-    /// here as a change, so no event is ever re-fired while a chord stays
-    /// pressed.
+    /// reports at most one transition. Autorepeat (a key reported down
+    /// while already down) never reaches here as a change, so no event is
+    /// ever re-fired while a chord stays pressed.
     ///
-    /// Several bindings can newly complete on the same key event (see the
-    /// type-level doc comment); this only marks the most specific one as
-    /// fired, so the others stay eligible to fire later on their own. Since
-    /// at most one binding is ever fired at a time, at most one can be
-    /// releasing at a time too, so release order needs no such tie-break.
+    /// A currently-fired binding, if any, is checked first, before any
+    /// other binding is even looked at: if it is no longer fully held, this
+    /// reports its `Released` and returns immediately — a release ending
+    /// the current session always takes priority over immediately starting
+    /// a different one from whatever keys are still held, even if a more
+    /// specific binding has *also* just become fully held in the same call
+    /// (the partial-release case: releasing one key of a longer chord can
+    /// leave a shorter, nested one fully held). If the fired binding is
+    /// still fully held, this reports nothing: a different binding
+    /// completing while one is already fired must not switch which session
+    /// is live, since `Released` stops recording and an extra modifier
+    /// pressed mid-dictation must not cut it short.
+    ///
+    /// Only once nothing is fired does this look for a new completion, and
+    /// only then does the most-specific-wins tie-break apply: several
+    /// bindings can newly complete on the same key event (see the
+    /// type-level doc comment), and the one with the most keys is fired,
+    /// since the user pressed the extra key deliberately.
     fn update(&mut self) -> Option<HotkeyEvent> {
+        if let Some(fired_index) = self.fired.iter().position(|&fired| fired) {
+            let tokens = &self.bindings[fired_index];
+            let full = tokens.iter().all(|k| self.pressed.contains(k));
+            if !full {
+                self.fired[fired_index] = false;
+                return Some(HotkeyEvent::Released {
+                    binding: BindingId(fired_index),
+                });
+            }
+            return None;
+        }
+
         let mut newly_completed: Option<usize> = None;
         for (index, tokens) in self.bindings.iter().enumerate() {
             let full = !tokens.is_empty() && tokens.iter().all(|k| self.pressed.contains(k));
-
-            if full && !self.fired[index] {
+            if full {
                 let more_specific = match newly_completed {
                     Some(best) => tokens.len() > self.bindings[best].len(),
                     None => true,
@@ -436,11 +465,6 @@ impl ChordMatcher {
                 if more_specific {
                     newly_completed = Some(index);
                 }
-            } else if !full && self.fired[index] {
-                self.fired[index] = false;
-                return Some(HotkeyEvent::Released {
-                    binding: BindingId(index),
-                });
             }
         }
 
@@ -673,6 +697,85 @@ mod tests {
                 binding: BindingId::from(1)
             }),
             "the binding that fired is the one that releases"
+        );
+    }
+
+    #[test]
+    fn fired_binding_latches_against_a_more_specific_completion_pressed_later() {
+        // The base chord completes first; the extra key for the nested,
+        // more specific chord arrives on its own, later call to `update()`
+        // — press the base chord, then decide to add the modifier. This is
+        // the press order the same-event tie-break alone does not cover.
+        let specs = [
+            parse_hotkey("ctrl+super").expect("valid chord"),
+            parse_hotkey("ctrl+alt+super").expect("valid chord"),
+        ];
+        let mut matcher = ChordMatcher::new(&specs);
+
+        assert_eq!(matcher.on_key_down(Key::Ctrl), None);
+        assert_eq!(
+            matcher.on_key_down(Key::Super),
+            Some(HotkeyEvent::Pressed {
+                binding: BindingId(0)
+            })
+        );
+        assert_eq!(
+            matcher.on_key_down(Key::Alt),
+            None,
+            "binding 0 is fired and still fully held; a more specific binding \
+             completing afterward must not start a second session"
+        );
+
+        assert_eq!(
+            matcher.on_key_up(Key::Super),
+            Some(HotkeyEvent::Released {
+                binding: BindingId(0)
+            }),
+            "only binding 0 was ever fired, so it is the only one that can release"
+        );
+        // Binding 1 was never marked fired, so Alt releasing afterward must
+        // not report anything for it.
+        assert_eq!(matcher.on_key_up(Key::Alt), None);
+    }
+
+    #[test]
+    fn releasing_a_fired_bindings_extra_key_does_not_hand_off_to_the_nested_chord() {
+        // ctrl+alt+super fires via the same-event tie-break (most keys
+        // wins). Releasing alt leaves ctrl+super fully held; the release
+        // taking priority over a same-call new completion means this
+        // reports binding 1's `Released` and stops there, rather than
+        // immediately firing binding 0 from the leftover keys.
+        let specs = [
+            parse_hotkey("ctrl+super").expect("valid chord"),
+            parse_hotkey("ctrl+alt+super").expect("valid chord"),
+        ];
+        let mut matcher = ChordMatcher::new(&specs);
+
+        assert_eq!(matcher.on_key_down(Key::Ctrl), None);
+        assert_eq!(matcher.on_key_down(Key::Alt), None);
+        assert_eq!(
+            matcher.on_key_down(Key::Super),
+            Some(HotkeyEvent::Pressed {
+                binding: BindingId(1)
+            })
+        );
+
+        assert_eq!(
+            matcher.on_key_up(Key::Alt),
+            Some(HotkeyEvent::Released {
+                binding: BindingId(1)
+            }),
+            "binding 1 releases; ctrl+super being fully held is not picked \
+             up in the same call"
+        );
+
+        // Re-pressing Alt re-fires binding 1 cleanly, confirming no stale
+        // fired flag or leftover latch state was left behind.
+        assert_eq!(
+            matcher.on_key_down(Key::Alt),
+            Some(HotkeyEvent::Pressed {
+                binding: BindingId(1)
+            })
         );
     }
 

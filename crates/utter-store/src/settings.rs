@@ -237,10 +237,20 @@ impl Default for CloudSttCfg {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RefineCfg {
+    /// Master switch: refinement never runs while this is false, regardless of any profile's
+    /// own policy. See [`refinement_is_on`].
     pub enabled: bool,
+    /// Duplicated with [`RefinePolicy::tone`](crate::profile::RefinePolicy::tone) until every
+    /// consumer of this global setting is routed through a profile instead. Remove this field
+    /// once `commands::test_refine` and `runtime_boot::build_deps`'s `RuntimeDeps` construction
+    /// read a profile's tone directly.
     pub tone: Tone,
+    /// Base URL of the OpenAI-compatible endpoint refinement requests are sent to.
     pub base_url: String,
+    /// Model name passed to the refinement endpoint.
     pub model: String,
+    /// How long to wait for a refinement response before giving up and using the
+    /// unrefined transcript instead.
     pub timeout_secs: u64,
 }
 

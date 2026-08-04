@@ -41,7 +41,7 @@ describe('Settings type/JSON round-trip', () => {
       engine: {
         active: 'cloud',
         whisper_model: 'medium',
-        vosk_model: 'vosk-model-small-en-us-0.15',
+        sherpa_model: 'gigaam-v3-e2e-rnnt',
         cloud: {
           base_url: 'https://api.groq.com/openai/v1',
           model: 'whisper-large-v3',

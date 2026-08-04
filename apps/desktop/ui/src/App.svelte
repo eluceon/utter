@@ -21,11 +21,11 @@
   // fresh" without the flag), AND the loaded settings are byte-for-byte the
   // defaults (a real config file that merely doesn't set some fields would
   // still differ once anything meaningful was changed and saved). This is a
-  // heuristic, not a hard signal — the brief explicitly rules out adding a
-  // new Rust command (e.g. "does config.toml exist") for this task, so
-  // there is no way to distinguish "never configured" from "configured
-  // everything back to the exact defaults on purpose" without one. A
-  // dedicated `config_exists` command would remove this ambiguity later.
+  // heuristic, not a hard signal — a new Rust command (e.g. "does
+  // config.toml exist") was deliberately ruled out for this, so there is no
+  // way to distinguish "never configured" from "configured everything back
+  // to the exact defaults on purpose" without one. A dedicated
+  // `config_exists` command would remove this ambiguity later.
   const ONBOARDED_KEY = 'utter.onboarded'
 
   const NAV: { hash: string; label: string }[] = [

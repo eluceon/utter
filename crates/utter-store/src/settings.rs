@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
+use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 
 use utter_core::{DictationMode, Tone};
@@ -78,16 +79,18 @@ impl Default for Dictation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EngineCfg {
+    #[serde(deserialize_with = "deserialize_active_engine")]
     pub active: EngineKind,
     /// Catalog id of the whisper model, resolved to an on-disk path through
     /// [`ModelManager::path_for`](crate::ModelManager::path_for) — never a
     /// filesystem path itself.
     pub whisper_model: String,
-    /// Catalog id of the vosk model, resolved the same way as
-    /// [`whisper_model`](Self::whisper_model). Vosk models install as a
-    /// directory rather than a file, which makes it tempting to read this as
-    /// a path; it is not one.
-    pub vosk_model: Option<String>,
+    /// Catalog id of the sherpa-onnx model, resolved the same way as
+    /// [`whisper_model`](Self::whisper_model) — never a filesystem path
+    /// itself. Sherpa models install as a directory of several artifacts
+    /// (encoder, decoder, joiner, tokens), which makes treating this as a
+    /// path an easy mistake to reintroduce.
+    pub sherpa_model: Option<String>,
     pub cloud: CloudSttCfg,
 }
 
@@ -96,7 +99,7 @@ impl Default for EngineCfg {
         Self {
             active: EngineKind::Whisper,
             whisper_model: "small".to_string(),
-            vosk_model: None,
+            sherpa_model: None,
             cloud: CloudSttCfg::default(),
         }
     }
@@ -108,8 +111,53 @@ impl Default for EngineCfg {
 pub enum EngineKind {
     #[default]
     Whisper,
-    Vosk,
     Cloud,
+    Sherpa,
+}
+
+/// Deserializes `engine.active`, tolerating a name this build does not
+/// recognise (e.g. a v0.1 config's `active = "vosk"`, left behind once the
+/// Vosk engine was removed). The derived `Deserialize` for [`EngineKind`]
+/// would fail the *whole* TOML document on an unrecognised variant — the
+/// unknown-key tolerance `#[serde(default)]` gives every other field does
+/// not extend to enum values. Falling back to [`EngineKind::default`] here
+/// keeps a stale engine name from turning into a startup crash; the value
+/// is logged so the fallback is not silent.
+///
+/// The fallback re-uses the derived `Deserialize` for [`EngineKind`] instead
+/// of hand-writing the string-to-variant mapping a second time: a mapping
+/// duplicated here would silently drift out of sync with the derive as soon
+/// as a variant is added (it would compile, and just deserialize the new
+/// name back to the default), whereas delegating to the derive means a new
+/// variant is picked up automatically.
+fn deserialize_active_engine<'de, D>(deserializer: D) -> Result<EngineKind, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(
+        EngineKind::deserialize(raw.as_str().into_deserializer()).unwrap_or_else(
+            |_: serde::de::value::Error| {
+                let fallback = EngineKind::default();
+                tracing::warn!(
+                    "unrecognized engine.active value \"{raw}\" in settings; falling back to \"{}\"",
+                    engine_kind_as_toml(fallback)
+                );
+                fallback
+            },
+        ),
+    )
+}
+
+/// Renders `kind` the way it appears in a TOML config file (its
+/// `#[serde(rename_all = "snake_case")]` spelling), for diagnostics aimed at
+/// someone reading their `config.toml` — not `{kind:?}`'s Rust spelling,
+/// which a user grepping their logs for `active = "whisper"` will not find.
+fn engine_kind_as_toml(kind: EngineKind) -> String {
+    toml::Value::try_from(kind)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{kind:?}"))
 }
 
 /// Configuration for an OpenAI-compatible cloud speech-to-text endpoint.
@@ -348,6 +396,31 @@ mod tests {
 
         let result = load(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn an_unknown_engine_name_falls_back_without_losing_other_settings() {
+        // A v0.1 config naming an engine this build no longer has. The whole
+        // document must still parse: the user's hotkey and dictionary are not
+        // collateral damage for one stale enum value.
+        let toml = r#"
+[dictation]
+hotkey = "ctrl+alt+super"
+
+[engine]
+active = "vosk"
+vosk_model = "vosk-model-small-ru-0.22"
+
+[dictionary]
+terms = ["PostgreSQL"]
+"#;
+
+        let settings: Settings =
+            toml::from_str(toml).expect("an unknown engine must not fail the file");
+
+        assert_eq!(settings.engine.active, EngineKind::default());
+        assert_eq!(settings.dictation.hotkey, "ctrl+alt+super");
+        assert_eq!(settings.dictionary.terms, vec!["PostgreSQL".to_string()]);
     }
 
     #[test]

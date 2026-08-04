@@ -12,10 +12,11 @@ reqwest = { workspace = true }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { workspace = true }
 sha2 = "0.10"
+thiserror = { workspace = true }
 toml = "0.9"
+tracing = { workspace = true }
 utter-core = { path = "../utter-core" }
 utter-refine = { path = "../utter-refine" }
-zip = "2"
 
 [dev-dependencies]
 tempfile = "3"

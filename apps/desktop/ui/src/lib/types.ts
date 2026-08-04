@@ -11,7 +11,7 @@ export type Theme = 'system' | 'light' | 'dark'
 export type DictationMode = 'push_to_talk' | 'toggle'
 
 /** `crates/utter-store/src/settings.rs::EngineKind` */
-export type EngineKind = 'whisper' | 'vosk' | 'cloud'
+export type EngineKind = 'whisper' | 'cloud' | 'sherpa'
 
 /** `crates/utter-core/src/types.rs::Tone` */
 export type Tone = 'verbatim' | 'clean' | 'formal' | 'notes' | 'code_comment'
@@ -44,7 +44,7 @@ export interface CloudSttCfg {
 export interface EngineCfg {
   active: EngineKind
   whisper_model: string
-  vosk_model: string | null
+  sherpa_model: string | null
   cloud: CloudSttCfg
 }
 
@@ -117,7 +117,7 @@ export function defaultSettings(): Settings {
     engine: {
       active: 'whisper',
       whisper_model: 'small',
-      vosk_model: null,
+      sherpa_model: null,
       cloud: {
         base_url: 'https://api.openai.com/v1',
         model: 'whisper-1',
@@ -183,8 +183,6 @@ export interface ModelInfo {
   engine: string
   label: string
   size_mb: number
-  url: string
-  sha256: string
   installed: boolean
 }
 

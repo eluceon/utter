@@ -13,5 +13,6 @@ crossbeam-channel = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sherpa-onnx = "1.13"
 thiserror = "2"
 tracing = "0.1"

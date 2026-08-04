@@ -19,11 +19,11 @@ cd apps/desktop/ui && npm ci && cd ../../..
 cargo tauri dev
 ```
 
-The `vosk` engine feature links against `libvosk`, a shared library not
-distributed on crates.io. Run `scripts/setup-libvosk.sh` once to fetch it
-into `~/.local/share/utter/lib`, then export the `LD_LIBRARY_PATH` /
-`RUSTFLAGS` it prints before building with `--features vosk`. It's optional:
-the default feature set (whisper.cpp + cloud STT) builds and runs without it.
+The `sherpa` engine feature links sherpa-onnx statically; its build script
+downloads a prebuilt native archive on first build, so building with
+`--features sherpa` needs network access the first time but no extra linker
+setup. It's optional: the default feature set (whisper.cpp + cloud STT)
+builds and runs without it.
 
 ## Workspace layout
 
@@ -42,8 +42,8 @@ npm test --prefix apps/desktop/ui
 A handful of Rust tests are `#[ignore]`d because they need real hardware or
 network access rather than being genuinely non-deterministic:
 
-- `crates/utter-stt/src/whisper.rs`, `crates/utter-stt/src/vosk.rs` —
-  download real models over the network and run inference against them.
+- `crates/utter-stt/src/whisper.rs` — downloads a real model over the
+  network and runs inference against it.
 - `crates/utter-audio/src/capture.rs` — opens a real microphone via `cpal`.
 - `crates/utter-inject/src/inject.rs`, `crates/utter-inject/src/hotkey_evdev.rs`
   — need a readable `/dev/input` device and/or a writable `/dev/uinput`
@@ -63,6 +63,8 @@ CI (`.github/workflows/ci.yml`) runs, and any change must pass, all of:
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --workspace
+cargo clippy --workspace --all-targets --features sherpa -- -D warnings
+cargo test --workspace --features sherpa
 ```
 
 ## Commit style

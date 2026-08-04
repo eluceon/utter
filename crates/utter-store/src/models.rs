@@ -1,13 +1,17 @@
 //! STT model catalog and downloader.
 //!
 //! Holds the hard-coded catalog of speech-to-text models (whisper.cpp ggml
-//! models from Hugging Face, Vosk models from alphacephei.com), tracks which
-//! ones are installed under `data_dir/models/`, and performs checksum-verified
-//! downloads: the response body streams to a `.part` file while its sha256 is
-//! computed incrementally, and the file (or, for Vosk zip archives, the
-//! unpacked directory) is only put in its final place once the checksum
-//! matches the catalog value. A checksum mismatch or an interrupted download
-//! always leaves the `.part` file cleaned up rather than lying around.
+//! models and sherpa-onnx transducer models, both from Hugging Face), tracks
+//! which ones are installed under `data_dir/models/`, and performs
+//! checksum-verified downloads. A catalog entry is one or more artifacts: a
+//! whisper model is a single `.bin` file, and a model with several artifacts
+//! (e.g. a sherpa-onnx transducer's encoder, decoder, joiner and tokens) is
+//! installed as a directory holding all of them. Each artifact streams to
+//! its own `.part` file while its sha256 is computed incrementally, and a
+//! model only becomes visible at its final path once every one of its
+//! artifacts has verified — a checksum mismatch or an interrupted download
+//! always leaves the staging area cleaned up rather than reporting a
+//! half-installed model.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -17,6 +21,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::error::IntegrityError;
+
 /// A speech-to-text model available for download, with its installed state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelInfo {
@@ -24,91 +30,182 @@ pub struct ModelInfo {
     pub engine: String,
     pub label: String,
     pub size_mb: u32,
-    pub url: String,
-    pub sha256: String,
     pub installed: bool,
+}
+
+/// One downloadable file that makes up a catalog entry.
+///
+/// `name` is the file name the artifact is installed under (directly inside
+/// `models/` for a single-artifact entry, or inside the entry's model
+/// directory for a multi-artifact one) — it is independent of `url`, since a
+/// remote file's name is not always the one it should be installed as.
+#[derive(Debug, Clone, Copy)]
+struct Artifact {
+    url: &'static str,
+    sha256: &'static str,
+    name: &'static str,
+    /// The artifact's exact size once fully downloaded, used by
+    /// [`ModelManager::verify_installed`] to catch a truncated file before
+    /// its path is ever handed to a native engine. This is a size check,
+    /// not a re-hash: it catches truncation — the failure mode actually
+    /// observed in practice — but not a file of the right length with
+    /// corrupted bytes inside it; that class of corruption is what the
+    /// download path's sha256 verification already guards against, and
+    /// re-hashing hundreds of megabytes on every engine load would trade a
+    /// cheap, load-time-only guard for a slow one that mostly re-checks
+    /// what already passed once.
+    size_bytes: u64,
 }
 
 /// Static metadata for one catalog entry.
 ///
-/// `engine` distinguishes how a download is installed: `"whisper"` models
-/// are a single `.bin` file placed directly under `models/`; `"vosk"` models
-/// are a `.zip` archive whose sha256 is verified before it is unpacked into a
-/// same-named directory under `models/`.
+/// `engine` distinguishes the STT engine a model belongs to; installation
+/// itself is driven purely by artifact count: a single file directly under
+/// `models/` when there is exactly one artifact (e.g. `"whisper"`), or a
+/// directory named after the entry's `id` holding every artifact when there
+/// is more than one (e.g. a sherpa-onnx transducer's encoder, decoder,
+/// joiner and tokens).
 #[derive(Debug, Clone, Copy)]
 struct CatalogEntry {
     id: &'static str,
     engine: &'static str,
     label: &'static str,
     size_mb: u32,
-    url: &'static str,
-    sha256: &'static str,
+    artifacts: &'static [Artifact],
 }
 
 /// The hard-coded catalog of downloadable speech-to-text models.
 ///
-/// Whisper sha256 values were read from the Hugging Face tree API for
-/// `ggerganov/whisper.cpp` (`lfs.oid` per file). Vosk sha256 values were
-/// computed locally from the zip archives published at
-/// `https://alphacephei.com/vosk/models/`, and cross-checked against the
-/// md5 values listed in `https://alphacephei.com/vosk/models/model-list.json`.
+/// Whisper sha256 and size_bytes values were read from the Hugging Face tree
+/// API for `ggerganov/whisper.cpp` (`lfs.oid` and `size` per file).
+/// Sherpa-onnx sha256 and size_bytes values were read from the Hugging Face
+/// tree API for each model's repository at the pinned revision in its
+/// artifact URLs.
 const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         id: "tiny",
         engine: "whisper",
         label: "Whisper Tiny",
         size_mb: 74,
-        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
-        sha256: "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21",
+        artifacts: &[Artifact {
+            url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
+            sha256: "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21",
+            name: "ggml-tiny.bin",
+            size_bytes: 77_691_713,
+        }],
     },
     CatalogEntry {
         id: "base",
         engine: "whisper",
         label: "Whisper Base",
         size_mb: 141,
-        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
-        sha256: "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
+        artifacts: &[Artifact {
+            url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
+            sha256: "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
+            name: "ggml-base.bin",
+            size_bytes: 147_951_465,
+        }],
     },
     CatalogEntry {
         id: "small",
         engine: "whisper",
         label: "Whisper Small",
         size_mb: 465,
-        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
-        sha256: "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
+        artifacts: &[Artifact {
+            url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+            sha256: "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
+            name: "ggml-small.bin",
+            size_bytes: 487_601_967,
+        }],
     },
     CatalogEntry {
         id: "medium",
         engine: "whisper",
         label: "Whisper Medium",
         size_mb: 1463,
-        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
-        sha256: "6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208",
+        artifacts: &[Artifact {
+            url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
+            sha256: "6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208",
+            name: "ggml-medium.bin",
+            size_bytes: 1_533_763_059,
+        }],
     },
     CatalogEntry {
         id: "large-v3-turbo-q5_0",
         engine: "whisper",
         label: "Whisper Large v3 Turbo (q5_0)",
         size_mb: 547,
-        url:
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
-        sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
+        artifacts: &[Artifact {
+            url:
+                "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
+            sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
+            name: "ggml-large-v3-turbo-q5_0.bin",
+            size_bytes: 574_041_195,
+        }],
     },
     CatalogEntry {
-        id: "vosk-model-small-en-us-0.15",
-        engine: "vosk",
-        label: "Vosk Small (English)",
-        size_mb: 39,
-        url: "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
-        sha256: "30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498",
+        id: "gigaam-v3-e2e-rnnt",
+        engine: "sherpa",
+        label: "GigaAM-v3 (Russian)",
+        size_mb: 221,
+        artifacts: &[
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16/resolve/a6039be7cee829a9044a69ac0ebaf1c191217c97/encoder.int8.onnx",
+                sha256: "369f35a71bf288d3b8e0391fabd8dba5f2314088d440bca474056b7b4b6e66bf",
+                name: "encoder.int8.onnx",
+                size_bytes: 224_570_820,
+            },
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16/resolve/a6039be7cee829a9044a69ac0ebaf1c191217c97/decoder.onnx",
+                sha256: "38fc7475443ea2a26f63211ca350f73ac50fff824ab7a3876ee2bd610c53bbc4",
+                name: "decoder.onnx",
+                size_bytes: 4_600_132,
+            },
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16/resolve/a6039be7cee829a9044a69ac0ebaf1c191217c97/joiner.onnx",
+                sha256: "602ff7017a93311aad34df1437c8d7f49911353c13d6eae7a6ee7b041339465c",
+                name: "joiner.onnx",
+                size_bytes: 2_712_896,
+            },
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16/resolve/a6039be7cee829a9044a69ac0ebaf1c191217c97/tokens.txt",
+                sha256: "39abae20e692998290c574e606f11a9edef2902a1995463fcff63d1490cf22b7",
+                name: "tokens.txt",
+                size_bytes: 13_354,
+            },
+        ],
     },
     CatalogEntry {
-        id: "vosk-model-small-ru-0.22",
-        engine: "vosk",
-        label: "Vosk Small (Russian)",
-        size_mb: 44,
-        url: "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip",
-        sha256: "961d5ff98a17f4aa6de69864d0aa71fa5bac682301d2b5d17a3f24c5c99a46d4",
+        id: "parakeet-tdt-110m-en",
+        engine: "sherpa",
+        label: "Parakeet TDT (English)",
+        size_mb: 455,
+        artifacts: &[
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000/resolve/e9bea5a06247dc3f55319ff23d34b0328f2f5ddf/encoder.onnx",
+                sha256: "db260f1073c654c37dd65006885d1ee98ff16c22463b1ef992bbcabc29780a3f",
+                name: "encoder.onnx",
+                size_bytes: 456_050_698,
+            },
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000/resolve/e9bea5a06247dc3f55319ff23d34b0328f2f5ddf/decoder.onnx",
+                sha256: "3da156bde41a04c94ef783e0bd92928e9974e08645b976a22d0c3e1063510249",
+                name: "decoder.onnx",
+                size_bytes: 15_753_086,
+            },
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000/resolve/e9bea5a06247dc3f55319ff23d34b0328f2f5ddf/joiner.onnx",
+                sha256: "b603765c0724a0768c378a23326dabbeb9cfea932d260e4fcc14384fa5fd5aff",
+                name: "joiner.onnx",
+                size_bytes: 5_596_854,
+            },
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000/resolve/e9bea5a06247dc3f55319ff23d34b0328f2f5ddf/tokens.txt",
+                sha256: "450e56bd2f036fe5b6aa821865838cc5aa9d8b0106134ce9a9ba0664abe6cd10",
+                name: "tokens.txt",
+                size_bytes: 9_953,
+            },
+        ],
     },
 ];
 
@@ -142,40 +239,50 @@ impl ModelManager {
     pub fn catalog(&self) -> Vec<ModelInfo> {
         self.catalog
             .iter()
-            .map(|entry| ModelInfo {
-                id: entry.id.to_string(),
-                engine: entry.engine.to_string(),
-                label: entry.label.to_string(),
-                size_mb: entry.size_mb,
-                url: entry.url.to_string(),
-                sha256: entry.sha256.to_string(),
-                installed: self.install_path(entry).exists(),
+            .map(|entry| {
+                let path = self.install_path(entry);
+                ModelInfo {
+                    id: entry.id.to_string(),
+                    engine: entry.engine.to_string(),
+                    label: entry.label.to_string(),
+                    size_mb: entry.size_mb,
+                    installed: self.is_installed(entry, &path),
+                }
             })
             .collect()
     }
 
-    /// Returns the installed path for `id` (a file for whisper models, a
-    /// directory for vosk models), or `None` if it is unknown or not yet
-    /// installed.
+    /// Returns the installed path for `id` (a file for single-artifact
+    /// models, a directory for multi-artifact models), or `None` if
+    /// it is unknown, or not installed. A multi-artifact model is only
+    /// reported as installed once every one of its artifacts is present —
+    /// a partially downloaded model must never report as ready.
     pub fn path_for(&self, id: &str) -> Option<PathBuf> {
         let entry = self.find(id)?;
         let path = self.install_path(entry);
-        path.exists().then_some(path)
+        self.is_installed(entry, &path).then_some(path)
     }
 
     /// Downloads and installs the model identified by `id`.
     ///
-    /// The response body streams into a `.part` file under `models/` while
-    /// its sha256 is computed incrementally; `progress(done, total)` is
-    /// called after every chunk (`total` is 0 if the server did not send a
-    /// `Content-Length`). Once the body is fully received, the digest is
-    /// checked against the catalog's sha256: on mismatch, or if the body is
-    /// interrupted, the `.part` file is removed and an error returned, so no
-    /// partial file or directory is ever left behind.
+    /// Each artifact's response body streams into a `.part` file inside a
+    /// fresh staging area while its sha256 is computed incrementally;
+    /// `progress(done, total)` is called after every chunk of every artifact,
+    /// with `total` the catalog's grand total across every artifact in the
+    /// entry (known upfront from each artifact's `size_bytes`, independent of
+    /// whatever the server reports as `Content-Length`) and `done` running
+    /// cumulatively across artifacts, never resetting to zero partway through
+    /// a multi-artifact model. An artifact's digest is checked against its
+    /// catalog sha256 as soon as it finishes downloading: on the first
+    /// mismatch, or if any body is interrupted, the whole staging area is
+    /// removed and an error returned, so no half-downloaded model is ever
+    /// left where [`Self::path_for`] would find it.
     ///
-    /// On success, whisper models are atomically renamed into place;
-    /// vosk models are unpacked from the verified zip into a same-named
-    /// directory, and the zip is discarded.
+    /// Only once every artifact has verified does the model become visible
+    /// at its final path: a single-artifact model (e.g. whisper) is renamed
+    /// directly into place as one file, and a multi-artifact model (e.g. a
+    /// sherpa-onnx entry) has its whole staging directory renamed into place
+    /// at once.
     pub fn download(&self, id: &str, progress: &mut dyn FnMut(u64, u64)) -> Result<PathBuf> {
         let entry = *self
             .find(id)
@@ -185,86 +292,79 @@ impl ModelManager {
         fs::create_dir_all(&models_dir)
             .with_context(|| format!("failed to create {}", models_dir.display()))?;
 
-        let target = target_name(entry.url);
-        let part_path = models_dir.join(format!("{target}.part"));
+        self.download_artifacts(id, &entry, &models_dir, progress)
+    }
 
-        let digest = match stream_to_part(entry.url, &part_path, progress) {
-            Ok(digest) => digest,
-            Err(err) => {
-                let _ = fs::remove_file(&part_path);
-                return Err(err);
-            }
+    /// Downloads and verifies every artifact of `entry` into a staging
+    /// directory, then puts it in its final place: a single file when there
+    /// is exactly one artifact, or the whole directory when there are
+    /// several. See [`Self::download`] for the staging/verification
+    /// contract.
+    fn download_artifacts(
+        &self,
+        id: &str,
+        entry: &CatalogEntry,
+        models_dir: &Path,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<PathBuf> {
+        let Some((first, _)) = entry.artifacts.split_first() else {
+            bail!("model '{id}' has no artifacts defined");
         };
 
-        if digest != entry.sha256 {
-            let _ = fs::remove_file(&part_path);
-            bail!(
-                "checksum mismatch for model '{id}': expected {}, got {digest}",
-                entry.sha256
-            );
+        let staging_dir = models_dir.join(format!("{}.staging", entry.id));
+        let _ = fs::remove_dir_all(&staging_dir);
+        fs::create_dir_all(&staging_dir)
+            .with_context(|| format!("failed to create {}", staging_dir.display()))?;
+
+        // The catalog already knows every artifact's exact size, so the
+        // grand total is fixed up front and does not depend on the server's
+        // `Content-Length`. Reporting `completed + done` against that fixed
+        // total (rather than passing each artifact's own `stream_to_part`
+        // progress straight through) keeps the sequence handed to `progress`
+        // monotonic across the whole model, instead of resetting to zero at
+        // the start of every artifact.
+        let grand_total: u64 = entry.artifacts.iter().map(|a| a.size_bytes).sum();
+        let mut completed: u64 = 0;
+        for artifact in entry.artifacts {
+            let mut aggregate = |done: u64, _total: u64| progress(completed + done, grand_total);
+            if let Err(err) = stage_one_artifact(id, artifact, &staging_dir, &mut aggregate) {
+                let _ = fs::remove_dir_all(&staging_dir);
+                return Err(err);
+            }
+            completed += artifact.size_bytes;
         }
 
-        let final_path = self.install_path(&entry);
-        match entry.engine {
-            "vosk" => {
-                // Extract into a fresh staging directory first, rather than
-                // over `final_path` directly: if extraction fails partway
-                // (checksum was already verified, but e.g. disk is full or
-                // the archive is otherwise unreadable), only the staging
-                // directory is discarded and any prior good install at
-                // `final_path` is left untouched. On success, the old
-                // install (if any) is removed only after the new one has
-                // been fully unpacked, then the staged directory is renamed
-                // into place.
-                let staging_root = models_dir.join(format!("{target}.staging"));
-                let _ = fs::remove_dir_all(&staging_root);
-
-                let unpacked = unpack_zip(&part_path, &staging_root);
-                let _ = fs::remove_file(&part_path);
-                if let Err(err) = unpacked {
-                    let _ = fs::remove_dir_all(&staging_root);
-                    return Err(err);
-                }
-
-                let staged_dir = final_path.file_name().map(|name| staging_root.join(name));
-                let Some(staged_dir) = staged_dir.filter(|dir| dir.is_dir()) else {
-                    let _ = fs::remove_dir_all(&staging_root);
-                    bail!(
-                        "archive for model '{id}' did not contain the expected directory '{}'",
-                        final_path.display()
-                    );
-                };
-
-                if final_path.exists() {
-                    fs::remove_dir_all(&final_path).with_context(|| {
-                        format!(
-                            "failed to remove previous install at {}",
-                            final_path.display()
-                        )
-                    })?;
-                }
-                fs::rename(&staged_dir, &final_path).with_context(|| {
+        let final_path = self.install_path(entry);
+        if entry.artifacts.len() > 1 {
+            if final_path.exists() {
+                fs::remove_dir_all(&final_path).with_context(|| {
                     format!(
-                        "failed to move {} into {}",
-                        staged_dir.display(),
+                        "failed to remove previous install at {}",
                         final_path.display()
                     )
                 })?;
-                let _ = fs::remove_dir_all(&staging_root);
-
-                Ok(final_path)
             }
-            _ => {
-                fs::rename(&part_path, &final_path).with_context(|| {
-                    format!(
-                        "failed to move {} into {}",
-                        part_path.display(),
-                        final_path.display()
-                    )
-                })?;
-                Ok(final_path)
-            }
+            fs::rename(&staging_dir, &final_path).with_context(|| {
+                format!(
+                    "failed to move {} into {}",
+                    staging_dir.display(),
+                    final_path.display()
+                )
+            })?;
+        } else {
+            let staged_file = staging_dir.join(first.name);
+            let renamed = fs::rename(&staged_file, &final_path).with_context(|| {
+                format!(
+                    "failed to move {} into {}",
+                    staged_file.display(),
+                    final_path.display()
+                )
+            });
+            let _ = fs::remove_dir_all(&staging_dir);
+            renamed?;
         }
+
+        Ok(final_path)
     }
 
     /// Removes the installed model identified by `id`, if present. A no-op
@@ -294,24 +394,124 @@ impl ModelManager {
         self.catalog.iter().find(|entry| entry.id == id)
     }
 
-    /// The final on-disk path a catalog entry installs to: a `.bin` file for
-    /// whisper models, a directory (the zip's basename minus `.zip`) for
-    /// vosk models.
+    /// The final on-disk path a catalog entry installs to: a directory named
+    /// after the entry's `id` for models with more than one artifact, or a
+    /// single file (the artifact's `name`) otherwise.
     fn install_path(&self, entry: &CatalogEntry) -> PathBuf {
-        let name = target_name(entry.url);
-        match entry.engine {
-            "vosk" => self
-                .models_dir()
-                .join(name.strip_suffix(".zip").unwrap_or(name)),
-            _ => self.models_dir().join(name),
+        if entry.artifacts.len() > 1 {
+            self.models_dir().join(entry.id)
+        } else {
+            let name = entry.artifacts.first().map_or(entry.id, |a| a.name);
+            self.models_dir().join(name)
         }
+    }
+
+    /// Whether every artifact of `entry` is present at `path`, the value
+    /// returned by [`Self::install_path`] for it.
+    fn is_installed(&self, entry: &CatalogEntry, path: &Path) -> bool {
+        entry
+            .artifacts
+            .iter()
+            .all(|a| artifact_path(entry, path, a).is_file())
+    }
+
+    /// Verifies that every artifact of the installed model `id` is present
+    /// and has exactly the byte length recorded in the catalog, returning
+    /// its installed path (the same one [`Self::path_for`] would) only if
+    /// every check passes.
+    ///
+    /// This exists because a corrupt model file does not fail cleanly once
+    /// handed to the native speech engine: sherpa-onnx's token-table parser
+    /// calls a compiled-in `exit()` on a malformed `tokens.txt`, and a
+    /// malformed `.onnx` file makes onnxruntime throw a C++ exception that
+    /// unwinds across the FFI boundary uncaught. Neither is catchable in
+    /// Rust — both abort the whole process with nothing logged and no
+    /// notice shown. Verifying before the path is ever handed to the native
+    /// layer is the only point at which this can be prevented rather than
+    /// merely reported.
+    ///
+    /// The check is file size, not a checksum: hashing every artifact (up
+    /// to several hundred megabytes) on every engine load would add real
+    /// latency to every app start and every language switch, to guard
+    /// against corruption that the download path already checksums
+    /// against. A size mismatch is the failure actually observed in
+    /// practice — an interrupted download leaving a file of the right name
+    /// and the wrong length — but this is not a complete integrity check:
+    /// a file of the correct size with corrupted bytes inside it still
+    /// passes.
+    pub fn verify_installed(&self, id: &str) -> Result<PathBuf, IntegrityError> {
+        let entry = self
+            .find(id)
+            .ok_or_else(|| IntegrityError::UnknownModel(id.to_string()))?;
+        let path = self.install_path(entry);
+        if !self.is_installed(entry, &path) {
+            return Err(IntegrityError::NotInstalled(id.to_string()));
+        }
+
+        for artifact in entry.artifacts {
+            let artifact_path = artifact_path(entry, &path, artifact);
+            let metadata = fs::metadata(&artifact_path).map_err(|source| IntegrityError::Io {
+                model: id.to_string(),
+                artifact: artifact.name.to_string(),
+                path: artifact_path.clone(),
+                source,
+            })?;
+            let actual = metadata.len();
+            if actual != artifact.size_bytes {
+                return Err(IntegrityError::SizeMismatch {
+                    model: id.to_string(),
+                    artifact: artifact.name.to_string(),
+                    path: artifact_path,
+                    expected: artifact.size_bytes,
+                    actual,
+                });
+            }
+        }
+
+        Ok(path)
     }
 }
 
-/// The last path segment of `url`, used as the on-disk file name for a
-/// download (e.g. `ggml-tiny.bin`, `vosk-model-small-en-us-0.15.zip`).
-fn target_name(url: &str) -> &str {
-    url.rsplit('/').next().unwrap_or(url)
+/// Resolves the on-disk path of one artifact of `entry`, given the entry's
+/// `install_path`: the artifact itself for a single-artifact entry (where
+/// `install_path` is already a file), or `install_path` joined with the
+/// artifact's name for a multi-artifact entry (where `install_path` is a
+/// directory).
+fn artifact_path(entry: &CatalogEntry, install_path: &Path, artifact: &Artifact) -> PathBuf {
+    if entry.artifacts.len() > 1 {
+        install_path.join(artifact.name)
+    } else {
+        install_path.to_path_buf()
+    }
+}
+
+/// Downloads and verifies one artifact into `staging_dir`, leaving it at
+/// `staging_dir/<artifact.name>` on success. The `.part` suffix is only used
+/// while the body is in flight and the checksum is unconfirmed.
+fn stage_one_artifact(
+    id: &str,
+    artifact: &Artifact,
+    staging_dir: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<()> {
+    let part_path = staging_dir.join(format!("{}.part", artifact.name));
+    let digest = stream_to_part(artifact.url, &part_path, progress)?;
+    if digest != artifact.sha256 {
+        bail!(
+            "checksum mismatch for model '{id}' artifact '{}': expected {}, got {digest}",
+            artifact.name,
+            artifact.sha256
+        );
+    }
+
+    let final_in_staging = staging_dir.join(artifact.name);
+    fs::rename(&part_path, &final_in_staging).with_context(|| {
+        format!(
+            "failed to move {} into {}",
+            part_path.display(),
+            final_in_staging.display()
+        )
+    })
 }
 
 /// Streams the HTTP body at `url` into `part_path`, reporting `(done,
@@ -355,40 +555,6 @@ fn stream_to_part(
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Unpacks the zip archive at `zip_path` into `dest_dir`, preserving each
-/// entry's relative path. Entries with an unsafe (e.g. path-traversing) name
-/// are skipped rather than trusted.
-fn unpack_zip(zip_path: &Path, dest_dir: &Path) -> Result<()> {
-    let file = File::open(zip_path).context("failed to open downloaded archive")?;
-    let mut archive = zip::ZipArchive::new(file).context("failed to read zip archive")?;
-
-    for i in 0..archive.len() {
-        let mut entry = archive
-            .by_index(i)
-            .with_context(|| format!("failed to read zip entry {i}"))?;
-        let Some(relative) = entry.enclosed_name() else {
-            continue;
-        };
-        let out_path = dest_dir.join(relative);
-
-        if entry.is_dir() {
-            fs::create_dir_all(&out_path)
-                .with_context(|| format!("failed to create directory {}", out_path.display()))?;
-        } else {
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create directory {}", parent.display()))?;
-            }
-            let mut out_file = File::create(&out_path)
-                .with_context(|| format!("failed to create {}", out_path.display()))?;
-            std::io::copy(&mut entry, &mut out_file)
-                .with_context(|| format!("failed to extract {}", out_path.display()))?;
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,27 +562,85 @@ mod tests {
 
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-    use zip::write::SimpleFileOptions;
 
-    fn whisper_entry(url: String, sha256: String) -> CatalogEntry {
+    /// Leaks a `Vec<Artifact>` into a `&'static [Artifact]`, mirroring how
+    /// the real catalog's entries are `'static` data, so test entries can be
+    /// built from owned `String`s (e.g. a mock server's URI).
+    fn leak_artifacts(artifacts: Vec<Artifact>) -> &'static [Artifact] {
+        Box::leak(artifacts.into_boxed_slice())
+    }
+
+    fn whisper_entry(url: String, sha256: String, size_bytes: u64) -> CatalogEntry {
         CatalogEntry {
             id: "test-whisper",
             engine: "whisper",
             label: "Test Whisper",
             size_mb: 1,
-            url: Box::leak(url.into_boxed_str()),
-            sha256: Box::leak(sha256.into_boxed_str()),
+            artifacts: leak_artifacts(vec![Artifact {
+                url: Box::leak(url.into_boxed_str()),
+                sha256: Box::leak(sha256.into_boxed_str()),
+                name: "ggml-test.bin",
+                size_bytes,
+            }]),
         }
     }
 
-    fn vosk_entry(url: String, sha256: String) -> CatalogEntry {
+    /// A two-artifact entry (e.g. mirroring a sherpa-onnx model's encoder
+    /// and tokens) whose artifacts are never actually downloaded in the
+    /// tests that use it — only `path_for`'s and `verify_installed`'s
+    /// "every file present" / "every size matches" logic is exercised, so
+    /// the URLs are unused placeholders. `encoder.onnx` is expected to be
+    /// 100 bytes and `tokens.txt` 50 once genuinely installed.
+    fn two_file_entry() -> CatalogEntry {
         CatalogEntry {
-            id: "test-vosk",
-            engine: "vosk",
-            label: "Test Vosk",
+            id: "two-file-model",
+            engine: "sherpa",
+            label: "Test Two-File Model",
             size_mb: 1,
-            url: Box::leak(url.into_boxed_str()),
-            sha256: Box::leak(sha256.into_boxed_str()),
+            artifacts: &[
+                Artifact {
+                    url: "unused",
+                    sha256: "unused",
+                    name: "encoder.onnx",
+                    size_bytes: 100,
+                },
+                Artifact {
+                    url: "unused",
+                    sha256: "unused",
+                    name: "tokens.txt",
+                    size_bytes: 50,
+                },
+            ],
+        }
+    }
+
+    fn multi_artifact_entry(
+        encoder_url: String,
+        encoder_sha256: String,
+        encoder_size_bytes: u64,
+        tokens_url: String,
+        tokens_sha256: String,
+        tokens_size_bytes: u64,
+    ) -> CatalogEntry {
+        CatalogEntry {
+            id: "test-multi",
+            engine: "sherpa",
+            label: "Test Multi-Artifact",
+            size_mb: 1,
+            artifacts: leak_artifacts(vec![
+                Artifact {
+                    url: Box::leak(encoder_url.into_boxed_str()),
+                    sha256: Box::leak(encoder_sha256.into_boxed_str()),
+                    name: "encoder.onnx",
+                    size_bytes: encoder_size_bytes,
+                },
+                Artifact {
+                    url: Box::leak(tokens_url.into_boxed_str()),
+                    sha256: Box::leak(tokens_sha256.into_boxed_str()),
+                    name: "tokens.txt",
+                    size_bytes: tokens_size_bytes,
+                },
+            ]),
         }
     }
 
@@ -424,65 +648,6 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
         hex::encode(hasher.finalize())
-    }
-
-    /// Builds a tiny zip archive with a single top-level directory (mirroring
-    /// how real Vosk archives are laid out) containing one small file.
-    fn build_test_vosk_zip(dir_name: &str) -> Vec<u8> {
-        let mut buf = Vec::new();
-        {
-            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let options =
-                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-            writer
-                .start_file(format!("{dir_name}/README"), options)
-                .expect("start_file");
-            writer
-                .write_all(b"tiny vosk model fixture")
-                .expect("write fixture body");
-            writer.finish().expect("finish zip");
-        }
-        buf
-    }
-
-    /// Builds a structurally valid zip archive (two Stored entries under
-    /// `dir_name`) whose second entry's data has been corrupted in place so
-    /// its CRC32 no longer matches: the archive opens fine, but extracting
-    /// the second entry fails partway through. Used to test that a checksum
-    /// can pass (it is computed over these exact, already-corrupt bytes)
-    /// while the subsequent unpack still fails.
-    fn build_corrupt_vosk_zip(dir_name: &str) -> Vec<u8> {
-        let mut buf = Vec::new();
-        let second_content = b"second file content, will be corrupted";
-        {
-            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let options =
-                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-            writer
-                .start_file(format!("{dir_name}/first"), options)
-                .expect("start_file first");
-            writer
-                .write_all(b"first file content, extracted fine")
-                .expect("write first");
-            writer
-                .start_file(format!("{dir_name}/second"), options)
-                .expect("start_file second");
-            writer.write_all(second_content).expect("write second");
-            writer.finish().expect("finish zip");
-        }
-
-        // Flip one byte inside the second entry's stored (uncompressed) data.
-        // Because compression is `Stored`, the entry's bytes appear verbatim
-        // in the archive, so this corrupts its content without touching the
-        // zip's structure or offsets; its recorded CRC32 no longer matches
-        // when read back.
-        let pos = buf
-            .windows(second_content.len())
-            .position(|window| window == second_content)
-            .expect("stored bytes should be present verbatim in the archive");
-        buf[pos] ^= 0xFF;
-
-        buf
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -498,7 +663,11 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let entry = whisper_entry(format!("{}/ggml-test.bin", server.uri()), sha256.clone());
+        let entry = whisper_entry(
+            format!("{}/ggml-test.bin", server.uri()),
+            sha256.clone(),
+            body.len() as u64,
+        );
         let manager = ModelManager::with_catalog(dir.path().to_path_buf(), vec![entry]);
 
         let (result, calls) = tokio::task::spawn_blocking(move || {
@@ -567,6 +736,7 @@ mod tests {
     async fn wrong_checksum_errors_and_leaves_no_file_behind() {
         let server = MockServer::start().await;
         let body = vec![0x11u8; 1_000];
+        let body_len = body.len() as u64;
 
         Mock::given(method("GET"))
             .and(path("/ggml-test.bin"))
@@ -578,6 +748,7 @@ mod tests {
         let entry = whisper_entry(
             format!("{}/ggml-test.bin", server.uri()),
             "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            body_len,
         );
         let manager = ModelManager::with_catalog(dir.path().to_path_buf(), vec![entry]);
 
@@ -604,6 +775,7 @@ mod tests {
         let entry = whisper_entry(
             format!("{base_url}/body"),
             "irrelevant-because-body-is-truncated".to_string(),
+            500_000,
         );
         let manager = ModelManager::with_catalog(dir.path().to_path_buf(), vec![entry]);
 
@@ -625,6 +797,7 @@ mod tests {
     async fn catalog_marks_model_installed_after_download() {
         let server = MockServer::start().await;
         let body = vec![0x77u8; 10_000];
+        let body_len = body.len() as u64;
         let sha256 = sha256_hex(&body);
 
         Mock::given(method("GET"))
@@ -634,7 +807,11 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let entry = whisper_entry(format!("{}/ggml-test.bin", server.uri()), sha256.clone());
+        let entry = whisper_entry(
+            format!("{}/ggml-test.bin", server.uri()),
+            sha256.clone(),
+            body_len,
+        );
         let manager = ModelManager::with_catalog(dir.path().to_path_buf(), vec![entry]);
 
         let before = manager.catalog();
@@ -662,140 +839,296 @@ mod tests {
         );
     }
 
+    #[test]
+    fn multi_artifact_model_is_installed_only_when_every_file_is_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = ModelManager::with_catalog(dir.path().to_path_buf(), vec![two_file_entry()]);
+
+        let model_dir = dir.path().join("models").join("two-file-model");
+        fs::create_dir_all(&model_dir).expect("create model dir");
+        fs::write(model_dir.join("encoder.onnx"), b"x").expect("write encoder");
+
+        assert!(
+            models.path_for("two-file-model").is_none(),
+            "a half-downloaded model must not report as installed"
+        );
+
+        fs::write(model_dir.join("tokens.txt"), b"x").expect("write tokens");
+        assert_eq!(models.path_for("two-file-model"), Some(model_dir));
+    }
+
+    #[test]
+    fn a_truncated_artifact_is_reported_as_damaged_not_installed() {
+        // The failure this guards against is not hypothetical: a 456 MB model
+        // download was observed to stall silently partway through, leaving a
+        // file of exactly the right name and the wrong length.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = ModelManager::with_catalog(dir.path().to_path_buf(), vec![two_file_entry()]);
+
+        let model_dir = dir.path().join("models").join("two-file-model");
+        fs::create_dir_all(&model_dir).expect("create model dir");
+        fs::write(model_dir.join("encoder.onnx"), b"truncated").expect("write encoder");
+        fs::write(model_dir.join("tokens.txt"), b"x").expect("write tokens");
+
+        let err = models
+            .verify_installed("two-file-model")
+            .expect_err("a wrong-sized artifact must not pass verification");
+        assert!(matches!(err, IntegrityError::SizeMismatch { .. }));
+    }
+
+    #[test]
+    fn verify_installed_succeeds_when_every_artifact_size_matches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = ModelManager::with_catalog(dir.path().to_path_buf(), vec![two_file_entry()]);
+
+        let model_dir = dir.path().join("models").join("two-file-model");
+        fs::create_dir_all(&model_dir).expect("create model dir");
+        fs::write(model_dir.join("encoder.onnx"), vec![0u8; 100]).expect("write encoder");
+        fs::write(model_dir.join("tokens.txt"), vec![0u8; 50]).expect("write tokens");
+
+        let verified = models
+            .verify_installed("two-file-model")
+            .expect("correctly sized artifacts must verify");
+        assert_eq!(verified, model_dir);
+    }
+
+    #[test]
+    fn verify_installed_checks_the_size_of_a_single_file_model() {
+        // Every other `verify_installed` test uses `two_file_entry`, so this
+        // is the only one exercising `artifact_path`'s single-artifact
+        // branch (whisper's shape, and the reason the function is generic).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = whisper_entry("unused".to_string(), "unused".to_string(), 100);
+        let models = ModelManager::with_catalog(dir.path().to_path_buf(), vec![entry]);
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).expect("create models dir");
+        let file = models_dir.join("ggml-test.bin");
+
+        fs::write(&file, vec![0u8; 99]).expect("write short file");
+        assert!(matches!(
+            models.verify_installed("test-whisper"),
+            Err(IntegrityError::SizeMismatch { .. })
+        ));
+
+        fs::write(&file, vec![0u8; 100]).expect("write correct file");
+        assert_eq!(
+            models.verify_installed("test-whisper").expect("verifies"),
+            file
+        );
+    }
+
+    #[test]
+    fn verify_installed_reports_a_never_downloaded_model_as_not_installed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = ModelManager::with_catalog(dir.path().to_path_buf(), vec![two_file_entry()]);
+
+        let err = models
+            .verify_installed("two-file-model")
+            .expect_err("a never-downloaded model must not verify");
+        assert!(matches!(err, IntegrityError::NotInstalled(id) if id == "two-file-model"));
+    }
+
+    #[test]
+    fn verify_installed_rejects_an_unknown_model_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = ModelManager::with_catalog(dir.path().to_path_buf(), Vec::new());
+
+        let err = models
+            .verify_installed("does-not-exist")
+            .expect_err("an unknown id must not verify");
+        assert!(matches!(err, IntegrityError::UnknownModel(id) if id == "does-not-exist"));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn vosk_zip_is_verified_then_unpacked_into_a_directory() {
+    async fn download_installs_every_artifact_of_a_multi_artifact_model() {
         let server = MockServer::start().await;
-        let zip_bytes = build_test_vosk_zip("vosk-model-test");
-        let sha256 = sha256_hex(&zip_bytes);
+        let encoder_body = vec![0xAAu8; 5_000];
+        let tokens_body = b"token list".to_vec();
+        let encoder_size_bytes = encoder_body.len() as u64;
+        let tokens_size_bytes = tokens_body.len() as u64;
+        let encoder_sha256 = sha256_hex(&encoder_body);
+        let tokens_sha256 = sha256_hex(&tokens_body);
 
         Mock::given(method("GET"))
-            .and(path("/vosk-model-test.zip"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
+            .and(path("/encoder.onnx"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(encoder_body.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tokens.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tokens_body.clone()))
             .mount(&server)
             .await;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let entry = vosk_entry(
-            format!("{}/vosk-model-test.zip", server.uri()),
-            sha256.clone(),
+        let entry = multi_artifact_entry(
+            format!("{}/encoder.onnx", server.uri()),
+            encoder_sha256,
+            encoder_size_bytes,
+            format!("{}/tokens.txt", server.uri()),
+            tokens_sha256,
+            tokens_size_bytes,
         );
         let manager = ModelManager::with_catalog(dir.path().to_path_buf(), vec![entry]);
 
         let installed_path =
-            tokio::task::spawn_blocking(move || manager.download("test-vosk", &mut |_, _| {}))
+            tokio::task::spawn_blocking(move || manager.download("test-multi", &mut |_, _| {}))
                 .await
                 .expect("blocking task panicked")
                 .expect("download should succeed");
 
-        assert_eq!(installed_path, dir.path().join("models/vosk-model-test"));
-        assert!(installed_path.is_dir());
-        let readme = fs::read_to_string(installed_path.join("README")).expect("read README");
-        assert_eq!(readme, "tiny vosk model fixture");
-
-        // The intermediate zip must not survive as a stray artifact.
-        assert!(!dir.path().join("models/vosk-model-test.zip.part").exists());
-        assert!(!dir.path().join("models/vosk-model-test.zip").exists());
+        assert_eq!(installed_path, dir.path().join("models/test-multi"));
+        assert_eq!(
+            fs::read(installed_path.join("encoder.onnx")).expect("read encoder"),
+            encoder_body
+        );
+        assert_eq!(
+            fs::read(installed_path.join("tokens.txt")).expect("read tokens"),
+            tokens_body
+        );
+        assert!(!dir.path().join("models/test-multi.staging").exists());
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn vosk_redownload_replaces_stale_files_and_removes_old_content() {
+    async fn multi_artifact_download_reports_progress_without_resetting_between_artifacts() {
         let server = MockServer::start().await;
-        let zip_bytes = build_test_vosk_zip("vosk-model-test");
-        let sha256 = sha256_hex(&zip_bytes);
+        let encoder_body = vec![0xCCu8; 5_000];
+        let tokens_body = vec![0xDDu8; 2_000];
+        let encoder_size_bytes = encoder_body.len() as u64;
+        let tokens_size_bytes = tokens_body.len() as u64;
+        let encoder_sha256 = sha256_hex(&encoder_body);
+        let tokens_sha256 = sha256_hex(&tokens_body);
 
         Mock::given(method("GET"))
-            .and(path("/vosk-model-test.zip"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
+            .and(path("/encoder.onnx"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(encoder_body.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tokens.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tokens_body.clone()))
             .mount(&server)
             .await;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let entry = vosk_entry(
-            format!("{}/vosk-model-test.zip", server.uri()),
-            sha256.clone(),
+        let entry = multi_artifact_entry(
+            format!("{}/encoder.onnx", server.uri()),
+            encoder_sha256,
+            encoder_size_bytes,
+            format!("{}/tokens.txt", server.uri()),
+            tokens_sha256,
+            tokens_size_bytes,
         );
         let manager = ModelManager::with_catalog(dir.path().to_path_buf(), vec![entry]);
+        let grand_total = encoder_size_bytes + tokens_size_bytes;
 
-        // Simulate a previously installed model containing a file the new
-        // archive does not: a naive "unpack over the same directory" would
-        // leave it behind.
-        let install_dir = dir.path().join("models/vosk-model-test");
-        fs::create_dir_all(&install_dir).expect("create stale install dir");
-        fs::write(
-            install_dir.join("stale-sentinel.txt"),
-            b"leftover from an old version",
-        )
-        .expect("write stale sentinel");
+        let calls = tokio::task::spawn_blocking(move || {
+            let mut calls: Vec<(u64, u64)> = Vec::new();
+            manager
+                .download("test-multi", &mut |done, total| calls.push((done, total)))
+                .expect("download should succeed");
+            calls
+        })
+        .await
+        .expect("blocking task panicked");
 
-        let installed_path =
-            tokio::task::spawn_blocking(move || manager.download("test-vosk", &mut |_, _| {}))
-                .await
-                .expect("blocking task panicked")
-                .expect("re-download should succeed");
-
-        assert_eq!(installed_path, install_dir);
-        let readme = fs::read_to_string(installed_path.join("README")).expect("read README");
-        assert_eq!(readme, "tiny vosk model fixture");
-        assert!(
-            !installed_path.join("stale-sentinel.txt").exists(),
-            "stale file from the previous install should be gone after re-download"
-        );
+        assert!(!calls.is_empty(), "expected at least one progress call");
+        assert_eq!(calls.first(), Some(&(0, grand_total)));
+        assert_eq!(calls.last(), Some(&(grand_total, grand_total)));
+        for pair in calls.windows(2) {
+            assert!(
+                pair[1].0 >= pair[0].0,
+                "progress must never decrease across artifacts: {:?} -> {:?}",
+                pair[0],
+                pair[1]
+            );
+            assert_eq!(
+                pair[0].1, grand_total,
+                "total must stay the grand total across every artifact"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn vosk_failed_unpack_over_existing_install_leaves_old_install_untouched() {
+    async fn download_of_multi_artifact_model_leaves_nothing_behind_when_one_artifact_fails_checksum(
+    ) {
         let server = MockServer::start().await;
-        let corrupt_zip = build_corrupt_vosk_zip("vosk-model-test");
-        // The catalog checksum is computed over these exact (already
-        // corrupt) bytes, so checksum verification passes; the failure this
-        // test exercises happens later, while unpacking.
-        let sha256 = sha256_hex(&corrupt_zip);
+        let encoder_body = vec![0xBBu8; 5_000];
+        let tokens_body = b"token list".to_vec();
+        let encoder_size_bytes = encoder_body.len() as u64;
+        let tokens_size_bytes = tokens_body.len() as u64;
+        let encoder_sha256 = sha256_hex(&encoder_body);
 
         Mock::given(method("GET"))
-            .and(path("/vosk-model-test.zip"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(corrupt_zip))
+            .and(path("/encoder.onnx"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(encoder_body.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tokens.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tokens_body.clone()))
             .mount(&server)
             .await;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let entry = vosk_entry(
-            format!("{}/vosk-model-test.zip", server.uri()),
-            sha256.clone(),
+        let entry = multi_artifact_entry(
+            format!("{}/encoder.onnx", server.uri()),
+            encoder_sha256,
+            encoder_size_bytes,
+            format!("{}/tokens.txt", server.uri()),
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            tokens_size_bytes,
         );
         let manager = ModelManager::with_catalog(dir.path().to_path_buf(), vec![entry]);
-
-        let install_dir = dir.path().join("models/vosk-model-test");
-        fs::create_dir_all(&install_dir).expect("create existing install dir");
-        fs::write(
-            install_dir.join("good.txt"),
-            b"the good, already-installed model",
-        )
-        .expect("write sentinel");
 
         let result =
-            tokio::task::spawn_blocking(move || manager.download("test-vosk", &mut |_, _| {}))
+            tokio::task::spawn_blocking(move || manager.download("test-multi", &mut |_, _| {}))
                 .await
                 .expect("blocking task panicked");
 
-        assert!(result.is_err(), "unpacking a corrupt archive should fail");
-
-        // The prior good install must be completely untouched.
-        assert_eq!(
-            fs::read_to_string(install_dir.join("good.txt")).expect("read sentinel"),
-            "the good, already-installed model"
-        );
-
-        // No staging directory or leftover zip artifacts beside it.
-        let models_dir = dir.path().join("models");
-        let leftovers: Vec<_> = fs::read_dir(&models_dir)
-            .expect("read models dir")
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name())
-            .filter(|name| name != "vosk-model-test")
-            .collect();
         assert!(
-            leftovers.is_empty(),
-            "expected no leftover staging/zip artifacts, found: {leftovers:?}"
+            result.is_err(),
+            "a bad artifact checksum should fail the whole download"
+        );
+        let models_dir = dir.path().join("models");
+        let remaining: Vec<_> = fs::read_dir(&models_dir)
+            .map(|entries| entries.filter_map(|e| e.ok()).collect())
+            .unwrap_or_default();
+        assert!(
+            remaining.is_empty(),
+            "expected no leftover files or directories, found: {remaining:?}"
+        );
+    }
+
+    // `ModelInfo` (the type `ModelManager::catalog()` returns) does not carry
+    // artifacts, only installed state, so this checks the real hard-coded
+    // `CatalogEntry` data directly rather than going through the manager.
+    #[test]
+    fn catalog_entries_declare_every_artifact_they_need() {
+        for entry in CATALOG {
+            assert!(
+                !entry.artifacts.is_empty(),
+                "{} declares no artifacts",
+                entry.id
+            );
+            for artifact in entry.artifacts {
+                assert_eq!(
+                    artifact.sha256.len(),
+                    64,
+                    "{}: {} has a malformed sha256",
+                    entry.id,
+                    artifact.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vosk_is_gone_from_the_catalog() {
+        let models = ModelManager::new(PathBuf::from("/nonexistent"));
+        assert!(
+            models.catalog().iter().all(|m| m.engine != "vosk"),
+            "vosk models must not be offered once the engine is removed"
         );
     }
 

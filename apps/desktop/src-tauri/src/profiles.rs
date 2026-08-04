@@ -202,6 +202,18 @@ impl ProfileRegistry {
     /// list. Reachable: a hand-edited config with `profiles = []` parses to
     /// an empty `Vec` and is not caught by the v0.1 migration check (which
     /// only fires when the `profiles` key is absent, not when it's empty).
+    ///
+    /// This is not the *only* route to the same dead end, and the registry
+    /// cannot see the other one: [`LanguageProfile::hotkey`] is a free-form
+    /// string nothing validates when settings are loaded. A single profile
+    /// with an unparseable chord (`""`, `"ctrl+"`, a typo'd key name) still
+    /// makes `new` return a non-empty, notice-free registry — every
+    /// `deps_for` call on it would succeed — but if the caller building the
+    /// hotkey source (Task 16) drops chords `parse_hotkey` rejects, that
+    /// profile's binding is never registered and its hotkey does nothing,
+    /// silently. Only the caller doing that parsing can catch it; this
+    /// module only ever sees `LanguageProfile`s, never their hotkey strings'
+    /// validity.
     pub(crate) fn new(
         profiles: Vec<LanguageProfile>,
         loader: Box<dyn ProfileLoader>,
@@ -220,7 +232,7 @@ impl ProfileRegistry {
             vec![(
                 "warning",
                 "no language profiles configured; dictation has no hotkey until at least one \
-                 profile exists"
+                 profile is configured"
                     .to_string(),
             )]
         } else {
@@ -270,6 +282,7 @@ impl ProfileRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -373,17 +386,22 @@ mod tests {
         CountingRegistry { registry, count }
     }
 
-    /// A loader where the profile named `"default"` always fails to
-    /// produce a real engine (mirroring a missing/damaged model — e.g. a
-    /// fresh install whose download was interrupted), while every other
-    /// profile loads cleanly and is stamped with its own id as
-    /// `engine_label` (see `fake_deps`).
+    /// A loader where the profile named `"default"`, and any profile whose
+    /// id starts with `"broken"`, always fails to produce a real engine
+    /// (mirroring a missing/damaged model), while every other profile loads
+    /// cleanly and is stamped with its own id as `engine_label` (see
+    /// `fake_deps`). Two distinct failure sites on purpose: `"default"`
+    /// sits at index 0, which `ProfileRegistry::new` loads *eagerly*, so it
+    /// pins a failure surfaced at boot; a `"broken"`-prefixed profile is
+    /// placed at a non-zero index so its failure is only ever reached
+    /// through a *lazy* `deps_for` load, pinning that the notice from that
+    /// load reaches the caller of `deps_for` itself, not just `new`.
     struct FailingLoader;
 
     impl ProfileLoader for FailingLoader {
         fn load(&self, profile: &LanguageProfile) -> (ProfileDeps, Vec<QueuedNotice>) {
-            if profile.id == "default" {
-                let reason = "default profile's model is not downloaded".to_string();
+            if profile.id == "default" || profile.id.starts_with("broken") {
+                let reason = format!("{}'s model is not downloaded", profile.id);
                 let mut deps = fake_deps(&profile.id);
                 deps.engine = unavailable_engine(reason.clone());
                 (deps, vec![("warning", reason)])
@@ -416,18 +434,26 @@ mod tests {
     }
 
     /// The profile at binding 0 (`"default"`) is the one `FailingLoader`
-    /// fails, so `ProfileRegistry::new`'s eager load fails immediately —
-    /// pinning the case where a fresh install's own default profile has a
-    /// missing model, not just some other profile the user hasn't touched
-    /// yet. Bindings 1 and 2 are only loaded *after* that failure, and are
-    /// checked here for their own correct identity, not merely for "some
-    /// engine or other" — a registry that quietly degrades every profile
-    /// once one fails (or silently substitutes one profile's engine for
-    /// another's) would still pass a test that only checked `Some`/notices
-    /// empty.
+    /// fails eagerly, so `ProfileRegistry::new`'s eager load fails
+    /// immediately — pinning the case where a fresh install's own default
+    /// profile has a missing model, not just some other profile the user
+    /// hasn't touched yet. Binding 1 (`"russian"`) is healthy and only
+    /// loaded *after* that failure, checked for its own correct identity
+    /// and a working engine — not merely for "some engine or other". Binding
+    /// 2 (`"broken-german"`) is a *second*, independently broken profile at
+    /// a non-zero index, only ever reached through a lazy `deps_for` call —
+    /// its first press must carry the notice, and its second must not
+    /// repeat it, pinning the property that justifies `deps_for` returning
+    /// notices alongside the deps in the first place: a lazy load's failure
+    /// has to reach whoever called `deps_for` at press time, not just
+    /// whoever called `new` at boot.
     #[test]
     fn a_broken_profile_does_not_disable_the_others() {
-        let profiles = vec![profile("default"), profile("russian"), profile("german")];
+        let profiles = vec![
+            profile("default"),
+            profile("russian"),
+            profile("broken-german"),
+        ];
         let (mut registry, boot_notices) = ProfileRegistry::new(profiles, Box::new(FailingLoader));
 
         assert!(
@@ -479,17 +505,40 @@ mod tests {
             "the healthy profile's engine must actually work, not be silently degraded"
         );
 
-        let (german, notices) = registry
+        // Binding 2's own failure is *lazy*: nothing about it has been
+        // loaded or reported before this first `deps_for` call, unlike
+        // binding 0's, which `new` already surfaced. This is the case C3
+        // pins: a `deps_for` that silently drops the load's notices (e.g.
+        // `Some((deps, Vec::new()))` regardless of what the load produced)
+        // passed every other assertion in this suite before this was added.
+        let (broken_german, notices) = registry
             .deps_for(BindingId::from(2))
-            .expect("a broken default profile must not take the german profile down with it");
-        assert!(notices.is_empty(), "the healthy profile loads cleanly");
+            .expect("binding exists even though its load will fail");
+        assert!(
+            !notices.is_empty(),
+            "a lazy load that fails must say so on the call that triggered it"
+        );
+        assert_eq!(notices[0].0, "warning");
         assert_eq!(
-            german.engine_label, "german",
-            "binding 2 must resolve to the german profile"
+            broken_german.engine_label, "broken-german",
+            "binding 2 must resolve to its own (broken) profile, not be swapped for another"
         );
         assert!(
-            german.engine.begin(&TranscribeOptions::default()).is_ok(),
-            "the healthy profile's engine must actually work, not be silently degraded"
+            broken_german
+                .engine
+                .begin(&TranscribeOptions::default())
+                .is_err(),
+            "binding 2's engine is genuinely the unavailable stand-in"
+        );
+
+        // Second press of the same binding: the notice already surfaced
+        // once and must not repeat.
+        let (_, notices) = registry
+            .deps_for(BindingId::from(2))
+            .expect("binding exists");
+        assert!(
+            notices.is_empty(),
+            "a lazily-loaded profile's notice must not repeat on every subsequent press"
         );
     }
 
@@ -540,5 +589,59 @@ mod tests {
         );
         assert_eq!(notices[0].0, "warning");
         assert_eq!(registry.entries.len(), 0);
+    }
+
+    /// `RealProfileLoader` itself: everything above exercises `ProfileLoader`
+    /// through fakes, so nothing pins what the *production* loader actually
+    /// does with a profile. This is the case the I1 fix (compute
+    /// `refinement_is_on` once, skip `build_refiner` entirely when it's
+    /// false) and the per-profile `language`/`tone` fields need: refinement
+    /// switched on globally but off for this profile must build no refiner
+    /// at all, and the profile's own language/tone must survive into
+    /// `ProfileDeps` rather than being lost to some global default.
+    ///
+    /// Uses a nonexistent model directory (`build_engine` degrades to
+    /// `unavailable_engine` + a notice with no models on disk, no network)
+    /// and refinement switched *off* for this profile specifically, which
+    /// never reaches `build_refiner` and therefore never touches the
+    /// keyring either -- so this test needs neither models nor a keyring.
+    #[test]
+    fn a_profile_with_refinement_off_builds_no_refiner_and_keeps_its_own_language_and_tone() {
+        let loader = RealProfileLoader::new(
+            Arc::new(ModelManager::new(PathBuf::from("/nonexistent"))),
+            RefineCfg {
+                enabled: true, // the global master switch is ON
+                ..RefineCfg::default()
+            },
+            Vec::new(),
+        );
+
+        let mut profile = LanguageProfile {
+            language: "ru".to_string(),
+            ..LanguageProfile::default()
+        };
+        profile.refine.enabled = false; // this profile's own policy is OFF
+        let tone = profile.refine.tone;
+
+        let (deps, _notices) = loader.load(&profile);
+
+        assert!(
+            !deps.refine_enabled,
+            "global on + profile off must not enable refinement"
+        );
+        assert!(
+            deps.refiner.is_none(),
+            "a profile with refinement off must not pay for a refiner -- no keyring round trip, \
+             no HTTP client, no missing-key notice for a profile that will never refine"
+        );
+        assert_eq!(
+            deps.language.as_deref(),
+            Some("ru"),
+            "the profile's own language must reach ProfileDeps, not be lost to auto-detect"
+        );
+        assert_eq!(
+            deps.tone, tone,
+            "the profile's own tone must reach ProfileDeps"
+        );
     }
 }

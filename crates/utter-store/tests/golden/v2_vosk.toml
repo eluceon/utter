@@ -1,0 +1,80 @@
+# The expected result of migrating v1_vosk.toml. Vosk no longer exists, so
+# the engine is rerouted to the sherpa-onnx model for the language the vosk
+# model id implies (`vosk-model-small-ru-*` -> Russian), which also becomes
+# the profile's language -- overriding the stale `general.language = "en"`
+# left over from before the user switched engines. `whisper_model` and
+# `cloud` reset to their defaults: nothing in the source config's leftover
+# whisper settings applies to a sherpa engine.
+
+[general]
+language = "en"
+theme = "dark"
+autostart = true
+
+[dictation]
+mode = "toggle"
+hotkey = "ctrl+super"
+silence_timeout_secs = 45
+hud = true
+
+[engine]
+active = "sherpa"
+whisper_model = "small"
+sherpa_model = "gigaam-v3-e2e-rnnt"
+
+[engine.cloud]
+base_url = "https://api.openai.com/v1"
+model = "whisper-1"
+
+[refine]
+enabled = true
+tone = "formal"
+base_url = "http://localhost:11434/v1"
+model = "llama3.2"
+timeout_secs = 20
+
+[dictionary]
+terms = ["PostgreSQL", "Kubernetes", "eluceon"]
+
+[[dictionary.rules]]
+heard = "cube control"
+write = "kubectl"
+
+[[dictionary.rules]]
+heard = "post gres"
+write = "Postgres"
+
+[[snippets]]
+trigger = "sign off"
+body = "Best regards,\nAlex"
+
+[[snippets]]
+trigger = "standup update"
+body = "No blockers, on track."
+
+[history]
+enabled = false
+
+[advanced]
+injection = "clipboard_paste"
+audio_device = "USB Microphone"
+vad_sensitivity = 0.7
+log_level = "debug"
+
+[[profiles]]
+id = "default"
+hotkey = "ctrl+super"
+language = "ru"
+
+[profiles.engine]
+active = "sherpa"
+whisper_model = "small"
+sherpa_model = "gigaam-v3-e2e-rnnt"
+
+[profiles.engine.cloud]
+base_url = "https://api.openai.com/v1"
+model = "whisper-1"
+
+[profiles.refine]
+enabled = true
+tone = "formal"

@@ -1,0 +1,74 @@
+# The expected result of migrating v1_whisper.toml. whisper.cpp was never
+# removed, so the engine section carries across unchanged; it is mirrored
+# into the one profile the migration creates.
+
+[general]
+language = "en"
+theme = "dark"
+autostart = true
+
+[dictation]
+mode = "toggle"
+hotkey = "ctrl+super"
+silence_timeout_secs = 45
+hud = true
+
+[engine]
+active = "whisper"
+whisper_model = "large-v3-turbo-q5_0"
+
+[engine.cloud]
+base_url = "https://api.openai.com/v1"
+model = "whisper-1"
+
+[refine]
+enabled = true
+tone = "formal"
+base_url = "http://localhost:11434/v1"
+model = "llama3.2"
+timeout_secs = 20
+
+[dictionary]
+terms = ["PostgreSQL", "Kubernetes", "eluceon"]
+
+[[dictionary.rules]]
+heard = "cube control"
+write = "kubectl"
+
+[[dictionary.rules]]
+heard = "post gres"
+write = "Postgres"
+
+[[snippets]]
+trigger = "sign off"
+body = "Best regards,\nAlex"
+
+[[snippets]]
+trigger = "standup update"
+body = "No blockers, on track."
+
+[history]
+enabled = false
+
+[advanced]
+injection = "clipboard_paste"
+audio_device = "USB Microphone"
+vad_sensitivity = 0.7
+log_level = "debug"
+
+[[profiles]]
+id = "default"
+hotkey = "ctrl+super"
+language = "en"
+
+[profiles.engine]
+active = "whisper"
+whisper_model = "large-v3-turbo-q5_0"
+
+[profiles.engine.cloud]
+base_url = "https://api.openai.com/v1"
+model = "whisper-1"
+
+[profiles.refine]
+enabled = true
+tone = "formal"

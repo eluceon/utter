@@ -1,0 +1,58 @@
+# A realistic v0.1 config: whisper.cpp active, refinement on, a populated
+# dictionary and snippet list. Every section a v0.1 install could produce
+# is represented so the migration test actually exercises full carryover,
+# not just the fields the unit tests happen to assert on.
+
+[general]
+language = "en"
+theme = "dark"
+autostart = true
+
+[dictation]
+mode = "toggle"
+hotkey = "ctrl+super"
+silence_timeout_secs = 45
+hud = true
+
+[engine]
+active = "whisper"
+whisper_model = "large-v3-turbo-q5_0"
+
+[engine.cloud]
+base_url = "https://api.openai.com/v1"
+model = "whisper-1"
+
+[refine]
+enabled = true
+tone = "formal"
+base_url = "http://localhost:11434/v1"
+model = "llama3.2"
+timeout_secs = 20
+
+[dictionary]
+terms = ["PostgreSQL", "Kubernetes", "eluceon"]
+
+[[dictionary.rules]]
+heard = "cube control"
+write = "kubectl"
+
+[[dictionary.rules]]
+heard = "post gres"
+write = "Postgres"
+
+[[snippets]]
+trigger = "sign off"
+body = "Best regards,\nAlex"
+
+[[snippets]]
+trigger = "standup update"
+body = "No blockers, on track."
+
+[history]
+enabled = false
+
+[advanced]
+injection = "clipboard_paste"
+audio_device = "USB Microphone"
+vad_sensitivity = 0.7
+log_level = "debug"

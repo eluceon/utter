@@ -53,3 +53,17 @@ pub enum IntegrityError {
         source: std::io::Error,
     },
 }
+
+/// Errors from [`crate::migrate::migrate_v1`].
+#[derive(Debug, Error)]
+pub enum MigrateError {
+    /// `raw` is not valid TOML, so neither the presence check nor the
+    /// migration itself could read it.
+    #[error("not valid toml: {0}")]
+    Parse(#[from] toml::de::Error),
+
+    /// `raw` already has a `[[profiles]]` table, so it is a v0.2 document
+    /// (or an unusual v0.1 one) and does not need migrating.
+    #[error("document already has a [[profiles]] table; it does not need migrating")]
+    AlreadyMigrated,
+}

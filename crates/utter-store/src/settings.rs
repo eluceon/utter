@@ -368,13 +368,14 @@ pub fn load(path: &Path) -> Result<Settings> {
 /// [`MigrationFailed`] via [`anyhow::Context::context`], so a caller that
 /// wants to degrade to `Settings::default()` instead of aborting startup can
 /// recognize the case with `anyhow::Error::downcast_ref::<MigrationFailed>`.
+/// `MigrationFailed::backup` is `Some` only once the copy has actually
+/// succeeded, so a failure reported before that point (the copy itself
+/// failing) correctly claims no backup at all.
 fn migrate_and_persist(path: &Path, raw: &str) -> Result<Settings> {
     let backup_path = backup_path(path);
-    let failure = || MigrationFailed {
-        path: path.to_path_buf(),
-        backup: backup_path.clone(),
-    };
 
+    // `backup` stays `None` here: the copy has not been attempted yet, so
+    // there is nothing at `backup_path` a caller could point a user to.
     fs::copy(path, &backup_path)
         .with_context(|| {
             format!(
@@ -383,7 +384,17 @@ fn migrate_and_persist(path: &Path, raw: &str) -> Result<Settings> {
                 backup_path.display()
             )
         })
-        .context(failure())?;
+        .context(MigrationFailed {
+            path: path.to_path_buf(),
+            backup: None,
+        })?;
+
+    // Only past this point did `fs::copy` report every byte written, so only
+    // past this point may a failure claim a backup exists.
+    let failure = || MigrationFailed {
+        path: path.to_path_buf(),
+        backup: Some(backup_path.clone()),
+    };
 
     let migrated = migrate_v1(raw)
         .with_context(|| format!("failed to migrate {}", path.display()))
@@ -653,6 +664,29 @@ mod tests {
             .downcast_ref::<MigrationFailed>()
             .expect("a failed migration must be reported as MigrationFailed");
         assert_eq!(failed.path, path);
+    }
+
+    #[test]
+    fn a_backup_step_failure_is_reported_with_no_backup() {
+        // `MigrationFailed::backup` must be `None` whenever the backup copy
+        // did not actually complete — a `Some` naming a path that was never
+        // written would tell a caller building a user-facing notice that a
+        // safety net exists when it doesn't. Force the copy to fail: `fs::copy`
+        // cannot write to a destination that already exists as a directory.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, include_str!("../tests/golden/v1_whisper.toml")).expect("write v1");
+        fs::create_dir(dir.path().join("config.toml.v1.bak")).expect("pre-create backup dir");
+
+        let err = load(&path).expect_err("a backup failure must stop migration");
+
+        let failed = err
+            .downcast_ref::<MigrationFailed>()
+            .expect("a failed migration must be reported as MigrationFailed");
+        assert_eq!(
+            failed.backup, None,
+            "the backup copy never completed, so no backup path may be claimed"
+        );
     }
 
     #[test]

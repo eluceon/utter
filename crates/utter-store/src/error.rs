@@ -75,14 +75,19 @@ pub enum MigrateError {
 /// [`anyhow::Error::downcast_ref`], since `load` reports it through
 /// `anyhow::Context::context`.
 ///
-/// The config file at `path` was left untouched; `backup` is where a copy
-/// was written before the attempt (it may not exist if the backup step
-/// itself is what failed).
+/// The config file at `path` was left untouched. `backup` is `Some` only
+/// when `fs::copy` reported success for the pre-migration copy of `path` —
+/// meaning every byte was actually written — and `None` when the backup
+/// step is what failed (or never ran). A caller building a user-facing
+/// message from this must not name a backup unless `backup` is `Some`: a
+/// `Some` value that turned out to be wrong would mean a truncated or
+/// missing file being presented as a safety net that isn't there.
 #[derive(Debug, Error)]
 #[error("failed to migrate {path}; the original file was left untouched")]
 pub struct MigrationFailed {
     /// The config file that could not be migrated.
     pub path: PathBuf,
-    /// Where a pre-migration backup of `path` was attempted.
-    pub backup: PathBuf,
+    /// Where a pre-migration backup of `path` was written, if the backup
+    /// step itself succeeded.
+    pub backup: Option<PathBuf>,
 }

@@ -144,7 +144,7 @@ fn open_history(settings: &Settings) -> Result<Option<HistoryHandle>, String> {
 
 /// One queued user-facing notice: `kind` matches [`crate::runtime::EventSink::notify`]'s
 /// convention (`"info"`, `"warning"`, `"error"`).
-type QueuedNotice = (&'static str, String);
+pub(crate) type QueuedNotice = (&'static str, String);
 
 /// Builds [`RuntimeDeps`] from `settings`, plus any degradation notices to
 /// surface once the runtime is up.
@@ -201,7 +201,7 @@ fn build_deps(
 }
 
 /// The label recorded on history entries for the active engine kind.
-fn engine_label(kind: EngineKind) -> &'static str {
+pub(crate) fn engine_label(kind: EngineKind) -> &'static str {
     match kind {
         EngineKind::Whisper => "whisper",
         EngineKind::Cloud => "cloud",
@@ -242,11 +242,11 @@ impl SttEngine for UnavailableEngine {
     }
 }
 
-fn unavailable_engine(reason: String) -> Box<dyn SttEngine> {
+pub(crate) fn unavailable_engine(reason: String) -> Box<dyn SttEngine> {
     Box::new(UnavailableEngine { reason })
 }
 
-fn build_engine(
+pub(crate) fn build_engine(
     cfg: &EngineCfg,
     models: &ModelManager,
     dictionary_terms: &[String],
@@ -394,7 +394,7 @@ fn refine_missing_key_notice(has_key: bool) -> Option<String> {
     }
 }
 
-fn build_refiner(
+pub(crate) fn build_refiner(
     cfg: &RefineCfg,
     dictionary_terms: Vec<String>,
 ) -> (Option<Box<dyn TextRefiner>>, Option<String>) {

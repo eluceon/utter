@@ -5,6 +5,10 @@
 mod commands;
 /// Event payload shapes shared with the frontend.
 pub mod events;
+/// Maps each language profile's hotkey binding to its own lazily-built
+/// engines. Wired into the runtime worker in Task 16. Public so integration
+/// tests can drive it directly, matching [`runtime`].
+pub mod profiles;
 /// The dictation runtime orchestrator (worker thread, state machine wiring).
 /// Public so integration tests can drive it directly.
 pub mod runtime;

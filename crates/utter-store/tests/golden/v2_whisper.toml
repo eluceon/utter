@@ -18,8 +18,8 @@ active = "whisper"
 whisper_model = "large-v3-turbo-q5_0"
 
 [engine.cloud]
-base_url = "https://api.openai.com/v1"
-model = "whisper-1"
+base_url = "https://whisper-user.example.com/v1"
+model = "whisper-1-self-hosted"
 
 [refine]
 enabled = true
@@ -66,8 +66,8 @@ active = "whisper"
 whisper_model = "large-v3-turbo-q5_0"
 
 [profiles.engine.cloud]
-base_url = "https://api.openai.com/v1"
-model = "whisper-1"
+base_url = "https://whisper-user.example.com/v1"
+model = "whisper-1-self-hosted"
 
 [profiles.refine]
 enabled = true

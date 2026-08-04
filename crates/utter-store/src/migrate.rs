@@ -127,7 +127,19 @@ fn migrate_engine(v1: &V1EngineCfg, general_language: Option<&str>) -> (EngineCf
         "en"
     });
 
-    let engine = EngineCfg::sherpa(sherpa_model_for_language(language));
+    // Built by hand rather than `EngineCfg::sherpa(...)`: that constructor's
+    // `..Self::default()` would reset `whisper_model` and `cloud` to their
+    // defaults. `cloud` configures a third engine the user can switch to
+    // independently of vosk/sherpa, so it survives regardless of which engine
+    // was active; `whisper_model` is a catalog id the user may have chosen
+    // and downloaded, so it is kept too in case they switch back to whisper
+    // later. Only `vosk_model` has no v0.2 field to land in.
+    let engine = EngineCfg {
+        active: EngineKind::Sherpa,
+        whisper_model: v1.whisper_model.clone(),
+        sherpa_model: Some(sherpa_model_for_language(language).to_string()),
+        cloud: v1.cloud.clone(),
+    };
     (engine, language.to_string())
 }
 
@@ -244,6 +256,27 @@ mod tests {
             Some("gigaam-v3-e2e-rnnt")
         );
         assert_eq!(migrated.profiles[0].language, "ru");
+    }
+
+    #[test]
+    fn a_vosk_users_cloud_and_whisper_model_settings_survive_migration() {
+        // Neither `[engine.cloud]` nor `whisper_model` is specific to vosk:
+        // both configure engines the user can still switch to independently
+        // of whichever engine was active in v0.1, so a vosk migration must
+        // not reset them to `CloudSttCfg::default()` /
+        // `EngineCfg::default().whisper_model` the way building the migrated
+        // engine from `EngineCfg::sherpa(...)`'s `..Self::default()` would.
+        // `v1_vosk.toml` deliberately sets both away from their defaults, so
+        // this test cannot pass by accident the way it would if the fixture
+        // happened to already hold the default values.
+        let v1 = include_str!("../tests/golden/v1_vosk.toml");
+        let migrated = migrate_v1(v1).expect("migration must succeed");
+
+        let engine = &migrated.profiles[0].engine;
+        assert_eq!(engine.whisper_model, "large-v3-turbo-q5_0");
+        assert_eq!(engine.cloud.base_url, "https://vosk-user.example.com/v1");
+        assert_eq!(engine.cloud.model, "whisper-1-custom");
+        assert_ne!(engine.cloud, CloudSttCfg::default());
     }
 
     #[test]

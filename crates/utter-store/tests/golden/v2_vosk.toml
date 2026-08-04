@@ -3,8 +3,9 @@
 # model id implies (`vosk-model-small-ru-*` -> Russian), which also becomes
 # the profile's language -- overriding the stale `general.language = "en"`
 # left over from before the user switched engines. `whisper_model` and
-# `cloud` reset to their defaults: nothing in the source config's leftover
-# whisper settings applies to a sherpa engine.
+# `cloud` are NOT reset: neither is specific to vosk, both configure engines
+# the user can still switch to independently, and both survive migration
+# unchanged from v1_vosk.toml.
 
 [general]
 language = "en"
@@ -19,12 +20,12 @@ hud = true
 
 [engine]
 active = "sherpa"
-whisper_model = "small"
+whisper_model = "large-v3-turbo-q5_0"
 sherpa_model = "gigaam-v3-e2e-rnnt"
 
 [engine.cloud]
-base_url = "https://api.openai.com/v1"
-model = "whisper-1"
+base_url = "https://vosk-user.example.com/v1"
+model = "whisper-1-custom"
 
 [refine]
 enabled = true
@@ -68,12 +69,12 @@ language = "ru"
 
 [profiles.engine]
 active = "sherpa"
-whisper_model = "small"
+whisper_model = "large-v3-turbo-q5_0"
 sherpa_model = "gigaam-v3-e2e-rnnt"
 
 [profiles.engine.cloud]
-base_url = "https://api.openai.com/v1"
-model = "whisper-1"
+base_url = "https://vosk-user.example.com/v1"
+model = "whisper-1-custom"
 
 [profiles.refine]
 enabled = true

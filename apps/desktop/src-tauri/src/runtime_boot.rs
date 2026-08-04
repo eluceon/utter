@@ -47,10 +47,11 @@ use crate::{keyring_password, REFINE_KEY_SERVICE, STT_KEY_SERVICE};
 /// stores its control handle in `AppState::session_ctl`.
 ///
 /// Called once at app startup. Any degradation (missing model, no hotkey
-/// permissions, ...) is reported through a freshly built [`TauriEventSink`]
-/// once the runtime is up; only a genuinely unexpected failure (e.g. the
-/// settings lock is poisoned, or the history database can't be opened)
-/// short-circuits with `Err`, leaving `session_ctl` at `None`.
+/// permissions, a v0.1 config that failed to migrate, ...) is reported
+/// through a freshly built [`TauriEventSink`] once the runtime is up; only a
+/// genuinely unexpected failure (e.g. the settings lock is poisoned, or the
+/// history database can't be opened) short-circuits with `Err`, leaving
+/// `session_ctl` at `None`.
 pub fn boot(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
 
@@ -61,7 +62,14 @@ pub fn boot(app: &AppHandle) -> Result<(), String> {
         .clone();
 
     let history = open_history(&settings)?;
-    let (deps, notices) = build_deps(&settings, &state.models, history);
+    let (deps, mut notices) = build_deps(&settings, &state.models, history);
+    // A config that failed to migrate on load (see `AppState::new`) is a
+    // one-time startup condition, not a per-boot degradation like the ones
+    // `build_deps` reports, so it is queued here rather than threaded
+    // through `build_deps`'s settings-derived checks.
+    if let Some(msg) = state.startup_notice.clone() {
+        notices.push(("warning", msg));
+    }
 
     let sink = Arc::new(TauriEventSink::new(app.clone()));
     let handle = Runtime::spawn(deps, sink.clone());

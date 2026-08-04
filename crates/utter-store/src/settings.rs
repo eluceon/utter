@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use utter_core::{DictationMode, Tone};
 use utter_refine::{ReplaceRule, Snippet};
 
+use crate::error::MigrationFailed;
+use crate::migrate::{migrate_v1, predates_profiles};
 use crate::profile::{LanguageProfile, RefinePolicy};
 
 /// The full, on-disk application settings.
@@ -329,6 +331,12 @@ pub fn config_path() -> PathBuf {
 
 /// Load settings from `path`. A missing file yields `Settings::default()`;
 /// an unreadable or malformed file is an error.
+///
+/// A file that predates language profiles (a v0.1 config, or any document
+/// with no `[[profiles]]` table) is migrated and rewritten in place before
+/// being returned — see [`migrate_and_persist`]. Every later load then finds
+/// a `[[profiles]]` table already there and takes the plain-parse path
+/// below, so migration runs at most once per file.
 pub fn load(path: &Path) -> Result<Settings> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -340,7 +348,60 @@ pub fn load(path: &Path) -> Result<Settings> {
         }
     };
 
+    let needs_migration = predates_profiles(&contents)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    if needs_migration {
+        return migrate_and_persist(path, &contents);
+    }
+
     toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+/// Migrates a v0.1 config at `path` (whose current contents are `raw`) to
+/// v0.2's schema, persists the result through [`save`], and returns it.
+///
+/// The original is copied to `<path>.v1.bak` before anything else happens;
+/// if that copy fails, migration stops there and `path` itself is never
+/// touched. A failure at any step — the backup, the migration itself, or the
+/// write-back — leaves `path` exactly as it was (`save` only replaces it by
+/// renaming a completed temp file into place) and is tagged with
+/// [`MigrationFailed`] via [`anyhow::Context::context`], so a caller that
+/// wants to degrade to `Settings::default()` instead of aborting startup can
+/// recognize the case with `anyhow::Error::downcast_ref::<MigrationFailed>`.
+fn migrate_and_persist(path: &Path, raw: &str) -> Result<Settings> {
+    let backup_path = backup_path(path);
+    let failure = || MigrationFailed {
+        path: path.to_path_buf(),
+        backup: backup_path.clone(),
+    };
+
+    fs::copy(path, &backup_path)
+        .with_context(|| {
+            format!(
+                "failed to back up {} to {}",
+                path.display(),
+                backup_path.display()
+            )
+        })
+        .context(failure())?;
+
+    let migrated = migrate_v1(raw)
+        .with_context(|| format!("failed to migrate {}", path.display()))
+        .context(failure())?;
+
+    save(path, &migrated)
+        .with_context(|| format!("failed to write migrated settings to {}", path.display()))
+        .context(failure())?;
+
+    Ok(migrated)
+}
+
+/// The backup path a migration copies `path`'s original contents to:
+/// `path` with `.v1.bak` appended to its file name.
+fn backup_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".v1.bak");
+    PathBuf::from(name)
 }
 
 /// Save settings to `path` atomically: serialize to a sibling `.tmp` file,
@@ -457,6 +518,12 @@ mod tests {
     fn loading_file_with_unknown_key_succeeds() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = config_path(dir.path());
+        // Carries a `[[profiles]]` table matching `Settings::default()`'s own
+        // profile so this file reads as a v2 document and exercises the
+        // plain-parse path rather than migration — a document with no
+        // `[[profiles]]` table at all is v0.1 by definition (see
+        // `migrate::predates_profiles`) and this test is about unknown-key
+        // tolerance, not migration.
         fs::write(
             &path,
             r#"
@@ -464,6 +531,15 @@ mod tests {
 
             [general]
             unknown_nested_key = 42
+
+            [[profiles]]
+            id = "default"
+            hotkey = "ctrl+super"
+            language = "en"
+
+            [profiles.engine]
+            active = "sherpa"
+            sherpa_model = "parakeet-tdt-110m-en"
             "#,
         )
         .expect("write fixture");
@@ -522,6 +598,61 @@ mod tests {
 
         let result = load(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn loading_a_v1_config_migrates_it_and_keeps_the_original_alongside() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, include_str!("../tests/golden/v1_whisper.toml")).expect("write v1");
+
+        let settings = load(&path).expect("a v0.1 config must load");
+
+        assert_eq!(settings.profiles.len(), 1, "migration ran");
+        assert!(
+            dir.path().join("config.toml.v1.bak").exists(),
+            "the original must survive the rewrite"
+        );
+
+        // The file on disk is now v2, so a second load is a plain parse.
+        let reloaded = load(&path).expect("reload");
+        assert_eq!(reloaded, settings, "migrating twice must change nothing");
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_migrated_is_left_on_disk_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let original = "[engine]\nactive = 42\n";
+        fs::write(&path, original).expect("write");
+
+        let err = load(&path).expect_err("a config that cannot be parsed must not load silently");
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("read back"),
+            original,
+            "a failed migration must not damage what the user had"
+        );
+        let _ = err;
+    }
+
+    #[test]
+    fn a_migration_failure_is_reported_as_migration_failed() {
+        // The desktop app degrades to `Settings::default()` plus a queued
+        // notice on exactly this error, distinguishing it from an unrelated
+        // I/O or parse error via `anyhow::Error::downcast_ref`. If `load`
+        // ever stopped tagging this case, that downcast would silently see
+        // `None` and the app would hard-abort startup instead of degrading.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[engine]\nactive = 42\n").expect("write");
+
+        let err = load(&path).expect_err("must fail");
+
+        let failed = err
+            .downcast_ref::<MigrationFailed>()
+            .expect("a failed migration must be reported as MigrationFailed");
+        assert_eq!(failed.path, path);
     }
 
     #[test]

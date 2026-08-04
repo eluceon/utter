@@ -32,6 +32,12 @@ pub struct AppState {
     /// the next successful `save_settings` spins one up (see
     /// `runtime_boot::rebuild`).
     pub session_ctl: Mutex<Option<RuntimeHandle>>,
+    /// Set when settings could not be loaded because a v0.1 config failed to
+    /// migrate (see `utter_store::MigrationFailed`): the app boots with
+    /// `Settings::default()` for this run and `runtime_boot::boot` queues
+    /// this as a user-facing notice once the runtime is up. `None` on every
+    /// other startup, including a normal migration.
+    pub startup_notice: Option<String>,
     /// Live mirror of `settings.dictation.hud`, shared with every
     /// `TauriEventSink` (see `crate::sink`). A plain `RwLock<Settings>` read
     /// isn't enough on its own: the sink used by an already-running
@@ -47,9 +53,32 @@ impl AppState {
     /// Builds application state: loads settings from disk (defaulting if
     /// absent), and opens the history database, creating both the on-disk
     /// config and data directories as needed.
+    ///
+    /// A config that fails to migrate degrades rather than aborting startup:
+    /// the original file is left exactly as `utter_store::load` left it (see
+    /// its doc comment), this run boots with `Settings::default()`, and
+    /// `startup_notice` carries a message for `runtime_boot::boot` to queue.
+    /// Any other load failure (unreadable file, genuinely malformed TOML
+    /// unrelated to migration) still aborts startup, as it did before.
     pub fn new() -> Result<Self> {
-        let settings =
-            utter_store::load(&utter_store::config_path()).context("failed to load settings")?;
+        let config_path = utter_store::config_path();
+        let (settings, startup_notice) = match utter_store::load(&config_path) {
+            Ok(settings) => (settings, None),
+            Err(err) => match err.downcast_ref::<utter_store::MigrationFailed>() {
+                Some(failed) => {
+                    tracing::warn!("{err:#}");
+                    let notice = format!(
+                        "Your settings at {} could not be upgraded to the new format and \
+                         were left unchanged; a backup was saved at {}. Utter is running \
+                         with default settings for now.",
+                        failed.path.display(),
+                        failed.backup.display()
+                    );
+                    (Settings::default(), Some(notice))
+                }
+                None => return Err(err).context("failed to load settings"),
+            },
+        };
         let hud_enabled = Arc::new(AtomicBool::new(settings.dictation.hud));
 
         let models = Arc::new(ModelManager::new(data_dir()?));
@@ -61,6 +90,7 @@ impl AppState {
             models,
             history: Mutex::new(history),
             session_ctl: Mutex::new(None),
+            startup_notice,
             hud_enabled,
         })
     }

@@ -7,7 +7,7 @@ pub mod models;
 pub mod profile;
 pub mod settings;
 
-pub use error::{IntegrityError, MigrateError};
+pub use error::{IntegrityError, MigrateError, MigrationFailed};
 pub use history::{HistoryEntry, HistoryRepo, NewEntry};
 pub use migrate::migrate_v1;
 pub use models::{ModelInfo, ModelManager};

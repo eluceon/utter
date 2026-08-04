@@ -67,3 +67,22 @@ pub enum MigrateError {
     #[error("document already has a [[profiles]] table; it does not need migrating")]
     AlreadyMigrated,
 }
+
+/// Marks a [`crate::settings::load`] failure that happened while migrating a
+/// v0.1 config into v0.2's schema, as opposed to an unrelated I/O or parse
+/// failure. A caller that wants to degrade to `Settings::default()` rather
+/// than abort startup can recognize this case with
+/// [`anyhow::Error::downcast_ref`], since `load` reports it through
+/// `anyhow::Context::context`.
+///
+/// The config file at `path` was left untouched; `backup` is where a copy
+/// was written before the attempt (it may not exist if the backup step
+/// itself is what failed).
+#[derive(Debug, Error)]
+#[error("failed to migrate {path}; the original file was left untouched")]
+pub struct MigrationFailed {
+    /// The config file that could not be migrated.
+    pub path: PathBuf,
+    /// Where a pre-migration backup of `path` was attempted.
+    pub backup: PathBuf,
+}

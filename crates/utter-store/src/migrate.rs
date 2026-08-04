@@ -90,7 +90,7 @@ pub fn migrate_v1(raw: &str) -> Result<Settings, MigrateError> {
 /// silently keep its hardcoded default profile instead of the user's actual
 /// hotkey, model and refinement settings. Only the raw document still carries
 /// the distinction, so that is what this checks.
-fn predates_profiles(raw: &str) -> Result<bool, MigrateError> {
+pub(crate) fn predates_profiles(raw: &str) -> Result<bool, MigrateError> {
     let value: toml::Value = toml::from_str(raw)?;
     let has_profiles_table = matches!(value.get("profiles"), Some(toml::Value::Array(_)));
     Ok(!has_profiles_table)

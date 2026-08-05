@@ -548,6 +548,21 @@ fn handle_hotkey_pressed(session: &mut Session, ctx: &mut WorkerCtx, binding: Bi
 /// place that builds both lists together), so no real `HotkeyEvent` can name an id the registry
 /// doesn't know. The check stays because that lockstep is maintained by a *different* module
 /// than this one, with nothing at this call site able to verify it holds.
+///
+/// **Known hazard, accepted and deferred, not fixed here:** `ctx.profiles.deps_for(binding)` can
+/// synchronously block this call for as long as a lazy load takes — model I/O (seconds) and, for
+/// a profile with refinement configured, `RealProfileLoader` → `build_refiner` →
+/// `keyring_password` (`crate::keyring_password`), a `keyring::Entry::get_password()` with no
+/// timeout that raises an OS unlock prompt on a locked gnome-keyring/KWallet and blocks until the
+/// user answers it. Before profiles, both of these ran once at boot; now they run here, on the
+/// worker thread, inside the hotkey-press handler, before `Effect::StartCapture` — while blocked,
+/// `worker_loop` is out of its `select!`, so no `"recording"` phase is ever emitted (the user
+/// speaks into a stopped microphone) and `cancel`/`toggle`/`reload`/`shutdown` all just queue on
+/// `control_rx` (and since `RuntimeHandle::drop` joins the worker, quitting the app hangs behind
+/// an unanswered keyring dialog). Bounding this — loading off the worker thread, or a timeout
+/// around the keyring call — is its own task; Task 16 (this one) inherits the hazard rather than
+/// introducing it, since the same calls already blocked boot, but moves it from a one-time,
+/// visible startup cost to a per-press, invisible one.
 fn start_session_for(session: &mut Session, ctx: &mut WorkerCtx, binding: BindingId) -> bool {
     let Some((deps, notices)) = ctx.profiles.deps_for(binding) else {
         return false;
@@ -878,6 +893,17 @@ fn handle_toggle(session: &mut Session, ctx: &mut WorkerCtx) {
             // profile `ProfileRegistry::new` eagerly loads at boot (see its doc comment).
             if start_session_for(session, ctx, BindingId::from(0)) {
                 dispatch(session, ctx, Event::HotkeyPressed);
+            } else {
+                // No profile at all (e.g. every profile was dropped for an unparseable hotkey,
+                // or `profiles = []`): `parse_profile_hotkeys`/`ProfileRegistry::new` already
+                // warned about this once at boot, but that toast is dismissible and this is the
+                // affordance the user reaches for afterwards -- it must say something too,
+                // rather than the tray item/HUD button silently doing nothing.
+                ctx.sink.notify(
+                    "warning",
+                    "no language profile is configured; dictation has no hotkey until at \
+                     least one profile is configured",
+                );
             }
         }
         State::Recording => {

@@ -295,6 +295,11 @@ struct DepsBuilder {
     silence: Option<Duration>,
     capture_tx_slot: Arc<Mutex<Option<Sender<AudioFrame>>>>,
     dictionary_terms: Vec<String>,
+    /// The profile's language, as read into `TranscribeOptions.language` by `start_capture`.
+    /// Defaults to `None` like every other fixture; the one test that cares sets a real value
+    /// and asserts it reached `begin_opts`, since this is the single hop that makes a profile's
+    /// language reach the engine at all.
+    language: Option<String>,
     begin_opts: Arc<Mutex<Vec<TranscribeOptions>>>,
 }
 
@@ -316,6 +321,7 @@ impl DepsBuilder {
             silence: None,
             capture_tx_slot: Arc::new(Mutex::new(None)),
             dictionary_terms: Vec::new(),
+            language: None,
             begin_opts: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -336,7 +342,7 @@ impl DepsBuilder {
             refiner,
             refine_enabled: self.refine_enabled,
             tone: Tone::Clean,
-            language: None,
+            language: self.language,
             engine_label: "fake-engine".to_string(),
             dictionary_terms: self.dictionary_terms,
         };
@@ -582,6 +588,9 @@ fn dictionary_rule_applied_before_injection_and_history() {
     assert_eq!(entries[0].final_text, "open the airlock bay doors");
 }
 
+/// Also pins the profile's `language` reaching `TranscribeOptions` (every other fixture in this
+/// file leaves it `None`, which made `start_capture` discarding it undetectable -- see
+/// `start_capture`'s use of `deps.language`).
 #[test]
 fn dictionary_terms_are_passed_to_engine_as_initial_prompt() {
     let begin_opts = Arc::new(Mutex::new(Vec::new()));
@@ -590,6 +599,7 @@ fn dictionary_terms_are_passed_to_engine_as_initial_prompt() {
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
     builder.dictionary_terms = vec!["SQLite".to_string(), "Tauri".to_string()];
+    builder.language = Some("ru".to_string());
     builder.begin_opts = begin_opts.clone();
     let deps = builder.build(hotkey_rx);
 
@@ -613,6 +623,12 @@ fn dictionary_terms_are_passed_to_engine_as_initial_prompt() {
     let opts = begin_opts.lock().expect("lock");
     assert_eq!(opts.len(), 1);
     assert_eq!(opts[0].initial_prompt, Some("SQLite, Tauri".to_string()));
+    assert_eq!(
+        opts[0].language,
+        Some("ru".to_string()),
+        "the profile's own language must reach the engine's TranscribeOptions -- the single hop \
+         that makes a hotkey's profile dictate in its configured language"
+    );
     drop(opts);
 
     handle.shutdown();
@@ -962,7 +978,7 @@ fn reload_swaps_deps_between_sessions() {
     assert_eq!(*injected_b.lock().expect("lock"), vec!["second session"]);
 
     // The reloaded deps' dictionary terms must reach the STT engine as an
-    // `initial_prompt`, proving `WorkerCtx::apply` copies `dictionary_terms`
+    // `initial_prompt`, proving `WorkerCtx::apply` copies `profiles`
     // just like every other field (not just at `WorkerCtx::new`).
     let opts_b = begin_opts_b.lock().expect("lock");
     assert_eq!(opts_b.len(), 1);
@@ -1317,6 +1333,88 @@ fn each_profile_applies_its_own_refine_enabled_flag_at_press_time() {
         1,
         "binding 1's profile has refinement on and must actually run it"
     );
+
+    handle.shutdown();
+}
+
+/// Pins the `session.state() == State::Idle` guard in `handle_hotkey_pressed` (see its module doc
+/// comment): a binding is only ever (re)selected while the session is `Idle`. `Toggle` mode's
+/// second press -- the one that stops recording -- need not come from the same binding that
+/// started it (a user could, in principle, hit a different profile's chord mid-utterance); the
+/// guard is what makes that press stop the in-flight session instead of being treated as a fresh
+/// selection. Without it, `start_session_for` would run again, reconstructing `Session` back to
+/// `Idle` and making `on_idle(HotkeyPressed)` start a *new* recording rather than stop the old
+/// one -- so `Toggle`-mode dictation could never be stopped by its own hotkey, and the
+/// overwritten `ctx.active_capture` would drop the first press's capture handle without
+/// `stop()`, leaking its audio stream. Two profiles with deliberately different transcripts:
+/// press binding 0 to start, then press binding 1 while `Recording`. The correct outcome is a
+/// single `"transcribing"` emission (the *same* session stopping) and an injected transcript
+/// from binding 0's profile -- binding 1 must never be consulted.
+#[test]
+fn second_binding_pressed_mid_recording_in_toggle_mode_stops_binding_zeros_session() {
+    let injected = Arc::new(Mutex::new(Vec::new()));
+    let (sink, states_rx, _notices) = fake_sink();
+    let (hotkey_tx, hotkey_rx) = unbounded();
+
+    let profiles = registry_with(vec![
+        (test_profile("zero"), profile_deps_with_transcript("first")),
+        (test_profile("one"), profile_deps_with_transcript("second")),
+    ]);
+
+    let deps = RuntimeDeps {
+        mode: DictationMode::Toggle,
+        silence: None,
+        profiles,
+        injector: Box::new(FakeInjector {
+            injected: injected.clone(),
+            fail: false,
+        }),
+        rules: Vec::new(),
+        snippets: Vec::new(),
+        history: None,
+        capture_device: None,
+        capture: Box::new(FakeCaptureBackend {
+            tx_slot: Arc::new(Mutex::new(None)),
+        }),
+        hotkey_rx,
+        vad_sensitivity: 0.5,
+        refine_timeout: Duration::from_secs(1),
+    };
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+
+    // Binding 1, pressed while binding 0's session is `Recording` -- not `Idle` -- must not be
+    // consulted at all (see `handle_hotkey_pressed`'s doc comment): this press just stops the
+    // in-flight session.
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(1),
+        })
+        .expect("send pressed");
+    assert_eq!(
+        recv_state(&states_rx),
+        "transcribing",
+        "the second press must stop binding 0's session, not rebuild it and start recording \
+         again with binding 1's profile"
+    );
+    assert_eq!(recv_state(&states_rx), "injecting");
+    assert_eq!(recv_state(&states_rx), "idle");
+
+    assert_eq!(
+        injected.lock().expect("lock").last(),
+        Some(&"first".to_string()),
+        "the utterance must still transcribe with binding 0's profile -- binding 1 was pressed \
+         mid-recording and must never be consulted"
+    );
+
+    assert_no_more_states(&states_rx);
 
     handle.shutdown();
 }

@@ -686,6 +686,15 @@ mod tests {
             "the notice must name the profile whose hotkey was rejected, got {:?}",
             notices[0].1
         );
+
+        assert_eq!(
+            specs,
+            vec![
+                parse_hotkey("ctrl+super").expect("valid"),
+                parse_hotkey("ctrl+alt+super").expect("valid"),
+            ],
+            "specs[i] must be kept[i]'s chord, not merely the right number of specs"
+        );
     }
 
     #[test]

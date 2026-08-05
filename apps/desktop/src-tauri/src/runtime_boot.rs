@@ -405,7 +405,13 @@ pub(crate) fn build_refiner(
     let api_key = keyring_password(REFINE_KEY_SERVICE);
     let notice = refine_missing_key_notice(api_key.is_some());
 
-    let refiner = Box::new(LlmRefiner::new(
+    // A refiner that cannot even be constructed degrades to "no refiner",
+    // like every other `build_*` here degrades to its own unavailable form.
+    // This used to panic, which was survivable only while refiners were
+    // built during boot; once they are built per profile on the dictation
+    // worker, the same panic would take the worker down and every profile's
+    // dictation with it.
+    let refiner = match LlmRefiner::new(
         LlmConfig {
             base_url: cfg.base_url.clone(),
             api_key,
@@ -413,9 +419,15 @@ pub(crate) fn build_refiner(
             timeout: Duration::from_secs(cfg.timeout_secs),
         },
         dictionary_terms,
-    ));
+    ) {
+        Ok(refiner) => refiner,
+        Err(e) => {
+            let reason = format!("refinement is unavailable: could not build its HTTP client: {e}");
+            return (None, Some(reason));
+        }
+    };
 
-    (Some(refiner), notice)
+    (Some(Box::new(refiner)), notice)
 }
 
 fn build_injector(preference: InjectionPreference) -> Box<dyn TextInjector> {

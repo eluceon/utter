@@ -379,7 +379,8 @@ pub async fn test_refine(app: AppHandle, sample: String) -> Result<String, Strin
                 timeout: Duration::from_secs(settings.refine.timeout_secs),
             },
             settings.dictionary.terms,
-        );
+        )
+        .map_err(|e| format!("could not build the refiner's HTTP client: {e}"))?;
 
         TextRefiner::refine(&refiner, &sample, settings.refine.tone)
             .map_err(|e| format!("refine failed: {e}"))

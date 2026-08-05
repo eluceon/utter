@@ -47,7 +47,7 @@ async fn happy_path_returns_refined_text_and_sends_expected_body() {
 
     let cfg = config(server.uri());
     let result = tokio::task::spawn_blocking(move || {
-        let refiner = LlmRefiner::new(cfg, Vec::new());
+        let refiner = LlmRefiner::new(cfg, Vec::new()).expect("build refiner");
         refiner.refine("so um hello there", Tone::Clean)
     })
     .await
@@ -68,7 +68,7 @@ async fn server_error_returns_http_error() {
 
     let cfg = config(server.uri());
     let result = tokio::task::spawn_blocking(move || {
-        let refiner = LlmRefiner::new(cfg, Vec::new());
+        let refiner = LlmRefiner::new(cfg, Vec::new()).expect("build refiner");
         refiner.refine("hello", Tone::Clean)
     })
     .await
@@ -98,7 +98,7 @@ async fn malformed_json_returns_bad_response() {
 
     let cfg = config(server.uri());
     let result = tokio::task::spawn_blocking(move || {
-        let refiner = LlmRefiner::new(cfg, Vec::new());
+        let refiner = LlmRefiner::new(cfg, Vec::new()).expect("build refiner");
         refiner.refine("hello", Tone::Clean)
     })
     .await
@@ -122,7 +122,7 @@ async fn empty_choices_returns_bad_response() {
 
     let cfg = config(server.uri());
     let result = tokio::task::spawn_blocking(move || {
-        let refiner = LlmRefiner::new(cfg, Vec::new());
+        let refiner = LlmRefiner::new(cfg, Vec::new()).expect("build refiner");
         refiner.refine("hello", Tone::Clean)
     })
     .await
@@ -151,7 +151,7 @@ async fn slow_response_beyond_timeout_returns_timeout() {
     let mut cfg = config(server.uri());
     cfg.timeout = Duration::from_millis(100);
     let result = tokio::task::spawn_blocking(move || {
-        let refiner = LlmRefiner::new(cfg, Vec::new());
+        let refiner = LlmRefiner::new(cfg, Vec::new()).expect("build refiner");
         refiner.refine("hello", Tone::Clean)
     })
     .await
@@ -175,7 +175,7 @@ async fn auth_header_present_when_api_key_set() {
     let mut cfg = config(server.uri());
     cfg.api_key = Some("secret-key".to_string());
     let result = tokio::task::spawn_blocking(move || {
-        let refiner = LlmRefiner::new(cfg, Vec::new());
+        let refiner = LlmRefiner::new(cfg, Vec::new()).expect("build refiner");
         refiner.refine("hello", Tone::Clean)
     })
     .await
@@ -207,7 +207,7 @@ async fn auth_header_absent_when_no_api_key() {
 
     let cfg = config(server.uri());
     let result = tokio::task::spawn_blocking(move || {
-        let refiner = LlmRefiner::new(cfg, Vec::new());
+        let refiner = LlmRefiner::new(cfg, Vec::new()).expect("build refiner");
         refiner.refine("hello", Tone::Clean)
     })
     .await
@@ -237,7 +237,7 @@ async fn verbatim_tone_returns_input_unchanged_without_http_call() {
 
     let cfg = config(server.uri());
     let result = tokio::task::spawn_blocking(move || {
-        let refiner = LlmRefiner::new(cfg, Vec::new());
+        let refiner = LlmRefiner::new(cfg, Vec::new()).expect("build refiner");
         refiner.refine("  keep me verbatim  ", Tone::Verbatim)
     })
     .await
@@ -266,7 +266,7 @@ async fn trailing_slash_in_base_url_does_not_double_slash_the_path() {
 
     let cfg = config(format!("{}/v1/", server.uri()));
     let result = tokio::task::spawn_blocking(move || {
-        let refiner = LlmRefiner::new(cfg, Vec::new());
+        let refiner = LlmRefiner::new(cfg, Vec::new()).expect("build refiner");
         refiner.refine("hello", Tone::Clean)
     })
     .await

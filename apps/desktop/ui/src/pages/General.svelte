@@ -34,16 +34,9 @@
   <Field
     label="Language"
     for="language"
-    hint="No longer used for dictation — each profile now sets its own language."
+    hint="No longer used for dictation — each profile on the Profiles page now sets its own language."
   >
-    <Select
-      id="language"
-      options={LANGUAGE_OPTIONS}
-      bind:value={
-        () => settings.general.language ?? '',
-        (v) => settingsStore.patch({ general: { language: v === '' ? null : v } })
-      }
-    />
+    <Select id="language" disabled options={LANGUAGE_OPTIONS} value={settings.general.language ?? ''} />
   </Field>
 
   <Field label="Theme" for="theme">

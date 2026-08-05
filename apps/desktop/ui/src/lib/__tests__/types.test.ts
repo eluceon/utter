@@ -49,7 +49,6 @@ describe('Settings type/JSON round-trip', () => {
       },
       refine: {
         enabled: true,
-        tone: 'formal',
         base_url: 'https://api.openai.com/v1',
         model: 'gpt-4o-mini',
         timeout_secs: 30,
@@ -68,9 +67,121 @@ describe('Settings type/JSON round-trip', () => {
         vad_sensitivity: 0.75,
         log_level: 'debug',
       },
+      // Two profiles (the normal bilingual case) with every field set to a
+      // non-default value, including two profiles that both sit on the
+      // sherpa engine — the case `ProfileDeps.engine_label` alone cannot
+      // distinguish (see the "Amended 2026-08-04" note on Task 17 in the
+      // v0.2 plan), so the wire contract needs `id` to survive intact for
+      // each.
+      profiles: [
+        {
+          id: 'ru',
+          hotkey: 'ctrl+super',
+          language: 'ru',
+          engine: {
+            active: 'sherpa',
+            whisper_model: 'small',
+            sherpa_model: 'gigaam-v3-e2e-rnnt',
+            cloud: {
+              base_url: 'https://api.openai.com/v1',
+              model: 'whisper-1',
+            },
+          },
+          draft: { model: 'zipformer-ru-small' },
+          refine: { enabled: false, tone: 'clean' },
+        },
+        {
+          id: 'en',
+          hotkey: 'ctrl+alt+super',
+          language: 'en',
+          engine: {
+            active: 'whisper',
+            whisper_model: 'medium',
+            sherpa_model: null,
+            cloud: {
+              base_url: 'https://api.openai.com/v1',
+              model: 'whisper-1',
+            },
+          },
+          draft: null,
+          refine: { enabled: true, tone: 'formal' },
+        },
+      ],
     }
 
     const roundTripped = JSON.parse(JSON.stringify(fixture)) as Settings
     expect(roundTripped).toEqual(fixture)
+  })
+})
+
+describe('defaultSettings', () => {
+  // Deliberately does NOT build its expectation from `defaultSettings()`
+  // itself (see the fixture test above's sibling trap: a round-trip test
+  // whose input is `defaultSettings()` agrees with itself no matter how
+  // wrong `defaultSettings()` is). `expected` below is instead a plain
+  // object hand-written to match `Settings::default()` in
+  // `crates/utter-store/src/settings.rs`, independent of this file's own
+  // `defaultSettings()` implementation — so if `defaultSettings()` drifts
+  // from the Rust default (missing the `profiles` seed, wrong field count,
+  // wrong value), this test fails on its own rather than agreeing with the
+  // bug. This is the gap that let `App.svelte`'s onboarding gate
+  // (`deepEqual(settings, defaultSettings())`) silently break: real
+  // settings from the backend carry a `profiles` key that `defaultSettings()`
+  // didn't, so `isDefaultSettings` was always false and a fresh install
+  // never saw onboarding.
+  it('matches Settings::default() field-for-field, including its one seeded profile', () => {
+    const expected = {
+      general: { language: null, theme: 'system', autostart: false },
+      dictation: { mode: 'push_to_talk', hotkey: 'ctrl+super', silence_timeout_secs: null, hud: true },
+      engine: {
+        active: 'whisper',
+        whisper_model: 'small',
+        sherpa_model: null,
+        cloud: { base_url: 'https://api.openai.com/v1', model: 'whisper-1' },
+      },
+      refine: {
+        enabled: false,
+        base_url: 'http://localhost:11434/v1',
+        model: 'llama3.2',
+        timeout_secs: 10,
+      },
+      dictionary: { terms: [], rules: [] },
+      snippets: [],
+      history: { enabled: true },
+      advanced: {
+        injection: 'auto',
+        audio_device: null,
+        vad_sensitivity: 0.5,
+        log_level: 'info',
+      },
+      profiles: [
+        {
+          id: 'default',
+          hotkey: 'ctrl+super',
+          language: 'en',
+          engine: {
+            active: 'sherpa',
+            whisper_model: 'small',
+            sherpa_model: 'parakeet-tdt-110m-en',
+            cloud: { base_url: 'https://api.openai.com/v1', model: 'whisper-1' },
+          },
+          draft: null,
+          refine: { enabled: false, tone: 'clean' },
+        },
+      ],
+    }
+
+    expect(deepEqual(defaultSettings(), expected)).toBe(true)
+  })
+
+  // Pins the exact property App.svelte's onboarding gate relies on:
+  // `deepEqual` compares key counts (see its own doc comment), so a
+  // freshly-loaded `Settings` value that is genuinely still "the defaults"
+  // must compare equal to `defaultSettings()` after a JSON round-trip (the
+  // same transformation `get_settings`'s payload goes through) — not merely
+  // by construction.
+  it('is deepEqual to itself after a JSON round-trip, the same shape a fresh install loads as', () => {
+    const roundTripped = JSON.parse(JSON.stringify(defaultSettings())) as Settings
+    expect(deepEqual(roundTripped, defaultSettings())).toBe(true)
   })
 })

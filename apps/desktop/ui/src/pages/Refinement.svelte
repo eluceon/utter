@@ -8,17 +8,8 @@
   import Toggle from '../lib/components/Toggle.svelte'
   import * as api from '../lib/api'
   import { settingsStore } from '../lib/stores'
-  import type { Tone } from '../lib/types'
 
   let settings = $derived($settingsStore!)
-
-  const TONE_OPTIONS: { value: Tone; label: string }[] = [
-    { value: 'verbatim', label: 'Verbatim (no changes)' },
-    { value: 'clean', label: 'Clean (punctuation, casing)' },
-    { value: 'formal', label: 'Formal' },
-    { value: 'notes', label: 'Notes (terse, bulleted)' },
-    { value: 'code_comment', label: 'Code comment' },
-  ]
 
   interface Preset {
     label: string
@@ -113,24 +104,20 @@
   }
 </script>
 
-<Section title="Refinement" description="Optionally clean up transcripts with an LLM before injecting them.">
-  <Field label="Enabled" for="refine-enabled">
+<Section
+  title="Refinement"
+  description="The LLM connection dictation optionally sends transcripts through. Each profile decides for itself whether it uses this, and in what tone, on the Profiles page."
+>
+  <Field
+    label="Enabled"
+    for="refine-enabled"
+    hint="Master switch: no profile refines while this is off, regardless of its own setting."
+  >
     <Toggle
       id="refine-enabled"
       bind:checked={
         () => settings.refine.enabled,
         (v) => settingsStore.patch({ refine: { enabled: v } })
-      }
-    />
-  </Field>
-
-  <Field label="Tone" for="tone">
-    <Select
-      id="tone"
-      options={TONE_OPTIONS}
-      bind:value={
-        () => settings.refine.tone,
-        (v) => settingsStore.patch({ refine: { tone: v as Tone } })
       }
     />
   </Field>

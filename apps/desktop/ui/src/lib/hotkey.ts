@@ -84,3 +84,45 @@ export function formatCombo(tokens: Set<string> | readonly string[]): string {
   const rest = [...set].filter((t) => !isModifierToken(t))
   return [...mods, ...rest].join('+')
 }
+
+/** Parses a `+`-separated chord string (as stored in `LanguageProfile.hotkey`)
+ * into its set of normalized (lowercased, trimmed) tokens. Returns `null` for
+ * a chord that carries no tokens at all (`""`, `"+"`, `"  "`) — the same case
+ * `utter_inject::hotkey::parse_hotkey` rejects as `HotkeyParseError::Empty`.
+ *
+ * Deliberately does not reject an unrecognized token the way the Rust parser
+ * does (`HotkeyParseError::UnknownToken`/`MultipleBaseKeys`): every chord this
+ * function is fed already came from `HotkeyPicker`, which only ever emits
+ * tokens from this same grammar (see the module doc comment), so there is no
+ * "typo'd key name" case to guard against here the way there is for a
+ * hand-edited config file on the Rust side. A profile whose hotkey fails to
+ * parse on the Rust side is dropped from hotkey registration entirely by
+ * `parse_profile_hotkeys` (never reaches `find_conflicts`); treating an
+ * empty chord as "no tokens, so no conflict" mirrors that outcome here. */
+export function parseChordTokens(chord: string): Set<string> | null {
+  const tokens = chord
+    .split('+')
+    .map((token) => token.trim().toLowerCase())
+    .filter((token) => token.length > 0)
+  return tokens.length > 0 ? new Set(tokens) : null
+}
+
+/** True when two chords could complete on the same key-down event, mirroring
+ * `utter_inject::hotkey::find_conflicts`'s notion of conflict exactly:
+ * identical token sets always conflict (a chord has no other way to complete
+ * than pressing its own last key); otherwise, they conflict only when their
+ * token sets overlap and neither is a strict subset of the other (holding
+ * every key both need except one they share, then pressing that shared key,
+ * completes both at once). A strict subset — e.g. `ctrl+super` inside
+ * `ctrl+alt+super` — is deliberately not a conflict: completing the larger
+ * chord still needs a key (`alt`) the smaller one doesn't require, so both
+ * stay distinguishable and usable, which is the pairing the two-language
+ * profile setup this check exists for relies on. */
+export function chordsConflict(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  const aSubsetOfB = [...a].every((token) => b.has(token))
+  const bSubsetOfA = [...b].every((token) => a.has(token))
+  if (aSubsetOfB && bSubsetOfA) return true // identical token sets
+  if (aSubsetOfB || bSubsetOfA) return false // one nested inside the other
+
+  return [...a].some((token) => b.has(token))
+}

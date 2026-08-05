@@ -61,6 +61,11 @@ pub struct ProfileDeps {
     pub language: Option<String>,
     /// Recorded on each history entry (e.g. `"whisper"`, `"sherpa"`, `"cloud"`).
     pub engine_label: String,
+    /// [`LanguageProfile::id`] of the profile these deps were built from. Recorded on each
+    /// history entry alongside `engine_label` so two profiles on the same engine kind — the
+    /// normal bilingual case, both on sherpa — can still be told apart; `engine_label` alone
+    /// cannot do that (see the "Amended 2026-08-04" note on Task 17 in the v0.2 plan).
+    pub profile_id: String,
     pub dictionary_terms: Vec<String>,
 }
 
@@ -150,6 +155,7 @@ impl ProfileLoader for RealProfileLoader {
             tone: profile.refine.tone,
             language: Some(profile.language.clone()),
             engine_label: engine_label(profile.engine.active).to_string(),
+            profile_id: profile.id.clone(),
             dictionary_terms: self.dictionary_terms.clone(),
         };
 
@@ -326,10 +332,11 @@ mod tests {
     }
 
     /// A `ProfileDeps` stand-in cheap to build repeatedly, carrying a
-    /// genuinely healthy [`HealthyEngine`]. `engine_label` is stamped with
-    /// the profile's own id, so tests can assert a `deps_for` call resolved
-    /// to the *right* profile rather than merely `Some` profile — see
-    /// `a_profile_loads_its_engines_only_on_first_use` and
+    /// genuinely healthy [`HealthyEngine`]. `engine_label` (and `profile_id`,
+    /// which every caller here also sets to the profile's own id) is stamped
+    /// with the profile's own id, so tests can assert a `deps_for` call
+    /// resolved to the *right* profile rather than merely `Some` profile —
+    /// see `a_profile_loads_its_engines_only_on_first_use` and
     /// `a_broken_profile_does_not_disable_the_others` below.
     fn fake_deps(engine_label: &str) -> ProfileDeps {
         ProfileDeps {
@@ -339,6 +346,7 @@ mod tests {
             tone: Tone::Clean,
             language: None,
             engine_label: engine_label.to_string(),
+            profile_id: engine_label.to_string(),
             dictionary_terms: Vec::new(),
         }
     }
@@ -643,6 +651,10 @@ mod tests {
         assert_eq!(
             deps.tone, tone,
             "the profile's own tone must reach ProfileDeps"
+        );
+        assert_eq!(
+            deps.profile_id, "default",
+            "the profile's own id must reach ProfileDeps, not be left blank"
         );
     }
 }

@@ -9,7 +9,7 @@ use rusqlite::{params, Connection, Row};
 use serde::Serialize;
 
 /// The current on-disk schema version, tracked via SQLite's `user_version` pragma.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// A single stored dictation history entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -21,6 +21,11 @@ pub struct HistoryEntry {
     pub raw_text: String,
     pub final_text: String,
     pub app: Option<String>,
+    /// Which language profile produced this entry. `None` for rows written
+    /// before profiles existed (schema v1 and earlier) — there is no real
+    /// profile to attribute them to, so it is left absent rather than
+    /// back-filled with a guess like `"default"`.
+    pub profile_id: Option<String>,
 }
 
 /// Fields required to record a new history entry.
@@ -34,6 +39,7 @@ pub struct NewEntry {
     pub raw_text: String,
     pub final_text: String,
     pub app: Option<String>,
+    pub profile_id: Option<String>,
 }
 
 /// A SQLite-backed store of completed dictation history.
@@ -63,15 +69,16 @@ impl HistoryRepo {
 
         self.conn
             .execute(
-                "INSERT INTO history (created_at, duration_ms, engine, raw_text, final_text, app)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO history (created_at, duration_ms, engine, raw_text, final_text, app, profile_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     created_at,
                     e.duration_ms,
                     e.engine,
                     e.raw_text,
                     e.final_text,
-                    e.app
+                    e.app,
+                    e.profile_id,
                 ],
             )
             .context("failed to insert history entry")?;
@@ -101,7 +108,7 @@ impl HistoryRepo {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT id, created_at, duration_ms, engine, raw_text, final_text, app
+                    "SELECT id, created_at, duration_ms, engine, raw_text, final_text, app, profile_id
                  FROM history
                  WHERE final_text LIKE '%' || ?1 || '%' ESCAPE '\\'
                  ORDER BY id DESC
@@ -120,7 +127,7 @@ impl HistoryRepo {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT id, created_at, duration_ms, engine, raw_text, final_text, app
+                    "SELECT id, created_at, duration_ms, engine, raw_text, final_text, app, profile_id
                  FROM history
                  ORDER BY id DESC
                  LIMIT ?1",
@@ -156,28 +163,51 @@ impl HistoryRepo {
     }
 }
 
+/// Runs each pending migration step in order, from whatever `user_version` the database is
+/// currently at up to [`SCHEMA_VERSION`]. Each step performs one schema change and advances
+/// `user_version` by exactly one, so an existing user's database — which already has the v1
+/// table — takes only the v1-to-v2 `ALTER TABLE` step rather than a `CREATE TABLE IF NOT EXISTS`
+/// that would silently no-op and leave the new column missing while still marking the database as
+/// current. See the "hazard" note in the v0.2 plan's Task 17 for why a single-step bump of
+/// `SCHEMA_VERSION` is unsafe here.
 fn migrate(conn: &Connection) -> Result<()> {
-    let user_version: i64 = conn
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .context("failed to read user_version")?;
+    loop {
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .context("failed to read user_version")?;
 
-    if user_version < SCHEMA_VERSION {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at INTEGER NOT NULL,
-                duration_ms INTEGER NOT NULL,
-                engine TEXT NOT NULL,
-                raw_text TEXT NOT NULL,
-                final_text TEXT NOT NULL,
-                app TEXT
-            );
-            PRAGMA user_version = 1;",
-        )
-        .context("failed to create history table or set user_version")?;
+        if user_version >= SCHEMA_VERSION {
+            return Ok(());
+        }
+
+        match user_version {
+            0 => conn
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        created_at INTEGER NOT NULL,
+                        duration_ms INTEGER NOT NULL,
+                        engine TEXT NOT NULL,
+                        raw_text TEXT NOT NULL,
+                        final_text TEXT NOT NULL,
+                        app TEXT
+                    );
+                    PRAGMA user_version = 1;",
+                )
+                .context("failed to create history table (v0 -> v1)")?,
+            1 => conn
+                .execute_batch(
+                    "ALTER TABLE history ADD COLUMN profile_id TEXT;
+                    PRAGMA user_version = 2;",
+                )
+                .context("failed to add profile_id column (v1 -> v2)")?,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "history database is at unknown schema version {other}"
+                ))
+            }
+        }
     }
-
-    Ok(())
 }
 
 fn row_to_entry(row: &Row) -> rusqlite::Result<HistoryEntry> {
@@ -189,6 +219,7 @@ fn row_to_entry(row: &Row) -> rusqlite::Result<HistoryEntry> {
         raw_text: row.get(4)?,
         final_text: row.get(5)?,
         app: row.get(6)?,
+        profile_id: row.get(7)?,
     })
 }
 
@@ -224,6 +255,7 @@ mod tests {
             raw_text: format!("raw: {final_text}"),
             final_text: final_text.to_string(),
             app: Some("Editor".to_string()),
+            profile_id: Some("ru".to_string()),
         }
     }
 
@@ -258,6 +290,7 @@ mod tests {
         assert_eq!(got.raw_text, "raw: hello world");
         assert_eq!(got.final_text, "hello world");
         assert_eq!(got.app.as_deref(), Some("Editor"));
+        assert_eq!(got.profile_id.as_deref(), Some("ru"));
         assert!(got.created_at > 0);
     }
 
@@ -376,6 +409,84 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read user_version");
 
+        assert_eq!(user_version, SCHEMA_VERSION);
+    }
+
+    /// Pins the migration hazard the v0.2 plan's Task 17 calls out by name: a real user's
+    /// database is never fresh, it already has the v1 `history` table, so a migration written as
+    /// a single `CREATE TABLE IF NOT EXISTS` bumped straight to `SCHEMA_VERSION` would no-op on
+    /// the `CREATE TABLE`, never add the new column, and still mark the database current. A test
+    /// that only ever opens fresh (v0) databases cannot see this — this one builds a v1 database
+    /// by hand, exactly as an existing installation would have on disk, and opens it through the
+    /// real `HistoryRepo::open` migration path.
+    ///
+    /// Run against the naive one-step version (`SCHEMA_VERSION = 2` with `profile_id TEXT` added
+    /// to the `CREATE TABLE IF NOT EXISTS` and nothing else changed), the second `repo.add(...)`
+    /// below fails with:
+    ///
+    /// ```text
+    /// insert row: failed to insert history entry: table history has 6 columns but 7 values were supplied
+    /// ```
+    #[test]
+    fn migrating_a_real_v1_database_preserves_data_and_adds_profile_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = repo_path(&dir);
+
+        {
+            let conn = Connection::open(&path).expect("create raw v1 database");
+            conn.execute_batch(
+                "CREATE TABLE history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    duration_ms INTEGER NOT NULL,
+                    engine TEXT NOT NULL,
+                    raw_text TEXT NOT NULL,
+                    final_text TEXT NOT NULL,
+                    app TEXT
+                );
+                PRAGMA user_version = 1;",
+            )
+            .expect("create v1 table");
+            conn.execute(
+                "INSERT INTO history (created_at, duration_ms, engine, raw_text, final_text, app)
+                 VALUES (1000, 500, 'whisper', 'raw pre-profile', 'pre-profile entry', NULL)",
+                [],
+            )
+            .expect("insert pre-existing v1 row");
+        }
+
+        let repo = HistoryRepo::open(&path).expect("open should migrate v1 -> v2 in place");
+
+        let new_id = repo
+            .add(entry("post-migration"))
+            .expect("insert row after migration");
+
+        let listed = repo.list(None, 10).expect("list");
+        assert_eq!(
+            listed.len(),
+            2,
+            "the pre-existing v1 row must survive the migration"
+        );
+
+        let old_row = listed
+            .iter()
+            .find(|e| e.final_text == "pre-profile entry")
+            .expect("the pre-existing row is still present");
+        assert_eq!(
+            old_row.profile_id, None,
+            "a row written before profiles existed has no profile to attribute it to"
+        );
+
+        let new_row = listed
+            .iter()
+            .find(|e| e.id == new_id)
+            .expect("the newly inserted row is present");
+        assert_eq!(new_row.profile_id.as_deref(), Some("ru"));
+
+        let conn = Connection::open(&path).expect("open raw connection");
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read user_version");
         assert_eq!(user_version, SCHEMA_VERSION);
     }
 

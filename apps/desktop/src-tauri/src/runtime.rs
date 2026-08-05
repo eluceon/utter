@@ -855,7 +855,9 @@ fn run_inject(session: &mut Session, ctx: &mut WorkerCtx, text: String) {
 }
 
 fn record_history(ctx: &mut WorkerCtx, final_text: &str) {
-    let engine_label = active_profile(ctx).engine_label.clone();
+    let profile = active_profile(ctx);
+    let engine_label = profile.engine_label.clone();
+    let profile_id = profile.profile_id.clone();
 
     let (Some(history), Some(pending)) = (&ctx.history, &ctx.pending) else {
         return;
@@ -872,6 +874,7 @@ fn record_history(ctx: &mut WorkerCtx, final_text: &str) {
         raw_text: pending.raw.clone(),
         final_text: final_text.to_string(),
         app: None,
+        profile_id: Some(profile_id),
     };
 
     if let Err(e) = history.add(entry) {

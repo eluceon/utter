@@ -158,12 +158,19 @@ impl ActiveCapture for NoopActiveCapture {
 /// the partial too).
 type Emission = (String, f32, Option<String>);
 
-/// Records every `emit_state` call (pushed to a channel so tests can wait on
-/// the *next* emission with a bounded timeout instead of polling) and every
-/// `notify` call, in order, into a shared, externally-inspectable Vec.
+/// One `notify` call: kind ("info"/"error") and message.
+type Notice = (String, String);
+
+/// Records every `emit_state` call and every `notify` call, each pushed to
+/// its own channel so tests can wait on the *next* one with a bounded
+/// timeout instead of polling or inferring it from an unrelated event. The
+/// two channels are independent: nothing here orders an emission against a
+/// notice beyond what `dispatch`/`run_effect` themselves guarantee, so a
+/// test that wants a notice must wait for it explicitly via `recv_notice`
+/// rather than assuming it already happened because some state was observed.
 struct FakeSink {
     states_tx: Sender<Emission>,
-    notices: Arc<Mutex<Vec<(String, String)>>>,
+    notices_tx: Sender<Notice>,
 }
 
 impl EventSink for FakeSink {
@@ -174,10 +181,7 @@ impl EventSink for FakeSink {
     }
 
     fn notify(&self, kind: &str, msg: &str) {
-        self.notices
-            .lock()
-            .expect("lock")
-            .push((kind.to_string(), msg.to_string()));
+        let _ = self.notices_tx.send((kind.to_string(), msg.to_string()));
     }
 }
 
@@ -215,6 +219,17 @@ fn recv_partial(rx: &Receiver<Emission>) -> Option<String> {
             return partial;
         }
     }
+}
+
+/// Waits for the next notice with the same bounded timeout `recv_state`
+/// uses, instead of inferring a notice happened from some unrelated state
+/// emission — `emit_state` and `notify` are ordered relative to each other
+/// only by whatever `dispatch`/`run_effect` actually guarantee (see
+/// `run_effect`'s effect ordering), which for some transitions puts the
+/// notice *after* a state a test has already observed.
+fn recv_notice(rx: &Receiver<Notice>) -> Notice {
+    rx.recv_timeout(WAIT)
+        .expect("expected a notify() call within the timeout")
 }
 
 fn assert_no_more_states(rx: &Receiver<Emission>) {
@@ -370,16 +385,14 @@ impl DepsBuilder {
     }
 }
 
-type Notices = Arc<Mutex<Vec<(String, String)>>>;
-
-fn fake_sink() -> (Arc<FakeSink>, Receiver<Emission>, Notices) {
+fn fake_sink() -> (Arc<FakeSink>, Receiver<Emission>, Receiver<Notice>) {
     let (states_tx, states_rx) = unbounded();
-    let notices = Arc::new(Mutex::new(Vec::new()));
+    let (notices_tx, notices_rx) = unbounded();
     let sink = Arc::new(FakeSink {
         states_tx,
-        notices: notices.clone(),
+        notices_tx,
     });
-    (sink, states_rx, notices)
+    (sink, states_rx, notices_rx)
 }
 
 /// Retrieves the `Sender<AudioFrame>` a `FakeCaptureBackend` stashed once
@@ -454,7 +467,7 @@ fn press_and_release(
 fn happy_path_emits_full_sequence_and_injects_refined_text() {
     let refine_calls = Arc::new(AtomicUsize::new(0));
     let injected = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -492,7 +505,7 @@ fn happy_path_emits_full_sequence_and_injects_refined_text() {
 fn refiner_failure_injects_raw_and_notifies() {
     let refine_calls = Arc::new(AtomicUsize::new(0));
     let injected = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, notices) = fake_sink();
+    let (sink, states_rx, notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -520,19 +533,23 @@ fn refiner_failure_injects_raw_and_notifies() {
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "refining");
     assert_eq!(recv_state(&states_rx), "injecting");
+
+    // `RefineFailed` produces `[Inject(raw), NotifyInfo(..)]` (see
+    // `on_refining` in session.rs): the notice is the *second* effect, run
+    // only after `Inject`'s own nested dispatch has already emitted "idle".
+    // So waiting for "idle" on `states_rx` proves nothing about whether the
+    // notice has fired yet -- wait for it explicitly instead.
+    let (kind, msg) = recv_notice(&notices_rx);
+    assert_eq!(kind, "info");
+    assert!(
+        msg.contains("Refinement unavailable"),
+        "expected a refinement-unavailable notice, got {msg:?}"
+    );
+
     assert_eq!(recv_state(&states_rx), "idle");
 
     assert_eq!(*injected.lock().expect("lock"), vec!["hello world"]);
     assert_eq!(refine_calls.load(Ordering::SeqCst), 1);
-
-    let notices = notices.lock().expect("lock");
-    assert!(
-        notices
-            .iter()
-            .any(|(kind, msg)| kind == "info" && msg.contains("Refinement unavailable")),
-        "expected a refinement-unavailable notice, got {notices:?}"
-    );
-    drop(notices);
 
     handle.shutdown();
 }
@@ -544,7 +561,7 @@ fn dictionary_rule_applied_before_injection_and_history() {
     let history = HistoryRepo::open(&db_path).expect("open history db");
 
     let injected = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("open the pod bay doors")));
@@ -594,7 +611,7 @@ fn dictionary_rule_applied_before_injection_and_history() {
 #[test]
 fn dictionary_terms_are_passed_to_engine_as_initial_prompt() {
     let begin_opts = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -637,7 +654,7 @@ fn dictionary_terms_are_passed_to_engine_as_initial_prompt() {
 #[test]
 fn empty_dictionary_terms_produce_no_initial_prompt() {
     let begin_opts = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -673,7 +690,7 @@ fn empty_dictionary_terms_produce_no_initial_prompt() {
 fn snippet_trigger_bypasses_refiner() {
     let refine_calls = Arc::new(AtomicUsize::new(0));
     let injected = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("insert my signature")));
@@ -718,7 +735,7 @@ fn snippet_trigger_bypasses_refiner() {
 fn cancel_during_recording_injects_nothing() {
     let injected = Arc::new(Mutex::new(Vec::new()));
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("should never be seen")));
@@ -758,7 +775,7 @@ fn cancel_after_finish_before_transcript_ready_injects_nothing() {
     // returns and the runtime checks for a pending cancel.
     let injected = Arc::new(Mutex::new(Vec::new()));
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -803,7 +820,7 @@ fn cancel_during_refine_injects_nothing() {
     // distinguishable commit point to test beyond this one.
     let injected = Arc::new(Mutex::new(Vec::new()));
     let refine_calls = Arc::new(AtomicUsize::new(0));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -846,7 +863,7 @@ fn cancel_during_refine_injects_nothing() {
 #[test]
 fn empty_transcript_notifies_and_injects_nothing() {
     let injected = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, notices) = fake_sink();
+    let (sink, states_rx, notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("   ")));
@@ -869,15 +886,17 @@ fn empty_transcript_notifies_and_injects_nothing() {
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "idle");
 
+    // Absence assertion: checked directly, not awaited -- there's nothing to
+    // wait for here, only a Vec that must still be empty.
     assert!(injected.lock().expect("lock").is_empty());
-    let notices = notices.lock().expect("lock");
-    assert!(
-        notices
-            .iter()
-            .any(|(kind, msg)| kind == "info" && msg == "Nothing heard"),
-        "expected a 'Nothing heard' notice, got {notices:?}"
-    );
-    drop(notices);
+
+    // `TranscriptReady` with empty text produces `[NotifyInfo(..)]` after the
+    // transition to "idle" is already emitted (see `on_transcribing` in
+    // session.rs), so the notice can genuinely still be in flight here.
+    // Wait for it explicitly instead of inferring it already happened.
+    let (kind, msg) = recv_notice(&notices_rx);
+    assert_eq!(kind, "info");
+    assert_eq!(msg, "Nothing heard");
 
     handle.shutdown();
 }
@@ -890,7 +909,7 @@ fn history_entry_recorded_with_raw_and_final_text() {
 
     let refine_calls = Arc::new(AtomicUsize::new(0));
     let injected = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -939,7 +958,7 @@ fn reload_swaps_deps_between_sessions() {
     let injected_a = Arc::new(Mutex::new(Vec::new()));
     let injected_b = Arc::new(Mutex::new(Vec::new()));
     let begin_opts_b = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder_a = DepsBuilder::new(Ok(transcript("hello world")));
@@ -997,7 +1016,7 @@ fn reload_swaps_deps_between_sessions() {
 #[test]
 fn toggle_drives_a_full_session_in_toggle_mode() {
     let injected = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (_hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("toggled")));
@@ -1024,7 +1043,7 @@ fn toggle_drives_a_full_session_in_toggle_mode() {
 fn audio_frames_are_fed_to_engine_and_partial_reaches_sink() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let tx_slot = Arc::new(Mutex::new(None));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -1070,7 +1089,7 @@ fn audio_frames_are_fed_to_engine_and_partial_reaches_sink() {
 fn trailing_frames_are_fed_before_finish_is_called() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let tx_slot = Arc::new(Mutex::new(None));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -1144,7 +1163,7 @@ fn trailing_frames_are_fed_before_finish_is_called() {
 #[test]
 fn silence_timeout_stops_recording_without_hotkey_release() {
     let tx_slot = Arc::new(Mutex::new(None));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (_hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -1190,7 +1209,7 @@ fn silence_timeout_stops_recording_without_hotkey_release() {
 #[test]
 fn each_hotkey_dictates_with_its_own_profile() {
     let injected = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
     let (hotkey_tx, hotkey_rx) = unbounded();
 
     let profiles = registry_with(vec![
@@ -1246,7 +1265,7 @@ fn each_hotkey_dictates_with_its_own_profile() {
 fn each_profile_applies_its_own_refine_enabled_flag_at_press_time() {
     let injected = Arc::new(Mutex::new(Vec::new()));
     let refine_calls = Arc::new(AtomicUsize::new(0));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
     let (hotkey_tx, hotkey_rx) = unbounded();
 
     let off_deps = profile_deps_with_transcript("plain");
@@ -1353,7 +1372,7 @@ fn each_profile_applies_its_own_refine_enabled_flag_at_press_time() {
 #[test]
 fn second_binding_pressed_mid_recording_in_toggle_mode_stops_binding_zeros_session() {
     let injected = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
     let (hotkey_tx, hotkey_rx) = unbounded();
 
     let profiles = registry_with(vec![
@@ -1426,7 +1445,7 @@ fn second_binding_pressed_mid_recording_in_toggle_mode_stops_binding_zeros_sessi
 /// for an unknown id is dropped silently: no session starts, nothing crashes.
 #[test]
 fn pressing_an_unregistered_binding_starts_no_session() {
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
     let (hotkey_tx, hotkey_rx) = unbounded();
 
     let builder = DepsBuilder::new(Ok(transcript("hello world")));

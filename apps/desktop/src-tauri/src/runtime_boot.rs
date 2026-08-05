@@ -29,15 +29,16 @@ use utter_core::{
 };
 use utter_inject::{
     create_source, injection_order, parse_hotkey, ChainInjector, ClipboardOnlyInjector,
-    ClipboardPasteInjector, HotkeyEvent, TypeInjector,
+    ClipboardPasteInjector, HotkeyEvent, HotkeySpec, TypeInjector,
 };
 use utter_refine::{LlmConfig, LlmRefiner};
 use utter_store::settings::{CloudSttCfg, EngineCfg, EngineKind, InjectionPreference, RefineCfg};
 #[cfg(feature = "sherpa")]
 use utter_store::IntegrityError;
-use utter_store::{ModelManager, Settings};
+use utter_store::{LanguageProfile, ModelManager, Settings};
 use utter_stt::{CloudEngine, CloudSttConfig, WhisperEngine};
 
+use crate::profiles::{ProfileRegistry, RealProfileLoader};
 use crate::runtime::{EventSink, HistoryHandle, RealCaptureBackend, Runtime, RuntimeDeps};
 use crate::sink::TauriEventSink;
 use crate::state::AppState;
@@ -148,40 +149,54 @@ pub(crate) type QueuedNotice = (&'static str, String);
 
 /// Builds [`RuntimeDeps`] from `settings`, plus any degradation notices to
 /// surface once the runtime is up.
+///
+/// `models` is an `Arc` (not a borrow, unlike `build_engine`'s) because the [`ProfileRegistry`]
+/// built here lazily loads engines for the runtime worker's whole lifetime, long after this
+/// function returns — it needs an owned handle, not one borrowed from this call's stack frame.
 fn build_deps(
     settings: &Settings,
-    models: &ModelManager,
+    models: &Arc<ModelManager>,
     history: Option<HistoryHandle>,
 ) -> (RuntimeDeps, Vec<QueuedNotice>) {
     let mut notices = Vec::new();
 
-    let (engine, engine_notice) =
-        build_engine(&settings.engine, models, &settings.dictionary.terms);
-    if let Some(msg) = engine_notice {
-        notices.push(("warning", msg));
-    }
+    let (specs, kept_profiles, hotkey_notices) = parse_profile_hotkeys(settings.profiles.clone());
+    notices.extend(hotkey_notices);
 
-    let (refiner, refiner_notice) =
-        build_refiner(&settings.refine, settings.dictionary.terms.clone());
-    if let Some(msg) = refiner_notice {
-        notices.push(("info", msg));
-    }
-    let injector = build_injector(settings.advanced.injection);
-
-    let (hotkey_rx, hotkey_notice) = spawn_hotkey_source(&settings.dictation.hotkey);
+    let (hotkey_rx, hotkey_notice) = spawn_hotkey_sources(&specs);
     if let Some(msg) = hotkey_notice {
         notices.push(("warning", msg));
     }
 
+    // D-A (see docs/superpowers/plans/2026-07-26-utter-v0.2.md, Task 16's "Amended
+    // 2026-08-04"): every call to `build_deps` -- at boot, and again on every settings save via
+    // `rebuild` -- constructs a brand new `ProfileRegistry`, discarding whatever engines a
+    // previous one had already lazily loaded. That looks expensive, but it is parity with
+    // today: this function already rebuilt the single engine on every `rebuild` before profiles
+    // existed (toggling the tray's refinement checkbox has always reloaded the whisper/sherpa
+    // model too), and laziness bounds the new cost -- after a recreate, only the default
+    // profile (index 0) reloads eagerly, and every other profile just re-pays its own load on
+    // its next press, exactly as a single-profile setup does today, even for a bilingual user.
+    // The narrower path -- keeping engines whose inputs (dictionary terms, engine config)
+    // didn't change and rebuilding only refiners/flags -- is a real improvement and is
+    // deferred, not rejected.
+    let loader = Box::new(RealProfileLoader::new(
+        models.clone(),
+        settings.refine.clone(),
+        settings.dictionary.terms.clone(),
+    ));
+    let (profiles, profile_notices) = ProfileRegistry::new(kept_profiles, loader);
+    notices.extend(profile_notices);
+
+    let injector = build_injector(settings.advanced.injection);
+
     let deps = RuntimeDeps {
         mode: settings.dictation.mode,
-        refine_enabled: settings.refine.enabled,
         silence: settings
             .dictation
             .silence_timeout_secs
             .map(|secs| Duration::from_secs(u64::from(secs))),
-        engine,
-        refiner,
+        profiles,
         injector,
         rules: settings.dictionary.rules.clone(),
         snippets: settings.snippets.clone(),
@@ -191,13 +206,56 @@ fn build_deps(
         hotkey_rx,
         vad_sensitivity: settings.advanced.vad_sensitivity,
         refine_timeout: Duration::from_secs(settings.refine.timeout_secs),
-        tone: settings.refine.tone,
-        language: settings.general.language.clone(),
-        engine_label: engine_label(settings.engine.active).to_string(),
-        dictionary_terms: settings.dictionary.terms.clone(),
     };
 
     (deps, notices)
+}
+
+/// Parses each profile's hotkey chord, keeping the profile only if it parses, and returns the
+/// specs and surviving profiles in lockstep: `specs[i]` is `kept[i]`'s chord, so the
+/// [`utter_inject::BindingId`] `create_source(&specs)` reports for index `i` always lines up
+/// with `kept[i]`'s position in the [`ProfileRegistry`] built from `kept` (see its own doc
+/// comment on the same invariant).
+///
+/// Building both lists from a single pass over `profiles` -- rather than something like
+/// `profiles.iter().filter_map(|p| parse_hotkey(&p.hotkey).ok()).collect()` for the specs alone
+/// -- is what keeps that alignment from drifting the moment any profile's hotkey fails to
+/// parse: dropping a spec without also dropping its profile (or vice versa) would silently
+/// shift every id after it, and the symptom is the user dictating in the wrong language with a
+/// green test suite (Task 16 of the v0.2 plan, "Amended 2026-08-04", item 1).
+///
+/// A profile whose hotkey is unparseable (nothing validates [`LanguageProfile::hotkey`] at
+/// settings load) is dropped from both lists and reported as a `"warning"` notice naming it --
+/// otherwise it would be a profile the registry can resolve but no chord could ever select,
+/// silently dead (item 2 of the same amendment). See [`ProfileRegistry::new`]'s doc comment for
+/// why the registry itself cannot catch this.
+fn parse_profile_hotkeys(
+    profiles: Vec<LanguageProfile>,
+) -> (Vec<HotkeySpec>, Vec<LanguageProfile>, Vec<QueuedNotice>) {
+    let mut specs = Vec::new();
+    let mut kept = Vec::new();
+    let mut notices = Vec::new();
+
+    for profile in profiles {
+        match parse_hotkey(&profile.hotkey) {
+            Ok(spec) => {
+                specs.push(spec);
+                kept.push(profile);
+            }
+            Err(e) => {
+                notices.push((
+                    "warning",
+                    format!(
+                        "profile \"{}\" has an invalid hotkey \"{}\": {e}; dictation has no \
+                         hotkey for this profile until it is fixed in Settings",
+                        profile.id, profile.hotkey
+                    ),
+                ));
+            }
+        }
+    }
+
+    (specs, kept, notices)
 }
 
 /// The label recorded on history entries for the active engine kind.
@@ -455,11 +513,13 @@ fn build_injector(preference: InjectionPreference) -> Box<dyn TextInjector> {
     Box::new(ChainInjector::new(injectors))
 }
 
-/// Starts the hotkey monitor thread for `hotkey` and returns the receiver
-/// side of its event channel, plus a notice if capture couldn't be started
-/// (an invalid chord, missing permissions, or the OS refusing to spawn the
-/// monitor thread) — the runtime still boots with no hotkey rather than
-/// failing outright.
+/// Starts the hotkey monitor thread watching every chord in `specs` at once (see
+/// [`utter_inject::create_source`]) and returns the receiver side of its shared event channel,
+/// plus a notice if capture couldn't be started (missing permissions, or the OS refusing to
+/// spawn the monitor thread) — the runtime still boots with no hotkey rather than failing
+/// outright. `specs` is assumed already validated: [`parse_profile_hotkeys`] is the only caller,
+/// and it has already dropped anything `parse_hotkey` rejects, so this function does no parsing
+/// of its own.
 ///
 /// The channel's sender is cloned before being handed to the spawned
 /// `HotkeySource` thread rather than moved directly: on the happy path the
@@ -472,24 +532,10 @@ fn build_injector(preference: InjectionPreference) -> Box<dyn TextInjector> {
 /// as immediately "ready" with a disconnect error, spinning the worker
 /// thread at 100% CPU forever. One leaked `Sender` per failed (re)boot is an
 /// intentionally rare, negligible cost next to that.
-fn spawn_hotkey_source(hotkey: &str) -> (Receiver<HotkeyEvent>, Option<String>) {
+fn spawn_hotkey_sources(specs: &[HotkeySpec]) -> (Receiver<HotkeyEvent>, Option<String>) {
     let (tx, rx) = unbounded::<HotkeyEvent>();
 
-    let spec = match parse_hotkey(hotkey) {
-        Ok(spec) => spec,
-        Err(e) => {
-            std::mem::forget(tx);
-            return (
-                rx,
-                Some(format!(
-                    "invalid hotkey \"{hotkey}\": {e}; dictation has no hotkey until this is \
-                     fixed in Settings"
-                )),
-            );
-        }
-    };
-
-    let source = match create_source(&[spec]) {
+    let source = match create_source(specs) {
         Ok(source) => source,
         Err(e) => {
             std::mem::forget(tx);
@@ -587,15 +633,59 @@ mod tests {
         assert_eq!(refine_missing_key_notice(true), None);
     }
 
+    fn profile(id: &str, hotkey: &str) -> LanguageProfile {
+        LanguageProfile {
+            id: id.to_string(),
+            hotkey: hotkey.to_string(),
+            ..LanguageProfile::default()
+        }
+    }
+
     #[test]
-    fn invalid_hotkey_boots_without_a_source_and_queues_a_notice() {
-        let (rx, notice) = spawn_hotkey_source("not+a+real+hotkey+++");
-        assert!(notice.is_some());
-        assert!(notice.unwrap().contains("invalid hotkey"));
-        // No source thread was spawned, so nothing is ever sent; the
-        // channel must read as merely empty, never disconnected (see this
-        // function's doc comment for why disconnection would matter).
-        assert_eq!(rx.try_recv(), Err(crossbeam_channel::TryRecvError::Empty));
+    fn parse_profile_hotkeys_keeps_every_profile_when_every_hotkey_parses() {
+        let profiles = vec![profile("ru", "ctrl+super"), profile("en", "ctrl+alt+super")];
+
+        let (specs, kept, notices) = parse_profile_hotkeys(profiles);
+
+        assert_eq!(specs.len(), 2);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].id, "ru");
+        assert_eq!(kept[1].id, "en");
+        assert!(notices.is_empty());
+    }
+
+    /// The bad chord sits in the *middle* of the list on purpose (Task 16 of the v0.2 plan,
+    /// "Amended 2026-08-04", item 1): the naive `filter_map` implementation this guards against
+    /// still gets index 0 right, so a fixture that only ever puts the bad hotkey last or first
+    /// would not catch a positional-drift regression. `kept[1]` must be `"en"` (not `"de"`,
+    /// which would be the result of `specs`/`kept` drifting out of lockstep), pinning that a
+    /// dropped profile is dropped from *both* lists at once, keeping every id after it aligned.
+    #[test]
+    fn parse_profile_hotkeys_drops_a_bad_chord_in_the_middle_without_shifting_the_rest() {
+        let profiles = vec![
+            profile("ru", "ctrl+super"),
+            profile("de", "not+a+real+hotkey+++"),
+            profile("en", "ctrl+alt+super"),
+        ];
+
+        let (specs, kept, notices) = parse_profile_hotkeys(profiles);
+
+        assert_eq!(specs.len(), 2, "the bad chord must not produce a spec");
+        assert_eq!(kept.len(), 2, "the bad chord's profile must not be kept");
+        assert_eq!(kept[0].id, "ru", "binding 0 is still the first profile");
+        assert_eq!(
+            kept[1].id, "en",
+            "binding 1 must be \"en\", not the dropped \"de\" -- proves specs and kept stayed \
+             in lockstep rather than one drifting relative to the other"
+        );
+
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].0, "warning");
+        assert!(
+            notices[0].1.contains("\"de\""),
+            "the notice must name the profile whose hotkey was rejected, got {:?}",
+            notices[0].1
+        );
     }
 
     #[test]

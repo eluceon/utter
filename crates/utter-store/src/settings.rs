@@ -8,7 +8,7 @@ use directories::ProjectDirs;
 use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 
-use utter_core::{DictationMode, Tone};
+use utter_core::DictationMode;
 use utter_refine::{ReplaceRule, Snippet};
 
 use crate::error::MigrationFailed;
@@ -63,6 +63,12 @@ impl Default for Settings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct General {
+    /// A recognition-language hint, historically applied to whatever engine the (now removed)
+    /// single global config built. Since dictation routes through
+    /// [`LanguageProfile::language`](crate::profile::LanguageProfile), each profile carrying its
+    /// own tag, this field no longer affects dictation at all — kept only because nothing else
+    /// has claimed it and dropping it would be a needless settings-schema churn for a field nothing
+    /// currently reads.
     pub language: Option<String>,
     pub theme: Theme,
     pub autostart: bool,
@@ -242,11 +248,6 @@ pub struct RefineCfg {
     /// Master switch: refinement never runs while this is false, regardless of any profile's
     /// own policy. See [`refinement_is_on`].
     pub enabled: bool,
-    /// Duplicated with [`RefinePolicy::tone`](crate::profile::RefinePolicy::tone) until every
-    /// consumer of this global setting is routed through a profile instead. Remove this field
-    /// once `commands::test_refine` and `runtime_boot::build_deps`'s `RuntimeDeps` construction
-    /// read a profile's tone directly.
-    pub tone: Tone,
     /// Base URL of the OpenAI-compatible endpoint refinement requests are sent to.
     pub base_url: String,
     /// Model name passed to the refinement endpoint.
@@ -260,7 +261,6 @@ impl Default for RefineCfg {
     fn default() -> Self {
         Self {
             enabled: false,
-            tone: Tone::Clean,
             base_url: "http://localhost:11434/v1".to_string(),
             model: "llama3.2".to_string(),
             timeout_secs: 10,
@@ -445,6 +445,7 @@ pub fn save(path: &Path, settings: &Settings) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use utter_core::Tone;
 
     #[test]
     fn profiles_round_trip_through_toml() {
@@ -723,7 +724,6 @@ terms = ["PostgreSQL"]
         assert!(settings.dictation.hud);
         assert_eq!(settings.dictation.mode, DictationMode::PushToTalk);
 
-        assert_eq!(settings.refine.tone, Tone::Clean);
         assert_eq!(settings.refine.timeout_secs, 10);
         assert!(!settings.refine.enabled);
         assert_eq!(settings.refine.base_url, "http://localhost:11434/v1");

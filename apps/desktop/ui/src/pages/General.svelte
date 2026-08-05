@@ -31,7 +31,11 @@
 </script>
 
 <Section title="General" description="Language, appearance, and startup behavior.">
-  <Field label="Language" for="language" hint="Used as a hint for the speech-to-text engine.">
+  <Field
+    label="Language"
+    for="language"
+    hint="No longer used for dictation — each profile now sets its own language."
+  >
     <Select
       id="language"
       options={LANGUAGE_OPTIONS}

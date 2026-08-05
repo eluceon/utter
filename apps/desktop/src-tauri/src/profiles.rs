@@ -33,13 +33,6 @@
 //! reuses `build_sherpa`) rather than reimplementing engine construction, so
 //! that check is never bypassed by a profile-specific load path.
 
-// Nothing outside this module's own tests constructs a `ProfileRegistry`
-// yet — wiring it into `AppState`/the dictation worker is Task 16's job
-// (see the "Amended 2026-08-04" note on Task 15 in the v0.2 plan). Remove
-// this attribute once that wiring lands; if anything below is still unused
-// after that, the lint is telling the truth.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use utter_core::{SttEngine, TextRefiner, Tone};
@@ -55,15 +48,20 @@ use crate::runtime_boot::{build_engine, build_refiner, engine_label, QueuedNotic
 /// backend, injector, ...). See the "Amended 2026-08-04" note on Task 15 in
 /// the v0.2 plan for why this is a separate type rather than one
 /// `RuntimeDeps` per profile.
-pub(crate) struct ProfileDeps {
-    pub(crate) engine: Box<dyn SttEngine>,
-    pub(crate) refiner: Option<Box<dyn TextRefiner>>,
-    pub(crate) refine_enabled: bool,
-    pub(crate) tone: Tone,
-    pub(crate) language: Option<String>,
+pub struct ProfileDeps {
+    pub engine: Box<dyn SttEngine>,
+    /// `Arc` rather than `Box`: `ProfileRegistry` caches a profile's `ProfileDeps` forever once
+    /// loaded (see its own doc comment), so the worker needs to hand out a cheap clone of the
+    /// refiner on every press of the same binding — a `refine_with_timeout` call races it on a
+    /// detached thread (see `crate::runtime`) — rather than being able to move a `Box` out of a
+    /// value it doesn't own.
+    pub refiner: Option<Arc<dyn TextRefiner>>,
+    pub refine_enabled: bool,
+    pub tone: Tone,
+    pub language: Option<String>,
     /// Recorded on each history entry (e.g. `"whisper"`, `"sherpa"`, `"cloud"`).
-    pub(crate) engine_label: String,
-    pub(crate) dictionary_terms: Vec<String>,
+    pub engine_label: String,
+    pub dictionary_terms: Vec<String>,
 }
 
 /// Turns one [`LanguageProfile`] into its [`ProfileDeps`], plus any
@@ -74,7 +72,7 @@ pub(crate) struct ProfileDeps {
 ///
 /// `Send` because [`ProfileRegistry`] is destined to live on the dictation
 /// worker thread (Task 16), so whatever it holds must be movable there.
-pub(crate) trait ProfileLoader: Send {
+pub trait ProfileLoader: Send {
     fn load(&self, profile: &LanguageProfile) -> (ProfileDeps, Vec<QueuedNotice>);
 }
 
@@ -134,13 +132,13 @@ impl ProfileLoader for RealProfileLoader {
         // `expect`s — real cost, and a real (if inert) panic surface, on
         // the lazy-load path for a profile that will never use either.
         let refine_enabled = refinement_is_on(&self.global_refine, &profile.refine);
-        let refiner = if refine_enabled {
+        let refiner: Option<Arc<dyn TextRefiner>> = if refine_enabled {
             let (refiner, refiner_notice) =
                 build_refiner(&self.global_refine, self.dictionary_terms.clone());
             if let Some(msg) = refiner_notice {
                 notices.push(("info", msg));
             }
-            refiner
+            refiner.map(Arc::from)
         } else {
             None
         };
@@ -181,9 +179,11 @@ struct Entry {
 /// already-loaded profile until the whole registry is discarded and
 /// rebuilt, and rebuilding throws away *every* lazily-loaded engine —
 /// hundreds of MB, potentially — and re-pays the eager default-profile
-/// load. Whoever wires this into the worker (Task 16) needs to weigh that
-/// cost explicitly rather than discover the staleness later.
-pub(crate) struct ProfileRegistry {
+/// load. `runtime_boot::build_deps` is where that recreate happens and
+/// documents the decision to accept it (Task 16 of the v0.2 plan): parity
+/// with the pre-profiles boot path, bounded by the same laziness this type
+/// already provides.
+pub struct ProfileRegistry {
     loader: Box<dyn ProfileLoader>,
     entries: Vec<Entry>,
 }
@@ -213,8 +213,9 @@ impl ProfileRegistry {
     /// profile's binding is never registered and its hotkey does nothing,
     /// silently. Only the caller doing that parsing can catch it; this
     /// module only ever sees `LanguageProfile`s, never their hotkey strings'
-    /// validity.
-    pub(crate) fn new(
+    /// validity. `runtime_boot::parse_profile_hotkeys` is the caller that
+    /// does this parsing (Task 16 of the v0.2 plan) and reports the notice.
+    pub fn new(
         profiles: Vec<LanguageProfile>,
         loader: Box<dyn ProfileLoader>,
     ) -> (Self, Vec<QueuedNotice>) {

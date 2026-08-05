@@ -6,10 +6,10 @@ mod commands;
 /// Event payload shapes shared with the frontend.
 pub mod events;
 /// Maps each language profile's hotkey binding to its own lazily-built
-/// engines. Tested inline (`#[cfg(test)] mod tests`, no integration test
-/// needs it); wired into the runtime worker in Task 16 — see its
-/// `#![allow(dead_code)]` for why it's silent about being unused until then.
-mod profiles;
+/// engines; wired into the runtime worker in `runtime`. Public so
+/// integration tests can build a `ProfileRegistry` over a fake
+/// `ProfileLoader`, the same seam `runtime.rs` itself depends on.
+pub mod profiles;
 /// The dictation runtime orchestrator (worker thread, state machine wiring).
 /// Public so integration tests can drive it directly.
 pub mod runtime;

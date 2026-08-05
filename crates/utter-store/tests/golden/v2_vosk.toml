@@ -29,7 +29,6 @@ model = "whisper-1-custom"
 
 [refine]
 enabled = true
-tone = "formal"
 base_url = "http://localhost:11434/v1"
 model = "llama3.2"
 timeout_secs = 20

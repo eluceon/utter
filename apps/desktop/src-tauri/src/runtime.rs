@@ -88,12 +88,14 @@ use crossbeam_channel::{select, unbounded, Receiver, Sender};
 
 use utter_audio::{rms_level, AudioFrame, SilenceDetector};
 use utter_core::{
-    DictationMode, Effect, Event, Session, State, SttEngine, TextInjector, TextRefiner, Tone,
+    DictationMode, Effect, Event, Session, State, TextInjector, TextRefiner, Tone,
     TranscribeOptions, Transcript,
 };
-use utter_inject::HotkeyEvent;
+use utter_inject::{BindingId, HotkeyEvent};
 use utter_refine::{apply_rules, match_snippet, ReplaceRule, Snippet};
 use utter_store::{HistoryRepo, NewEntry};
+
+use crate::profiles::{ProfileDeps, ProfileRegistry};
 
 /// Sink the runtime reports dictation phase changes and user-facing notices
 /// to. `state` matches the `DictationPhase` names in [`crate::events`]
@@ -158,14 +160,24 @@ impl ActiveCapture for RealActiveCapture {
 
 /// Everything [`Runtime::spawn`] needs to drive one dictation session, and
 /// everything [`RuntimeHandle::reload`] can swap out for the next one.
+///
+/// Fields that used to live here directly (`engine`, `refiner`, `refine_enabled`, `tone`,
+/// `language`, `engine_label`, `dictionary_terms`) are now per-profile instead of per-runtime —
+/// see [`profiles`] — because a hotkey binding selects a [`LanguageProfile`], not a single global
+/// engine/refiner pair. `profiles` is the only field that changed; everything else here is a
+/// true singleton shared by every profile (the hotkey receiver, the history connection, the
+/// capture backend, the injector, ...) and could not be duplicated per profile even if it wanted
+/// to be.
+///
+/// [`LanguageProfile`]: utter_store::LanguageProfile
 pub struct RuntimeDeps {
     pub mode: DictationMode,
-    pub refine_enabled: bool,
     /// Continuous-silence duration that auto-stops recording; `None`
     /// disables the silence timeout entirely.
     pub silence: Option<Duration>,
-    pub engine: Box<dyn SttEngine>,
-    pub refiner: Option<Box<dyn TextRefiner>>,
+    /// Maps each configured profile's hotkey binding to its own engine, refiner, language and
+    /// tone, building them lazily on first use. See [`crate::profiles`].
+    pub profiles: ProfileRegistry,
     pub injector: Box<dyn TextInjector>,
     pub rules: Vec<ReplaceRule>,
     pub snippets: Vec<Snippet>,
@@ -179,20 +191,10 @@ pub struct RuntimeDeps {
     /// keeps it trivially testable — tests drive it with a plain channel.
     pub hotkey_rx: Receiver<HotkeyEvent>,
     pub vad_sensitivity: f32,
+    /// How long to wait for a refine call before giving up and using the raw transcript instead.
+    /// Shared across every profile: there is one refine endpoint/timeout configured globally
+    /// (`RefineCfg`), even though whether it runs and with which tone is per-profile.
     pub refine_timeout: Duration,
-    pub tone: Tone,
-    pub language: Option<String>,
-    /// Recorded on each history entry (e.g. `"whisper"`, `"sherpa"`, `"cloud"`).
-    pub engine_label: String,
-    /// User-configured dictionary terms (proper nouns, jargon, ...), fed to
-    /// the active engine as a recognition hint so it is more likely to get
-    /// them right in the first place — distinct from `rules`, which rewrite
-    /// the transcript after the fact. How they are delivered is
-    /// engine-specific: whisper.cpp takes them as an `initial_prompt` on
-    /// every `begin()`, while sherpa-onnx takes them as hotwords fixed at
-    /// model load, which is why changing them rebuilds the runtime (see
-    /// `runtime_boot::build_sherpa`) rather than being re-supplied per call.
-    pub dictionary_terms: Vec<String>,
 }
 
 /// Messages sent from a [`RuntimeHandle`] to the worker thread.
@@ -294,8 +296,16 @@ struct PendingUtterance {
 /// swappable adapters/config (from the latest [`RuntimeDeps`]) plus
 /// in-flight session state that survives across `select!` iterations.
 struct WorkerCtx {
-    engine: Box<dyn SttEngine>,
-    refiner: Option<Arc<dyn TextRefiner>>,
+    /// Maps each profile's hotkey binding to its engine/refiner/language/tone. Which entry is
+    /// "live" for the in-flight session is tracked separately in `active_binding`, since the
+    /// registry itself has no notion of a currently-selected profile.
+    profiles: ProfileRegistry,
+    /// The binding driving the in-flight session, set by [`start_session_for`] the moment a
+    /// press starts one from `State::Idle` (the only moment a binding can be selected — see the
+    /// module doc comment) and cleared back to `None` once the session returns to `Idle`. `None`
+    /// at rest, between sessions: there is no "current profile" to speak of until a press picks
+    /// one.
+    active_binding: Option<BindingId>,
     injector: Box<dyn TextInjector>,
     rules: Vec<ReplaceRule>,
     snippets: Vec<Snippet>,
@@ -306,11 +316,7 @@ struct WorkerCtx {
     vad_sensitivity: f32,
     silence: Option<Duration>,
     refine_timeout: Duration,
-    tone: Tone,
-    language: Option<String>,
-    engine_label: String,
     mode: DictationMode,
-    dictionary_terms: Vec<String>,
 
     sink: Arc<dyn EventSink>,
     // Kept alive for the runtime's whole lifetime (even with no capture
@@ -344,9 +350,9 @@ impl WorkerCtx {
         audio_rx: Receiver<AudioFrame>,
         control_rx: Receiver<ControlMsg>,
     ) -> Self {
-        let mut ctx = Self {
-            engine: deps.engine,
-            refiner: None,
+        Self {
+            profiles: deps.profiles,
+            active_binding: None,
             injector: deps.injector,
             rules: deps.rules,
             snippets: deps.snippets,
@@ -357,11 +363,7 @@ impl WorkerCtx {
             vad_sensitivity: deps.vad_sensitivity,
             silence: deps.silence,
             refine_timeout: deps.refine_timeout,
-            tone: deps.tone,
-            language: deps.language,
-            engine_label: deps.engine_label,
             mode: deps.mode,
-            dictionary_terms: deps.dictionary_terms,
             sink,
             audio_tx,
             audio_rx,
@@ -371,18 +373,20 @@ impl WorkerCtx {
             pending: None,
             control_rx,
             pending_control: VecDeque::new(),
-        };
-        ctx.refiner = deps.refiner.map(Arc::from);
-        ctx
+        }
     }
 
     /// Swaps in newly-reloaded config/adapters. Runtime-owned in-flight
     /// state (`sink`, the audio channel, `active_capture`, `pending`, ...)
     /// is left untouched — by the time this runs the session is idle (see
     /// `reload`), so there is none in flight to preserve or discard.
+    /// `active_binding` is likewise already `None` by this point (cleared
+    /// the moment the session reached `Idle` — see `dispatch`), but is reset
+    /// here too as a defensive invariant: nothing after `apply` should ever
+    /// resolve a binding against a registry it no longer belongs to.
     fn apply(&mut self, deps: RuntimeDeps) {
-        self.engine = deps.engine;
-        self.refiner = deps.refiner.map(Arc::from);
+        self.profiles = deps.profiles;
+        self.active_binding = None;
         self.injector = deps.injector;
         self.rules = deps.rules;
         self.snippets = deps.snippets;
@@ -393,12 +397,27 @@ impl WorkerCtx {
         self.vad_sensitivity = deps.vad_sensitivity;
         self.silence = deps.silence;
         self.refine_timeout = deps.refine_timeout;
-        self.tone = deps.tone;
-        self.language = deps.language;
-        self.engine_label = deps.engine_label;
         self.mode = deps.mode;
-        self.dictionary_terms = deps.dictionary_terms;
     }
+}
+
+/// The [`ProfileDeps`] for the binding driving the in-flight session.
+///
+/// Panics if called with no active binding, or a binding the registry no longer has an entry
+/// for. Both are invariants established by [`start_session_for`] (the only place
+/// `ctx.active_binding` is ever set) and preserved afterward: a binding is never removed from a
+/// live registry (a `reload` replaces the whole registry, but only once any in-flight recording
+/// has already been cancelled back to `Idle` — see `reload` below), and every caller of this
+/// function is itself only reachable while a session is in flight (`State::Recording` through
+/// `State::Injecting`), which cannot happen before `start_session_for` has run.
+fn active_profile(ctx: &mut WorkerCtx) -> &mut ProfileDeps {
+    let binding = ctx
+        .active_binding
+        .expect("invariant: active_profile called with no session in flight");
+    ctx.profiles
+        .deps_for(binding)
+        .map(|(deps, _notices)| deps)
+        .expect("invariant: active_binding must resolve to a live registry entry")
 }
 
 fn phase_str(state: State) -> &'static str {
@@ -413,7 +432,13 @@ fn phase_str(state: State) -> &'static str {
 
 fn worker_loop(deps: RuntimeDeps, sink: Arc<dyn EventSink>, control_rx: Receiver<ControlMsg>) {
     let (audio_tx, audio_rx) = unbounded::<AudioFrame>();
-    let mut session = Session::new(deps.mode, deps.refine_enabled);
+    // Placeholder, replaced by `start_session_for` the moment the first press or `toggle()`
+    // selects a profile (see `handle_hotkey_pressed`/`handle_toggle`) and reconstructs this with
+    // that profile's own `refine_enabled`. The value here is never actually consulted:
+    // `Session::on_idle` doesn't look at `refine_enabled`, and nothing reaches any other state
+    // without going through `start_session_for` first — `Session::new` just requires some value
+    // to be given one.
+    let mut session = Session::new(deps.mode, false);
     let mut ctx = WorkerCtx::new(deps, sink, audio_tx, audio_rx, control_rx);
 
     loop {
@@ -431,13 +456,13 @@ fn worker_loop(deps: RuntimeDeps, sink: Arc<dyn EventSink>, control_rx: Receiver
 
         select! {
             recv(ctx.hotkey_rx) -> msg => match msg {
-                // `binding` is ignored here: this runtime registers a
-                // single hotkey today, so every event belongs to it.
-                // Routing per binding (e.g. to a language profile) is a
-                // later step's job.
-                Ok(HotkeyEvent::Pressed { .. }) => {
-                    dispatch(&mut session, &mut ctx, Event::HotkeyPressed)
+                Ok(HotkeyEvent::Pressed { binding }) => {
+                    handle_hotkey_pressed(&mut session, &mut ctx, binding)
                 }
+                // Which binding released is never checked: `ChordMatcher` guarantees only the
+                // binding that fired can ever release (see its own doc comment), and the
+                // session already knows which one is active via `ctx.active_binding` -- so
+                // there is nothing this event needs to add.
                 Ok(HotkeyEvent::Released { .. }) => {
                     dispatch(&mut session, &mut ctx, Event::HotkeyReleased)
                 }
@@ -490,6 +515,54 @@ fn handle_control(session: &mut Session, ctx: &mut WorkerCtx, msg: ControlMsg) -
     }
 }
 
+/// Handles a `HotkeyEvent::Pressed { binding }`. A binding is only ever selected from `Idle`
+/// (see the module doc comment): if the session is currently idle, this first resolves
+/// `binding`'s profile and (re)starts the session with it before dispatching the press;
+/// otherwise `binding` is not consulted at all and the press is simply forwarded to the
+/// in-flight session as-is (e.g. the second press of a `Toggle`-mode binding, which stops
+/// recording regardless of which binding fired it).
+fn handle_hotkey_pressed(session: &mut Session, ctx: &mut WorkerCtx, binding: BindingId) {
+    if session.state() == State::Idle && !start_session_for(session, ctx, binding) {
+        // No profile is registered for this binding -- see `ProfileRegistry::deps_for`'s doc
+        // comment for the one thing `None` can mean here. There is nothing sensible to start,
+        // so the press is dropped rather than handed to `Session` with no profile behind it.
+        return;
+    }
+    dispatch(session, ctx, Event::HotkeyPressed);
+}
+
+/// Resolves `binding` via the registry, surfaces any notice its (possibly first-ever) load
+/// produced, records it as the binding driving the new session, and reconstructs `session` fresh
+/// with that profile's own `refine_enabled`.
+///
+/// Reconstructing `Session` here, rather than mutating a long-lived one, is what makes
+/// `refine_enabled` a per-press, per-profile value even though `Session::new` only takes it at
+/// construction: a session is only ever started from `Idle`, which is also the only moment a
+/// binding is selected, so the two happen together and nothing observable is lost — a `Session`
+/// carries no other state worth preserving across an idle boundary (`state` is already `Idle`;
+/// `mode` does not change per profile).
+///
+/// Returns `false` (leaving `session`/`ctx` untouched) if `binding` has no registry entry. In
+/// practice this is unreachable: `create_source` is only ever handed specs for bindings
+/// `ProfileRegistry` also has entries for (see `runtime_boot::parse_profile_hotkeys`, the one
+/// place that builds both lists together), so no real `HotkeyEvent` can name an id the registry
+/// doesn't know. The check stays because that lockstep is maintained by a *different* module
+/// than this one, with nothing at this call site able to verify it holds.
+fn start_session_for(session: &mut Session, ctx: &mut WorkerCtx, binding: BindingId) -> bool {
+    let Some((deps, notices)) = ctx.profiles.deps_for(binding) else {
+        return false;
+    };
+    let refine_enabled = deps.refine_enabled;
+
+    ctx.active_binding = Some(binding);
+    *session = Session::new(ctx.mode, refine_enabled);
+
+    for (kind, msg) in notices {
+        ctx.sink.notify(kind, &msg);
+    }
+    true
+}
+
 fn cleanup_and_exit(ctx: &mut WorkerCtx) {
     if let Some(active) = ctx.active_capture.take() {
         active.stop();
@@ -530,6 +603,9 @@ fn dispatch(session: &mut Session, ctx: &mut WorkerCtx, event: Event) {
         ctx.pending = None;
         ctx.session_started_at = None;
         ctx.silence_detector = None;
+        // No session is in flight anymore; the next one may pick a different profile (see
+        // `start_session_for`), so there is no binding to speak of until it does.
+        ctx.active_binding = None;
     }
 }
 
@@ -550,13 +626,17 @@ fn start_capture(ctx: &mut WorkerCtx) {
         .silence
         .map(|hold| SilenceDetector::new(ctx.vad_sensitivity, hold));
 
-    let initial_prompt = if ctx.dictionary_terms.is_empty() {
+    let (language, dictionary_terms) = {
+        let deps = active_profile(ctx);
+        (deps.language.clone(), deps.dictionary_terms.clone())
+    };
+    let initial_prompt = if dictionary_terms.is_empty() {
         None
     } else {
-        Some(ctx.dictionary_terms.join(", "))
+        Some(dictionary_terms.join(", "))
     };
     let opts = TranscribeOptions {
-        language: ctx.language.clone(),
+        language,
         initial_prompt,
     };
     // `Session` has no event for "capture failed to start" (see the module
@@ -566,7 +646,7 @@ fn start_capture(ctx: &mut WorkerCtx) {
     // no audio ever fed, `engine.finish()` on an un-begun engine is expected
     // to error, which naturally routes to `TranscriptFailed` and back to
     // `Idle` — self-healing without `Session` needing to know about it.
-    if let Err(e) = ctx.engine.begin(&opts) {
+    if let Err(e) = active_profile(ctx).engine.begin(&opts) {
         ctx.sink
             .notify("error", &format!("failed to start transcription: {e}"));
         return;
@@ -591,7 +671,7 @@ fn handle_audio_frame(session: &mut Session, ctx: &mut WorkerCtx, frame: AudioFr
     }
 
     let level = rms_level(&frame.samples);
-    let partial = match ctx.engine.feed(&frame.samples) {
+    let partial = match active_profile(ctx).engine.feed(&frame.samples) {
         Ok(partial) => partial,
         Err(e) => {
             ctx.sink
@@ -633,7 +713,7 @@ fn stop_capture_and_maybe_transcribe(session: &mut Session, ctx: &mut WorkerCtx)
     }
 
     for frame in &trailing {
-        if let Err(e) = ctx.engine.feed(&frame.samples) {
+        if let Err(e) = active_profile(ctx).engine.feed(&frame.samples) {
             ctx.sink.notify(
                 "warning",
                 &format!("speech engine error while flushing: {e}"),
@@ -641,7 +721,7 @@ fn stop_capture_and_maybe_transcribe(session: &mut Session, ctx: &mut WorkerCtx)
         }
     }
 
-    let result = ctx.engine.finish();
+    let result = active_profile(ctx).engine.finish();
 
     // Commit point 1/2 (see the module doc comment): a `Cancel` that arrived
     // any time up to and including while `finish()` was blocking must win
@@ -684,14 +764,13 @@ fn run_refine(session: &mut Session, ctx: &mut WorkerCtx, t: Transcript) {
         // The one and only refiner bypass: see the module doc comment.
         Event::RefineDone(t.text)
     } else {
-        match &ctx.refiner {
+        let (refiner, tone) = {
+            let deps = active_profile(ctx);
+            (deps.refiner.clone(), deps.tone)
+        };
+        match refiner {
             Some(refiner) => {
-                match refine_with_timeout(
-                    refiner.clone(),
-                    t.text.clone(),
-                    ctx.tone,
-                    ctx.refine_timeout,
-                ) {
+                match refine_with_timeout(refiner, t.text.clone(), tone, ctx.refine_timeout) {
                     Ok(text) => Event::RefineDone(text),
                     Err(reason) => Event::RefineFailed {
                         raw: t.text,
@@ -761,6 +840,8 @@ fn run_inject(session: &mut Session, ctx: &mut WorkerCtx, text: String) {
 }
 
 fn record_history(ctx: &mut WorkerCtx, final_text: &str) {
+    let engine_label = active_profile(ctx).engine_label.clone();
+
     let (Some(history), Some(pending)) = (&ctx.history, &ctx.pending) else {
         return;
     };
@@ -772,7 +853,7 @@ fn record_history(ctx: &mut WorkerCtx, final_text: &str) {
 
     let entry = NewEntry {
         duration_ms,
-        engine: ctx.engine_label.clone(),
+        engine: engine_label,
         raw_text: pending.raw.clone(),
         final_text: final_text.to_string(),
         app: None,
@@ -791,7 +872,14 @@ fn record_history(ctx: &mut WorkerCtx, final_text: &str) {
 /// sensible for a single button to do mid-pipeline.
 fn handle_toggle(session: &mut Session, ctx: &mut WorkerCtx) {
     match session.state() {
-        State::Idle => dispatch(session, ctx, Event::HotkeyPressed),
+        State::Idle => {
+            // A UI-triggered toggle (tray menu, HUD button) carries no hotkey binding of its
+            // own, so it always starts the default profile's session -- binding 0, the same
+            // profile `ProfileRegistry::new` eagerly loads at boot (see its doc comment).
+            if start_session_for(session, ctx, BindingId::from(0)) {
+                dispatch(session, ctx, Event::HotkeyPressed);
+            }
+        }
         State::Recording => {
             let event = match ctx.mode {
                 DictationMode::Toggle => Event::HotkeyPressed,
@@ -806,10 +894,15 @@ fn handle_toggle(session: &mut Session, ctx: &mut WorkerCtx) {
 /// Applies reloaded dependencies. If a session is recording, it is
 /// cancelled first (see [`RuntimeHandle::reload`]'s doc comment for why);
 /// by the time `ctx.apply` runs, the session is always idle.
+///
+/// `session` is reset to a placeholder here, the same way `worker_loop` seeds its very first
+/// one: `refine_enabled` is per-profile now, so there is no single value to give `Session::new`
+/// until the next press picks a binding and `start_session_for` reconstructs it for real (see
+/// that function's doc comment).
 fn reload(session: &mut Session, ctx: &mut WorkerCtx, new_deps: RuntimeDeps) {
     if session.state() == State::Recording {
         dispatch(session, ctx, Event::CancelRequested);
     }
-    *session = Session::new(new_deps.mode, new_deps.refine_enabled);
+    *session = Session::new(new_deps.mode, false);
     ctx.apply(new_deps);
 }

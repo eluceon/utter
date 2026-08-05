@@ -10,13 +10,15 @@
 use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 
+use utter_core::Tone;
+use utter_refine::Snippet;
+
 use crate::error::MigrateError;
 use crate::profile::{LanguageProfile, RefinePolicy};
 use crate::settings::{
     Advanced, CloudSttCfg, Dictation, Dictionary, EngineCfg, EngineKind, General, HistoryCfg,
     RefineCfg, Settings,
 };
-use utter_refine::Snippet;
 
 /// The catalog id a v0.1 Russian vosk model (`vosk-model-small-ru-*`) is
 /// migrated to.
@@ -68,7 +70,12 @@ pub fn migrate_v1(raw: &str) -> Result<Settings, MigrateError> {
         general: v1.general,
         dictation: v1.dictation,
         engine,
-        refine: v1.refine,
+        refine: RefineCfg {
+            enabled: v1.refine.enabled,
+            base_url: v1.refine.base_url,
+            model: v1.refine.model,
+            timeout_secs: v1.refine.timeout_secs,
+        },
         dictionary: v1.dictionary,
         snippets: v1.snippets,
         history: v1.history,
@@ -185,23 +192,50 @@ fn sherpa_model_for_language(language: &str) -> &'static str {
 
 /// The subset of a v0.1 document this migration reads.
 ///
-/// Every field other than `engine` kept the same shape from v0.1 to v0.2, so
-/// this borrows those types directly from [`crate::settings`] and
-/// [`utter_refine`]. Only `engine` differs: v0.1 named its local-model field
-/// `vosk_model` where v0.2 has `sherpa_model`, and v0.1's `active` could name
-/// an engine (`"vosk"`) this build's [`EngineKind`] no longer defines —
-/// [`V1EngineCfg::active`] is read as a plain string for exactly that reason.
+/// Every field other than `engine`/`refine` kept the same shape from v0.1 to v0.2, so this
+/// borrows those types directly from [`crate::settings`] and [`utter_refine`]. `engine` differs
+/// because v0.1 named its local-model field `vosk_model` where v0.2 has `sherpa_model`, and
+/// v0.1's `active` could name an engine (`"vosk"`) this build's [`EngineKind`] no longer defines
+/// — [`V1EngineCfg::active`] is read as a plain string for exactly that reason. `refine` differs
+/// because v0.1's `[refine]` table had a `tone` key that [`crate::settings::RefineCfg`] dropped
+/// once `tone` became purely a per-profile setting (Task 16 of the v0.2 plan) — this is the last
+/// place that value needs reading, to seed the migrated profile's own [`RefinePolicy::tone`].
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct V1Settings {
     general: General,
     dictation: Dictation,
     engine: V1EngineCfg,
-    refine: RefineCfg,
+    refine: V1RefineCfg,
     dictionary: Dictionary,
     snippets: Vec<Snippet>,
     history: HistoryCfg,
     advanced: Advanced,
+}
+
+/// A v0.1 `[refine]` table: the one other section whose shape changed before v0.2 (see
+/// [`V1Settings`]'s doc comment). Cannot reuse [`crate::settings::RefineCfg`] the way every
+/// unchanged section does, since that type no longer has a `tone` field.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct V1RefineCfg {
+    enabled: bool,
+    tone: Tone,
+    base_url: String,
+    model: String,
+    timeout_secs: u64,
+}
+
+impl Default for V1RefineCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tone: Tone::Clean,
+            base_url: "http://localhost:11434/v1".to_string(),
+            model: "llama3.2".to_string(),
+            timeout_secs: 10,
+        }
+    }
 }
 
 /// A v0.1 `[engine]` table: the one section whose shape changed before v0.2.

@@ -153,7 +153,12 @@ impl ProfileLoader for RealProfileLoader {
             refiner,
             refine_enabled,
             tone: profile.refine.tone,
-            language: Some(profile.language.clone()),
+            // A blank language (the shape `Profiles.svelte`'s free `TextInput` produces for a
+            // newly added profile, or one the user simply cleared) must reach the engine as
+            // `None`, its auto-detect value -- not as `Some("")`, which `cloud.rs` sends
+            // verbatim as a rejected empty form field and `whisper.rs` treats as a real
+            // (nonsensical) language rather than the `None`-means-auto path.
+            language: (!profile.language.trim().is_empty()).then(|| profile.language.clone()),
             engine_label: engine_label(profile.engine.active).to_string(),
             profile_id: profile.id.clone(),
             dictionary_terms: self.dictionary_terms.clone(),
@@ -655,6 +660,31 @@ mod tests {
         assert_eq!(
             deps.profile_id, "default",
             "the profile's own id must reach ProfileDeps, not be left blank"
+        );
+    }
+
+    /// A blank language -- the shape `Profiles.svelte`'s free `TextInput` produces for a newly
+    /// added profile -- must reach `ProfileDeps` as `None` (auto-detect), not `Some("")`. The
+    /// test above only ever exercises a real language tag and would not notice a missing
+    /// normalisation step.
+    #[test]
+    fn a_blank_profile_language_reaches_deps_as_none() {
+        let loader = RealProfileLoader::new(
+            Arc::new(ModelManager::new(PathBuf::from("/nonexistent"))),
+            RefineCfg::default(),
+            Vec::new(),
+        );
+
+        let profile = LanguageProfile {
+            language: String::new(),
+            ..LanguageProfile::default()
+        };
+
+        let (deps, _notices) = loader.load(&profile);
+
+        assert_eq!(
+            deps.language, None,
+            "a blank language must normalise to None (auto-detect), not Some(\"\")"
         );
     }
 }

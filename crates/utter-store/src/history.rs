@@ -168,8 +168,8 @@ impl HistoryRepo {
 /// `user_version` by exactly one, so an existing user's database — which already has the v1
 /// table — takes only the v1-to-v2 `ALTER TABLE` step rather than a `CREATE TABLE IF NOT EXISTS`
 /// that would silently no-op and leave the new column missing while still marking the database as
-/// current. See the "hazard" note in the v0.2 plan's Task 17 for why a single-step bump of
-/// `SCHEMA_VERSION` is unsafe here.
+/// current. See `migrating_a_real_v1_database_preserves_data_and_adds_profile_id` below for why a
+/// single-step bump of `SCHEMA_VERSION` is unsafe here.
 fn migrate(conn: &Connection) -> Result<()> {
     loop {
         let user_version: i64 = conn
@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(user_version, SCHEMA_VERSION);
     }
 
-    /// Pins the migration hazard the v0.2 plan's Task 17 calls out by name: a real user's
+    /// Pins the migration hazard a single-step schema bump would hide: a real user's
     /// database is never fresh, it already has the v1 `history` table, so a migration written as
     /// a single `CREATE TABLE IF NOT EXISTS` bumped straight to `SCHEMA_VERSION` would no-op on
     /// the `CREATE TABLE`, never add the new column, and still mark the database current. A test

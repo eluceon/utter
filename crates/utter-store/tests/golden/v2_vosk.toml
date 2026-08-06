@@ -5,8 +5,8 @@
 # left over from before the user switched engines. `whisper_model` and
 # `cloud` are NOT reset: neither is specific to vosk, both configure engines
 # the user can still switch to independently, and both survive migration
-# unchanged from v1_vosk.toml. The hotkey moved off `[dictation]` entirely
-# (Task 17c): it now lives only on the profile.
+# unchanged from v1_vosk.toml. The hotkey moved off `[dictation]` entirely:
+# it now lives only on the profile.
 
 [general]
 language = "en"

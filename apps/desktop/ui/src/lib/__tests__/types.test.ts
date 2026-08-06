@@ -60,8 +60,7 @@ describe('Settings type/JSON round-trip', () => {
       // Two profiles (the normal bilingual case) with every field set to a
       // non-default value, including two profiles that both sit on the
       // sherpa engine — the case `ProfileDeps.engine_label` alone cannot
-      // distinguish (see the "Amended 2026-08-04" note on Task 17 in the
-      // v0.2 plan), so the wire contract needs `id` to survive intact for
+      // distinguish, so the wire contract needs `id` to survive intact for
       // each.
       profiles: [
         {

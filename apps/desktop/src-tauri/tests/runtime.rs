@@ -1218,8 +1218,9 @@ fn silence_timeout_stops_recording_without_hotkey_release() {
     handle.shutdown();
 }
 
-/// Pins the whole point of Task 16: which profile a press resolves to must actually be driven by
-/// its `BindingId`, not just "whichever engine happened to load first". The two profiles are
+/// Pins the whole point of per-profile routing: which profile a press resolves to must actually
+/// be driven by its `BindingId`, not just "whichever engine happened to load first". The two
+/// profiles are
 /// deliberately given *different* output text (Russian vs. English) rather than the same text --
 /// a routing bug that always used binding 0's profile, or that shared one `Session`/engine across
 /// bindings, would still pass a test whose profiles produced identical text. Both directions are

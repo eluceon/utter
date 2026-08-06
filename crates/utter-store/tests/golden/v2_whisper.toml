@@ -1,7 +1,7 @@
 # The expected result of migrating v1_whisper.toml. whisper.cpp was never
 # removed, so the engine section carries across unchanged; it is mirrored
 # into the one profile the migration creates. The hotkey moved off
-# `[dictation]` entirely (Task 17c): it now lives only on the profile.
+# `[dictation]` entirely: it now lives only on the profile.
 
 [general]
 language = "en"

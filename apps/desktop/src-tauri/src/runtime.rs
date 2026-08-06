@@ -560,7 +560,7 @@ fn handle_hotkey_pressed(session: &mut Session, ctx: &mut WorkerCtx, binding: Bi
 /// speaks into a stopped microphone) and `cancel`/`toggle`/`reload`/`shutdown` all just queue on
 /// `control_rx` (and since `RuntimeHandle::drop` joins the worker, quitting the app hangs behind
 /// an unanswered keyring dialog). Bounding this — loading off the worker thread, or a timeout
-/// around the keyring call — is its own task; Task 16 (this one) inherits the hazard rather than
+/// around the keyring call — is its own follow-up; this change inherits the hazard rather than
 /// introducing it, since the same calls already blocked boot, but moves it from a one-time,
 /// visible startup cost to a per-press, invisible one.
 fn start_session_for(session: &mut Session, ctx: &mut WorkerCtx, binding: BindingId) -> bool {

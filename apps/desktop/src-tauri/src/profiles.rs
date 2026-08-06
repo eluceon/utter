@@ -45,9 +45,10 @@ use crate::runtime_boot::{build_engine, build_refiner, engine_label, QueuedNotic
 /// The per-profile slice of what a dictation session needs: everything
 /// [`crate::runtime::RuntimeDeps`] does *not* already own once and share
 /// across every profile (the hotkey receiver, history connection, capture
-/// backend, injector, ...). See the "Amended 2026-08-04" note on Task 15 in
-/// the v0.2 plan for why this is a separate type rather than one
-/// `RuntimeDeps` per profile.
+/// backend, injector, ...). Kept as its own type rather than folded into a
+/// full `RuntimeDeps` per profile: those shared pieces exist exactly once
+/// for the whole runtime and would have nowhere sensible to live if
+/// duplicated per profile.
 pub struct ProfileDeps {
     pub engine: Box<dyn SttEngine>,
     /// `Arc` rather than `Box`: `ProfileRegistry` caches a profile's `ProfileDeps` forever once
@@ -64,7 +65,7 @@ pub struct ProfileDeps {
     /// [`LanguageProfile::id`] of the profile these deps were built from. Recorded on each
     /// history entry alongside `engine_label` so two profiles on the same engine kind — the
     /// normal bilingual case, both on sherpa — can still be told apart; `engine_label` alone
-    /// cannot do that (see the "Amended 2026-08-04" note on Task 17 in the v0.2 plan).
+    /// cannot do that.
     pub profile_id: String,
     pub dictionary_terms: Vec<String>,
 }
@@ -76,7 +77,7 @@ pub struct ProfileDeps {
 /// production implementation is [`RealProfileLoader`].
 ///
 /// `Send` because [`ProfileRegistry`] is destined to live on the dictation
-/// worker thread (Task 16), so whatever it holds must be movable there.
+/// worker thread, so whatever it holds must be movable there.
 pub trait ProfileLoader: Send {
     fn load(&self, profile: &LanguageProfile) -> (ProfileDeps, Vec<QueuedNotice>);
 }
@@ -178,7 +179,7 @@ struct Entry {
 /// building them lazily on first use — see the module doc comment.
 ///
 /// [`BindingId`]s are assigned by position in the `profiles` list `new` was
-/// given, the same order Task 16 registers their chords in via
+/// given, the same order their chords are registered in via
 /// `utter_inject::create_source`, so a binding's index here always lines up
 /// with the id `create_source` hands back for it.
 ///
@@ -191,9 +192,8 @@ struct Entry {
 /// rebuilt, and rebuilding throws away *every* lazily-loaded engine —
 /// hundreds of MB, potentially — and re-pays the eager default-profile
 /// load. `runtime_boot::build_deps` is where that recreate happens and
-/// documents the decision to accept it (Task 16 of the v0.2 plan): parity
-/// with the pre-profiles boot path, bounded by the same laziness this type
-/// already provides.
+/// documents the decision to accept it: parity with the pre-profiles boot
+/// path, bounded by the same laziness this type already provides.
 pub struct ProfileRegistry {
     loader: Box<dyn ProfileLoader>,
     entries: Vec<Entry>,
@@ -220,12 +220,12 @@ impl ProfileRegistry {
     /// with an unparseable chord (`""`, `"ctrl+"`, a typo'd key name) still
     /// makes `new` return a non-empty, notice-free registry — every
     /// `deps_for` call on it would succeed — but if the caller building the
-    /// hotkey source (Task 16) drops chords `parse_hotkey` rejects, that
-    /// profile's binding is never registered and its hotkey does nothing,
-    /// silently. Only the caller doing that parsing can catch it; this
-    /// module only ever sees `LanguageProfile`s, never their hotkey strings'
-    /// validity. `runtime_boot::parse_profile_hotkeys` is the caller that
-    /// does this parsing (Task 16 of the v0.2 plan) and reports the notice.
+    /// hotkey source drops chords `parse_hotkey` rejects, that profile's
+    /// binding is never registered and its hotkey does nothing, silently.
+    /// Only the caller doing that parsing can catch it; this module only
+    /// ever sees `LanguageProfile`s, never their hotkey strings' validity.
+    /// `runtime_boot::parse_profile_hotkeys` is the caller that does this
+    /// parsing and reports the notice.
     pub fn new(
         profiles: Vec<LanguageProfile>,
         loader: Box<dyn ProfileLoader>,

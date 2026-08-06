@@ -384,8 +384,8 @@ pub async fn test_refine(app: AppHandle, sample: String) -> Result<String, Strin
 
         // `test_refine` validates connectivity/credentials with a scratch sample, independent of
         // any particular profile -- `Tone` no longer has a global setting to read (it moved to
-        // `RefinePolicy::tone`, Task 16 of the v0.2 plan), so this always previews with `Clean`,
-        // the same value both `RefineCfg` and `RefinePolicy` used to default to.
+        // `RefinePolicy::tone`, one profile at a time), so this always previews with `Clean`, the
+        // same value both `RefineCfg` and `RefinePolicy` used to default to.
         TextRefiner::refine(&refiner, &sample, Tone::Clean)
             .map_err(|e| format!("refine failed: {e}"))
     })

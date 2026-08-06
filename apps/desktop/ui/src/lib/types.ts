@@ -50,8 +50,8 @@ export interface EngineCfg {
 }
 
 /** `crates/utter-store/src/settings.rs::RefineCfg`. Master switch plus the
- * provider connection only — `tone` moved to `RefinePolicy.tone` (Task 16),
- * one profile at a time rather than one global setting. */
+ * provider connection only — `tone` moved to `RefinePolicy.tone`, set one
+ * profile at a time rather than as one global setting. */
 export interface RefineCfg {
   enabled: boolean
   base_url: string
@@ -123,7 +123,7 @@ export interface Settings {
   history: HistoryCfg
   advanced: Advanced
   /** One entry per language the user dictates in, each binding a hotkey to
-   * an engine, a model and a refinement policy. Carried since Task 13;
+   * an engine, a model and a refinement policy.
    * `defaultSettings()` below MUST seed exactly the one profile
    * `Settings::default()` does — `App.svelte`'s onboarding gate compares a
    * freshly loaded `Settings` against this function's output key-for-key

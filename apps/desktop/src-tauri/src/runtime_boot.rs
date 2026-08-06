@@ -168,8 +168,7 @@ fn build_deps(
         notices.push(("warning", msg));
     }
 
-    // D-A (see docs/superpowers/plans/2026-07-26-utter-v0.2.md, Task 16's "Amended
-    // 2026-08-04"): every call to `build_deps` -- at boot, and again on every settings save via
+    // Every call to `build_deps` -- at boot, and again on every settings save via
     // `rebuild` -- constructs a brand new `ProfileRegistry`, discarding whatever engines a
     // previous one had already lazily loaded. That looks expensive, but it is parity with
     // today: this function already rebuilt the single engine on every `rebuild` before profiles
@@ -222,7 +221,7 @@ fn build_deps(
 /// -- is what keeps that alignment from drifting the moment any profile's hotkey fails to
 /// parse: dropping a spec without also dropping its profile (or vice versa) would silently
 /// shift every id after it, and the symptom is the user dictating in the wrong language with a
-/// green test suite (Task 16 of the v0.2 plan, "Amended 2026-08-04", item 1).
+/// green test suite.
 ///
 /// A profile whose hotkey is unparseable (nothing validates [`LanguageProfile::hotkey`] at
 /// settings load) is dropped from both lists and reported as a `"warning"` notice naming it --
@@ -654,12 +653,12 @@ mod tests {
         assert!(notices.is_empty());
     }
 
-    /// The bad chord sits in the *middle* of the list on purpose (Task 16 of the v0.2 plan,
-    /// "Amended 2026-08-04", item 1): the naive `filter_map` implementation this guards against
-    /// still gets index 0 right, so a fixture that only ever puts the bad hotkey last or first
-    /// would not catch a positional-drift regression. `kept[1]` must be `"en"` (not `"de"`,
-    /// which would be the result of `specs`/`kept` drifting out of lockstep), pinning that a
-    /// dropped profile is dropped from *both* lists at once, keeping every id after it aligned.
+    /// The bad chord sits in the *middle* of the list on purpose: the naive `filter_map`
+    /// implementation this guards against still gets index 0 right, so a fixture that only ever
+    /// puts the bad hotkey last or first would not catch a positional-drift regression. `kept[1]`
+    /// must be `"en"` (not `"de"`, which would be the result of `specs`/`kept` drifting out of
+    /// lockstep), pinning that a dropped profile is dropped from *both* lists at once, keeping
+    /// every id after it aligned.
     #[test]
     fn parse_profile_hotkeys_drops_a_bad_chord_in_the_middle_without_shifting_the_rest() {
         let profiles = vec![

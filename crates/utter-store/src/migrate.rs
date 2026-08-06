@@ -198,15 +198,15 @@ fn sherpa_model_for_language(language: &str) -> &'static str {
 /// Every field other than `dictation`/`engine`/`refine` kept the same shape from v0.1 to v0.2, so
 /// this borrows those types directly from [`crate::settings`] and [`utter_refine`]. `dictation`
 /// differs because v0.1's `[dictation]` table had a `hotkey` key that
-/// [`crate::settings::Dictation`] dropped once the hotkey became a per-profile setting (Task 17c
-/// of the v0.2 plan) — this is the last place that value needs reading, to seed the migrated
-/// profile's own [`LanguageProfile::hotkey`]. `engine` differs because v0.1 named its local-model
-/// field `vosk_model` where v0.2 has `sherpa_model`, and v0.1's `active` could name an engine
+/// [`crate::settings::Dictation`] dropped once the hotkey became a per-profile setting — this is
+/// the last place that value needs reading, to seed the migrated profile's own
+/// [`LanguageProfile::hotkey`]. `engine` differs because v0.1 named its local-model field
+/// `vosk_model` where v0.2 has `sherpa_model`, and v0.1's `active` could name an engine
 /// (`"vosk"`) this build's [`EngineKind`] no longer defines — [`V1EngineCfg::active`] is read as a
 /// plain string for exactly that reason. `refine` differs because v0.1's `[refine]` table had a
 /// `tone` key that [`crate::settings::RefineCfg`] dropped once `tone` became purely a per-profile
-/// setting (Task 16 of the v0.2 plan) — this is the last place that value needs reading, to seed
-/// the migrated profile's own [`RefinePolicy::tone`].
+/// setting — this is the last place that value needs reading, to seed the migrated profile's own
+/// [`RefinePolicy::tone`].
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct V1Settings {

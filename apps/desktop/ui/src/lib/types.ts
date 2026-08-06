@@ -26,10 +26,11 @@ export interface General {
   autostart: boolean
 }
 
-/** `crates/utter-store/src/settings.rs::Dictation` */
+/** `crates/utter-store/src/settings.rs::Dictation`. The hotkey that triggers
+ * dictation lives on each `LanguageProfile` instead — see
+ * `LanguageProfile.hotkey`. */
 export interface Dictation {
   mode: DictationMode
-  hotkey: string
   silence_timeout_secs: number | null
   hud: boolean
 }
@@ -116,7 +117,6 @@ export interface Advanced {
 export interface Settings {
   general: General
   dictation: Dictation
-  engine: EngineCfg
   refine: RefineCfg
   dictionary: Dictionary
   snippets: Snippet[]
@@ -142,18 +142,8 @@ export function defaultSettings(): Settings {
     },
     dictation: {
       mode: 'push_to_talk',
-      hotkey: 'ctrl+super',
       silence_timeout_secs: null,
       hud: true,
-    },
-    engine: {
-      active: 'whisper',
-      whisper_model: 'small',
-      sherpa_model: null,
-      cloud: {
-        base_url: 'https://api.openai.com/v1',
-        model: 'whisper-1',
-      },
     },
     refine: {
       enabled: false,

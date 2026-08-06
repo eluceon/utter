@@ -8,7 +8,9 @@
 # values (unlike v1_whisper.toml's, which happen to equal CloudSttCfg's
 # defaults): a migration that discards them and one that preserves them
 # would otherwise produce identical output, so a fixture at the defaults
-# cannot prove either field survived.
+# cannot prove either field survived. `[dictation].hotkey` is likewise
+# deliberately non-default and distinct from v1_whisper.toml's, for the same
+# reason.
 
 [general]
 language = "en"
@@ -17,7 +19,7 @@ autostart = true
 
 [dictation]
 mode = "toggle"
-hotkey = "ctrl+super"
+hotkey = "ctrl+shift+r"
 silence_timeout_secs = 45
 hud = true
 

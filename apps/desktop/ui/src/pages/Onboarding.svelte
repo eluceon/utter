@@ -197,8 +197,11 @@
       <p class="muted">Pick the key combination that starts/stops dictation.</p>
       <HotkeyPicker
         bind:value={
-          () => settings.dictation.hotkey,
-          (v) => settingsStore.patch({ dictation: { hotkey: v } })
+          () => settings.profiles[0].hotkey,
+          (v) =>
+            settingsStore.patch({
+              profiles: settings.profiles.map((p, i) => (i === 0 ? { ...p, hotkey: v } : p)),
+            })
         }
       />
     {:else if step === 4}

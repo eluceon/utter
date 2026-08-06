@@ -10,7 +10,7 @@
 use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 
-use utter_core::Tone;
+use utter_core::{DictationMode, Tone};
 use utter_refine::Snippet;
 
 use crate::error::MigrateError;
@@ -58,7 +58,7 @@ pub fn migrate_v1(raw: &str) -> Result<Settings, MigrateError> {
         id: "default".to_string(),
         hotkey,
         language,
-        engine: engine.clone(),
+        engine,
         draft: None,
         refine: RefinePolicy {
             enabled: v1.refine.enabled,
@@ -68,8 +68,11 @@ pub fn migrate_v1(raw: &str) -> Result<Settings, MigrateError> {
 
     Ok(Settings {
         general: v1.general,
-        dictation: v1.dictation,
-        engine,
+        dictation: Dictation {
+            mode: v1.dictation.mode,
+            silence_timeout_secs: v1.dictation.silence_timeout_secs,
+            hud: v1.dictation.hud,
+        },
         refine: RefineCfg {
             enabled: v1.refine.enabled,
             base_url: v1.refine.base_url,
@@ -192,25 +195,53 @@ fn sherpa_model_for_language(language: &str) -> &'static str {
 
 /// The subset of a v0.1 document this migration reads.
 ///
-/// Every field other than `engine`/`refine` kept the same shape from v0.1 to v0.2, so this
-/// borrows those types directly from [`crate::settings`] and [`utter_refine`]. `engine` differs
-/// because v0.1 named its local-model field `vosk_model` where v0.2 has `sherpa_model`, and
-/// v0.1's `active` could name an engine (`"vosk"`) this build's [`EngineKind`] no longer defines
-/// — [`V1EngineCfg::active`] is read as a plain string for exactly that reason. `refine` differs
-/// because v0.1's `[refine]` table had a `tone` key that [`crate::settings::RefineCfg`] dropped
-/// once `tone` became purely a per-profile setting (Task 16 of the v0.2 plan) — this is the last
-/// place that value needs reading, to seed the migrated profile's own [`RefinePolicy::tone`].
+/// Every field other than `dictation`/`engine`/`refine` kept the same shape from v0.1 to v0.2, so
+/// this borrows those types directly from [`crate::settings`] and [`utter_refine`]. `dictation`
+/// differs because v0.1's `[dictation]` table had a `hotkey` key that
+/// [`crate::settings::Dictation`] dropped once the hotkey became a per-profile setting (Task 17c
+/// of the v0.2 plan) — this is the last place that value needs reading, to seed the migrated
+/// profile's own [`LanguageProfile::hotkey`]. `engine` differs because v0.1 named its local-model
+/// field `vosk_model` where v0.2 has `sherpa_model`, and v0.1's `active` could name an engine
+/// (`"vosk"`) this build's [`EngineKind`] no longer defines — [`V1EngineCfg::active`] is read as a
+/// plain string for exactly that reason. `refine` differs because v0.1's `[refine]` table had a
+/// `tone` key that [`crate::settings::RefineCfg`] dropped once `tone` became purely a per-profile
+/// setting (Task 16 of the v0.2 plan) — this is the last place that value needs reading, to seed
+/// the migrated profile's own [`RefinePolicy::tone`].
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct V1Settings {
     general: General,
-    dictation: Dictation,
+    dictation: V1Dictation,
     engine: V1EngineCfg,
     refine: V1RefineCfg,
     dictionary: Dictionary,
     snippets: Vec<Snippet>,
     history: HistoryCfg,
     advanced: Advanced,
+}
+
+/// A v0.1 `[dictation]` table: the one other section whose shape changed before v0.2 (see
+/// [`V1Settings`]'s doc comment). Cannot reuse [`crate::settings::Dictation`] the way every
+/// unchanged section does, since that type no longer has a `hotkey` field — the hotkey moved to
+/// [`LanguageProfile::hotkey`](crate::profile::LanguageProfile::hotkey).
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct V1Dictation {
+    mode: DictationMode,
+    hotkey: String,
+    silence_timeout_secs: Option<u32>,
+    hud: bool,
+}
+
+impl Default for V1Dictation {
+    fn default() -> Self {
+        Self {
+            mode: DictationMode::PushToTalk,
+            hotkey: "ctrl+super".to_string(),
+            silence_timeout_secs: None,
+            hud: true,
+        }
+    }
 }
 
 /// A v0.1 `[refine]` table: the one other section whose shape changed before v0.2 (see
@@ -271,7 +302,7 @@ mod tests {
         assert_eq!(migrated.profiles.len(), 1);
         let profile = &migrated.profiles[0];
         assert_eq!(
-            profile.hotkey, "ctrl+super",
+            profile.hotkey, "ctrl+alt+space",
             "the user's hotkey must survive"
         );
         assert_eq!(profile.engine.whisper_model, "large-v3-turbo-q5_0");

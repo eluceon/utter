@@ -34,18 +34,8 @@ describe('Settings type/JSON round-trip', () => {
       },
       dictation: {
         mode: 'toggle',
-        hotkey: 'ctrl+alt+d',
         silence_timeout_secs: 5,
         hud: false,
-      },
-      engine: {
-        active: 'cloud',
-        whisper_model: 'medium',
-        sherpa_model: 'gigaam-v3-e2e-rnnt',
-        cloud: {
-          base_url: 'https://api.groq.com/openai/v1',
-          model: 'whisper-large-v3',
-        },
       },
       refine: {
         enabled: true,
@@ -132,13 +122,7 @@ describe('defaultSettings', () => {
   it('matches Settings::default() field-for-field, including its one seeded profile', () => {
     const expected = {
       general: { language: null, theme: 'system', autostart: false },
-      dictation: { mode: 'push_to_talk', hotkey: 'ctrl+super', silence_timeout_secs: null, hud: true },
-      engine: {
-        active: 'whisper',
-        whisper_model: 'small',
-        sherpa_model: null,
-        cloud: { base_url: 'https://api.openai.com/v1', model: 'whisper-1' },
-      },
+      dictation: { mode: 'push_to_talk', silence_timeout_secs: null, hud: true },
       refine: {
         enabled: false,
         base_url: 'http://localhost:11434/v1',

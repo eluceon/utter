@@ -3,13 +3,9 @@
 
   import Section from '../lib/components/Section.svelte'
   import Field from '../lib/components/Field.svelte'
-  import Select from '../lib/components/Select.svelte'
   import TextInput from '../lib/components/TextInput.svelte'
   import * as api from '../lib/api'
-  import { settingsStore } from '../lib/stores'
-  import type { EngineKind, ModelInfo } from '../lib/types'
-
-  let settings = $derived($settingsStore!)
+  import type { ModelInfo } from '../lib/types'
 
   let models = $state<ModelInfo[]>([])
   let modelsError = $state('')
@@ -20,19 +16,8 @@
   let sttKeyJustSaved = $state(false)
   let sttKeyError = $state('')
 
-  const ENGINE_OPTIONS: { value: EngineKind; label: string }[] = [
-    { value: 'whisper', label: 'Whisper (local)' },
-    { value: 'sherpa', label: 'Sherpa-onnx (local)' },
-    { value: 'cloud', label: 'Cloud (OpenAI-compatible)' },
-  ]
-
   let whisperModels = $derived(models.filter((m) => m.engine === 'whisper'))
   let sherpaModels = $derived(models.filter((m) => m.engine === 'sherpa'))
-  let sherpaOptions = $derived([
-    { value: '', label: 'None selected' },
-    ...sherpaModels.map((m) => ({ value: m.id, label: m.label })),
-  ])
-  let whisperOptions = $derived(whisperModels.map((m) => ({ value: m.id, label: m.label })))
 
   let unlisten: (() => void) | undefined
 
@@ -122,33 +107,10 @@
   }
 </script>
 
-<Section title="Engines" description="Which speech-to-text engine transcribes your dictation.">
-  <Field label="Active engine" for="active-engine">
-    <Select
-      id="active-engine"
-      options={ENGINE_OPTIONS}
-      bind:value={
-        () => settings.engine.active,
-        (v) => settingsStore.patch({ engine: { active: v as EngineKind } })
-      }
-    />
-  </Field>
-</Section>
-
-<Section title="Whisper models" description="Runs fully offline. Larger models are more accurate but slower.">
+<Section title="Whisper models" description="Runs fully offline. Larger models are more accurate but slower. Which model a profile uses is set on the Profiles page.">
   {#if modelsError}
     <p class="error">{modelsError}</p>
   {/if}
-  <Field label="Active model" for="whisper-model">
-    <Select
-      id="whisper-model"
-      options={whisperOptions}
-      bind:value={
-        () => settings.engine.whisper_model,
-        (v) => settingsStore.patch({ engine: { whisper_model: v } })
-      }
-    />
-  </Field>
   <ul class="model-list">
     {#each whisperModels as model (model.id)}
       <li>
@@ -181,16 +143,6 @@
 </Section>
 
 <Section title="Sherpa-onnx models" description="Offline transducer models, one per language, that emit punctuation directly and bias recognition towards your dictionary terms.">
-  <Field label="Active model" for="sherpa-model">
-    <Select
-      id="sherpa-model"
-      options={sherpaOptions}
-      bind:value={
-        () => settings.engine.sherpa_model ?? '',
-        (v) => settingsStore.patch({ engine: { sherpa_model: v === '' ? null : v } })
-      }
-    />
-  </Field>
   <ul class="model-list">
     {#each sherpaModels as model (model.id)}
       <li>
@@ -222,28 +174,7 @@
   </ul>
 </Section>
 
-<Section title="Cloud engine" description="An OpenAI-compatible speech-to-text endpoint.">
-  <Field label="Base URL" for="cloud-stt-url">
-    <TextInput
-      id="cloud-stt-url"
-      type="url"
-      placeholder="https://api.openai.com/v1"
-      bind:value={
-        () => settings.engine.cloud.base_url,
-        (v) => settingsStore.patch({ engine: { cloud: { base_url: v } } })
-      }
-    />
-  </Field>
-  <Field label="Model" for="cloud-stt-model">
-    <TextInput
-      id="cloud-stt-model"
-      placeholder="whisper-1"
-      bind:value={
-        () => settings.engine.cloud.model,
-        (v) => settingsStore.patch({ engine: { cloud: { model: v } } })
-      }
-    />
-  </Field>
+<Section title="Cloud engine" description="Credentials for an OpenAI-compatible speech-to-text endpoint. The base URL and model are set per profile on the Profiles page.">
   <Field label="API key" for="cloud-stt-key">
     <div class="key-row">
       <TextInput id="cloud-stt-key" type="password" placeholder="sk-…" bind:value={() => sttApiKey, (v) => (sttApiKey = v)} />

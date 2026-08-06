@@ -6,7 +6,10 @@
 # `[engine.cloud]` is deliberately non-default (and distinct from
 # v1_vosk.toml's own non-default values, so the two fixtures cannot be
 # confused with one another): a migration that dropped it and one that
-# preserved it would otherwise produce identical output.
+# preserved it would otherwise produce identical output. `[dictation].hotkey`
+# is likewise deliberately not "ctrl+super" (the default a fresh profile
+# seeds): a migration that ignored v0.1's hotkey and fell back to the default
+# would otherwise pass this fixture by coincidence.
 
 [general]
 language = "en"
@@ -15,7 +18,7 @@ autostart = true
 
 [dictation]
 mode = "toggle"
-hotkey = "ctrl+super"
+hotkey = "ctrl+alt+space"
 silence_timeout_secs = 45
 hud = true
 

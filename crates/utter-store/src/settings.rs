@@ -21,7 +21,6 @@ use crate::profile::{LanguageProfile, RefinePolicy};
 pub struct Settings {
     pub general: General,
     pub dictation: Dictation,
-    pub engine: EngineCfg,
     pub refine: RefineCfg,
     pub dictionary: Dictionary,
     pub snippets: Vec<Snippet>,
@@ -41,7 +40,6 @@ impl Default for Settings {
         Self {
             general: General::default(),
             dictation: Dictation::default(),
-            engine: EngineCfg::default(),
             refine: RefineCfg::default(),
             dictionary: Dictionary::default(),
             snippets: Vec::new(),
@@ -49,7 +47,7 @@ impl Default for Settings {
             advanced: Advanced::default(),
             profiles: vec![LanguageProfile {
                 id: "default".to_string(),
-                hotkey: Dictation::default().hotkey,
+                hotkey: "ctrl+super".to_string(),
                 language: "en".to_string(),
                 engine: EngineCfg::sherpa("parakeet-tdt-110m-en"),
                 draft: None,
@@ -94,12 +92,14 @@ pub enum Theme {
     Dark,
 }
 
-/// Dictation hotkey and recording behavior.
+/// Dictation recording behavior. The hotkey that triggers it lives on each
+/// [`LanguageProfile`](crate::profile::LanguageProfile) instead, one chord
+/// per language rather than one global chord — see
+/// [`LanguageProfile::hotkey`](crate::profile::LanguageProfile::hotkey).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Dictation {
     pub mode: DictationMode,
-    pub hotkey: String,
     pub silence_timeout_secs: Option<u32>,
     pub hud: bool,
 }
@@ -108,7 +108,6 @@ impl Default for Dictation {
     fn default() -> Self {
         Self {
             mode: DictationMode::PushToTalk,
-            hotkey: "ctrl+super".to_string(),
             silence_timeout_secs: None,
             hud: true,
         }
@@ -564,21 +563,36 @@ mod tests {
     fn loading_partial_file_fills_defaults_for_the_rest() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = config_path(dir.path());
+        // A `[[profiles]]` table matching `Settings::default()`'s own profile
+        // is included deliberately: with no `[[profiles]]` table at all, this
+        // document would read as v0.1 (see `migrate::predates_profiles`) and
+        // take the migration path instead of the plain-parse path this test
+        // means to exercise, seeding the profile from v0.1's defaults
+        // (whisper) rather than v0.2's (sherpa).
         fs::write(
             &path,
             r#"
             [dictation]
-            hotkey = "ctrl+alt+space"
+            mode = "toggle"
+
+            [[profiles]]
+            id = "default"
+            hotkey = "ctrl+super"
+            language = "en"
+
+            [profiles.engine]
+            active = "sherpa"
+            sherpa_model = "parakeet-tdt-110m-en"
             "#,
         )
         .expect("write fixture");
 
         let loaded = load(&path).expect("load should succeed");
 
-        assert_eq!(loaded.dictation.hotkey, "ctrl+alt+space");
-        assert_eq!(loaded.dictation.mode, DictationMode::PushToTalk);
+        assert_eq!(loaded.dictation.mode, DictationMode::Toggle);
+        assert_eq!(loaded.dictation.silence_timeout_secs, None);
         assert_eq!(loaded.general, General::default());
-        assert_eq!(loaded.engine, EngineCfg::default());
+        assert_eq!(loaded.profiles, Settings::default().profiles);
     }
 
     #[test]
@@ -692,16 +706,17 @@ mod tests {
 
     #[test]
     fn an_unknown_engine_name_falls_back_without_losing_other_settings() {
-        // A v0.1 config naming an engine this build no longer has. The whole
-        // document must still parse: the user's hotkey and dictionary are not
+        // A profile naming an engine this build no longer has (the shape a
+        // stale hand-edited v0.2 config, or a `[[profiles]]` table copied
+        // from an old release, could still produce). The whole document must
+        // still parse: the profile's id and the dictionary are not
         // collateral damage for one stale enum value.
         let toml = r#"
-[dictation]
-hotkey = "ctrl+alt+super"
+[[profiles]]
+id = "legacy"
 
-[engine]
+[profiles.engine]
 active = "vosk"
-vosk_model = "vosk-model-small-ru-0.22"
 
 [dictionary]
 terms = ["PostgreSQL"]
@@ -710,8 +725,8 @@ terms = ["PostgreSQL"]
         let settings: Settings =
             toml::from_str(toml).expect("an unknown engine must not fail the file");
 
-        assert_eq!(settings.engine.active, EngineKind::default());
-        assert_eq!(settings.dictation.hotkey, "ctrl+alt+super");
+        assert_eq!(settings.profiles[0].engine.active, EngineKind::default());
+        assert_eq!(settings.profiles[0].id, "legacy");
         assert_eq!(settings.dictionary.terms, vec!["PostgreSQL".to_string()]);
     }
 
@@ -719,7 +734,6 @@ terms = ["PostgreSQL"]
     fn defaults_match_documented_values() {
         let settings = Settings::default();
 
-        assert_eq!(settings.dictation.hotkey, "ctrl+super");
         assert_eq!(settings.dictation.silence_timeout_secs, None);
         assert!(settings.dictation.hud);
         assert_eq!(settings.dictation.mode, DictationMode::PushToTalk);
@@ -729,10 +743,18 @@ terms = ["PostgreSQL"]
         assert_eq!(settings.refine.base_url, "http://localhost:11434/v1");
         assert_eq!(settings.refine.model, "llama3.2");
 
-        assert_eq!(settings.engine.whisper_model, "small");
-        assert_eq!(settings.engine.active, EngineKind::Whisper);
-        assert_eq!(settings.engine.cloud.base_url, "https://api.openai.com/v1");
-        assert_eq!(settings.engine.cloud.model, "whisper-1");
+        // The hotkey and engine selection now live on the seeded profile, not
+        // on `Settings` itself — see `Dictation`'s doc comment and
+        // `EngineCfg`'s removal from `Settings`.
+        let profile = &settings.profiles[0];
+        assert_eq!(profile.hotkey, "ctrl+super");
+        assert_eq!(profile.engine.active, EngineKind::Sherpa);
+        assert_eq!(
+            profile.engine.sherpa_model.as_deref(),
+            Some("parakeet-tdt-110m-en")
+        );
+        assert_eq!(profile.engine.cloud.base_url, "https://api.openai.com/v1");
+        assert_eq!(profile.engine.cloud.model, "whisper-1");
 
         assert_eq!(settings.general.theme, Theme::System);
         assert_eq!(settings.general.language, None);

@@ -1,6 +1,7 @@
 # The expected result of migrating v1_whisper.toml. whisper.cpp was never
 # removed, so the engine section carries across unchanged; it is mirrored
-# into the one profile the migration creates.
+# into the one profile the migration creates. The hotkey moved off
+# `[dictation]` entirely (Task 17c): it now lives only on the profile.
 
 [general]
 language = "en"
@@ -9,7 +10,6 @@ autostart = true
 
 [dictation]
 mode = "toggle"
-hotkey = "ctrl+super"
 silence_timeout_secs = 45
 hud = true
 
@@ -57,7 +57,7 @@ log_level = "debug"
 
 [[profiles]]
 id = "default"
-hotkey = "ctrl+super"
+hotkey = "ctrl+alt+space"
 language = "en"
 
 [profiles.engine]

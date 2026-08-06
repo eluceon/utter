@@ -490,10 +490,13 @@ impl ChordMatcher {
 /// chord has no other way to complete than pressing its own last key.
 ///
 /// A strict subset (e.g. `ctrl+super` inside `ctrl+alt+super`) is
-/// deliberately not reported: completing the larger chord still needs a key
-/// — here, `alt` — that the smaller one doesn't require at all, so the two
-/// stay distinguishable and both remain usable. This is the pairing the
-/// two-language profile setup this validation exists for relies on.
+/// deliberately not reported: nested chords *can* complete on the same key
+/// event (see [`ChordMatcher`]'s doc comment), but [`ChordMatcher`]'s
+/// most-specific-wins latch already resolves that deterministically — the
+/// longer chord always wins, so both remain usable regardless. This
+/// function exists for the overlaps that latch *cannot* choose between:
+/// two equally specific chords that share some but not all of their keys,
+/// where "most keys wins" has nothing to compare.
 pub fn find_conflicts(specs: &[HotkeySpec]) -> Vec<(usize, usize)> {
     let mut conflicts = Vec::new();
     for i in 0..specs.len() {
@@ -806,9 +809,10 @@ mod tests {
 
         assert!(
             find_conflicts(&[a, nested]).is_empty(),
-            "a nested chord needs a key the shorter one lacks, so the two cannot \
-             complete on one event and both must stay usable — this is the pair \
-             the two-language setup recommends"
+            "a nested chord can complete on the same event as the shorter one it contains, but \
+             ChordMatcher's most-specific-wins latch already resolves that deterministically, so \
+             find_conflicts has nothing useful to report here — this is the pair the \
+             two-language setup recommends"
         );
 
         // Neither identical nor nested: holding ctrl+super and then pressing alt

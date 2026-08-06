@@ -108,8 +108,9 @@ describe('chordsConflict', () => {
   })
 
   it('a nested chord does not conflict with the shorter chord it contains', () => {
-    // Completing ctrl+alt+super still needs `alt`, which ctrl+super does not
-    // require at all, so the two stay distinguishable.
+    // ctrl+alt+super can complete on the same event as ctrl+super, but the Rust
+    // matcher's most-specific-wins latch already resolves that deterministically,
+    // so this check has nothing useful to report for the nested pair.
     const shorter = tokens('ctrl+super')
     const nested = tokens('ctrl+alt+super')
     expect(chordsConflict(shorter, nested)).toBe(false)

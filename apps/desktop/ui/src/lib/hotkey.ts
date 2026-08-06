@@ -114,10 +114,13 @@ export function parseChordTokens(chord: string): Set<string> | null {
  * token sets overlap and neither is a strict subset of the other (holding
  * every key both need except one they share, then pressing that shared key,
  * completes both at once). A strict subset — e.g. `ctrl+super` inside
- * `ctrl+alt+super` — is deliberately not a conflict: completing the larger
- * chord still needs a key (`alt`) the smaller one doesn't require, so both
- * stay distinguishable and usable, which is the pairing the two-language
- * profile setup this check exists for relies on. */
+ * `ctrl+alt+super` — is deliberately not a conflict: a nested chord *can*
+ * complete on the same event as the shorter one it contains, but the Rust
+ * hotkey matcher's most-specific-wins latch already resolves that
+ * deterministically (the longer chord always wins), so both stay usable
+ * regardless. This check exists for the overlaps that latch cannot choose
+ * between: two equally specific chords sharing some but not all of their
+ * keys, which is the pairing the two-language profile setup relies on. */
 export function chordsConflict(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
   const aSubsetOfB = [...a].every((token) => b.has(token))
   const bSubsetOfA = [...b].every((token) => a.has(token))

@@ -46,8 +46,26 @@
   let busy = $state<Record<string, boolean>>({})
   let unlistenProgress: (() => void) | undefined
 
-  let whisperModels = $derived(models.filter((m) => m.engine === 'whisper'))
-  let anyInstalled = $derived(models.some((m) => m.installed))
+  // The model step must offer whatever the default profile's own engine names, not a
+  // hardcoded engine -- `Settings::default()` seeds it on sherpa, but a hand-edited or migrated
+  // config can seed it on whisper (or cloud, which needs no local model at all). Offering the
+  // wrong engine's models here is how a fresh install completes onboarding and still can't
+  // dictate: the default profile's hotkey resolves to a model that was never downloaded.
+  let profileEngine = $derived(settings.profiles[0]?.engine.active ?? 'whisper')
+  let profileModelId = $derived(
+    profileEngine === 'sherpa'
+      ? settings.profiles[0]?.engine.sherpa_model
+      : profileEngine === 'whisper'
+        ? settings.profiles[0]?.engine.whisper_model
+        : null,
+  )
+  let downloadableModels = $derived(models.filter((m) => m.engine === profileEngine))
+  // Deliberately checks the *specific* model id the default profile names, not merely "some
+  // model of the right engine is installed" -- a sherpa engine has two catalog models, and
+  // installing the wrong one would still let the (dishonest) old copy claim readiness.
+  let defaultModelInstalled = $derived(
+    profileModelId != null && models.some((m) => m.id === profileModelId && m.installed),
+  )
 
   async function refreshModels() {
     try {
@@ -161,36 +179,47 @@
       {/if}
     {:else if step === 2}
       <h1>Speech model</h1>
-      <p class="muted">Install at least one offline Whisper model to get started (you can add more later).</p>
-      {#if modelsError}
-        <p class="error">{modelsError}</p>
-      {/if}
-      <ul class="model-list">
-        {#each whisperModels as model (model.id)}
-          <li>
-            <div class="model-row">
-              <div class="model-info">
-                <span class="model-label">{model.label}</span>
-                <span class="model-size">{model.size_mb} MB</span>
+      {#if profileEngine === 'cloud'}
+        <p class="muted">
+          Your default profile dictates through a cloud speech-to-text endpoint. Configure its
+          API key under Settings &gt; Engines after finishing setup — no model download is
+          needed here.
+        </p>
+      {:else}
+        <p class="muted">
+          Install the model your default profile uses ({profileModelId ?? 'none configured'}) to
+          get started (you can add more later).
+        </p>
+        {#if modelsError}
+          <p class="error">{modelsError}</p>
+        {/if}
+        <ul class="model-list">
+          {#each downloadableModels as model (model.id)}
+            <li>
+              <div class="model-row">
+                <div class="model-info">
+                  <span class="model-label">{model.label}</span>
+                  <span class="model-size">{model.size_mb} MB</span>
+                </div>
+                {#if model.installed}
+                  <span class="badge">Installed</span>
+                {:else}
+                  <button type="button" onclick={() => install(model.id)} disabled={busy[model.id]}>
+                    {busy[model.id] ? 'Downloading…' : 'Install'}
+                  </button>
+                {/if}
               </div>
-              {#if model.installed}
-                <span class="badge">Installed</span>
-              {:else}
-                <button type="button" onclick={() => install(model.id)} disabled={busy[model.id]}>
-                  {busy[model.id] ? 'Downloading…' : 'Install'}
-                </button>
+              {#if busy[model.id]}
+                <div class="progress-track">
+                  <div class="progress-fill" style:width="{progressPercent(model.id) ?? 0}%"></div>
+                </div>
               {/if}
-            </div>
-            {#if busy[model.id]}
-              <div class="progress-track">
-                <div class="progress-fill" style:width="{progressPercent(model.id) ?? 0}%"></div>
-              </div>
-            {/if}
-          </li>
-        {/each}
-      </ul>
-      {#if anyInstalled}
-        <p class="ok">A model is installed — you're ready to dictate.</p>
+            </li>
+          {/each}
+        </ul>
+        {#if defaultModelInstalled}
+          <p class="ok">Your default profile's model is installed — you're ready to dictate.</p>
+        {/if}
       {/if}
     {:else if step === 3}
       <h1>Hotkey</h1>

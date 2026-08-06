@@ -4,7 +4,7 @@
 //! Push-to-talk holds the hotkey (e.g. `ctrl+super`) down while recording
 //! and releases it to stop; injection follows within about a second. If a
 //! physical Ctrl or Super key is still (or again) held when the virtual
-//! keyboard synthesizes Ctrl+V — the release of one chord key already fires
+//! keyboard synthesizes the paste chord — the release of one chord key already fires
 //! [`crate::HotkeyEvent::Released`] while the other may still be
 //! physically down, and a fast re-press can also land inside the window —
 //! the compositor sees an unrelated chord (e.g. Ctrl+Super+V) that most
@@ -51,7 +51,7 @@ mod linux_impl {
     use super::{wait_for_clear_with, POLL_INTERVAL, RELEASE_TIMEOUT};
     use evdev::{AttributeSet, Device, KeyCode};
 
-    /// Every physical modifier key that could turn a synthesized Ctrl+V
+    /// Every physical modifier key that could turn a synthesized paste chord
     /// into a chord the focused app doesn't recognize as paste (see module
     /// docs).
     const MODIFIER_KEYS: [KeyCode; 8] = [

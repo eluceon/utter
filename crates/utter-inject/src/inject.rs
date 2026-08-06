@@ -16,25 +16,29 @@ use crate::clipboard;
 use crate::modifier_wait;
 use crate::uinput_kbd::VirtualKeyboard;
 
-/// How long to wait after setting the clipboard before synthesizing Ctrl+V.
+/// How long to wait after setting the clipboard before synthesizing the
+/// paste chord.
 /// On Wayland the clipboard offer has to be registered with the compositor
 /// before a paste can pick it up; without this delay a paste synthesized
 /// immediately after `set_text` can race that registration and land on
 /// whatever was previously on the clipboard (or nothing at all).
 const CLIPBOARD_SET_TO_PASTE_DELAY: Duration = Duration::from_millis(80);
 
-/// How long to wait after synthesizing Ctrl+V before restoring the user's
+/// How long to wait after synthesizing the paste chord before restoring the user's
 /// previous clipboard contents. The target application reads the clipboard
 /// asynchronously in response to the paste keystroke, so restoring too soon
 /// would race it and paste our own restored (old) value instead.
 const CLIPBOARD_RESTORE_DELAY: Duration = Duration::from_millis(150);
 
-/// Injects text by placing it on the clipboard and synthesizing Ctrl+V.
+/// Injects text by publishing it to the clipboard and synthesizing a paste.
 ///
-/// The previous clipboard contents are saved before the paste and restored
+/// The text goes to both the CLIPBOARD and PRIMARY selections, because the
+/// paste chord is Shift+Insert and which selection that reads depends on the
+/// receiving toolkit — see [`crate::uinput_kbd`] for why it cannot be Ctrl+V.
+/// The previous contents of both are saved before the paste and restored
 /// afterward on a best-effort basis: a failed restore is logged (see
-/// [`crate::clipboard::restore_text`]) but never turns a successful
-/// injection into an error.
+/// [`crate::clipboard::restore`]) but never turns a successful injection into
+/// an error.
 pub struct ClipboardPasteInjector {
     keyboard: VirtualKeyboard,
 }
@@ -51,19 +55,19 @@ impl ClipboardPasteInjector {
 
 impl TextInjector for ClipboardPasteInjector {
     fn inject(&mut self, text: &str) -> Result<InjectionMethod, InjectError> {
-        let previous = clipboard::read_text_lossy();
+        let previous = clipboard::save();
         clipboard::set_text(text)?;
         std::thread::sleep(CLIPBOARD_SET_TO_PASTE_DELAY);
 
         // Push-to-talk releases the hotkey right before this runs; wait
         // (bounded) for any physical modifier still down to clear so the
-        // compositor sees a clean Ctrl+V rather than some other chord (see
-        // `crate::modifier_wait`).
+        // compositor sees a clean paste chord rather than some other
+        // combination (see `crate::modifier_wait`).
         modifier_wait::wait_for_modifiers_released();
 
-        let paste_result = self.keyboard.ctrl_v();
+        let paste_result = self.keyboard.paste();
         std::thread::sleep(CLIPBOARD_RESTORE_DELAY);
-        clipboard::restore_text(previous);
+        clipboard::restore(previous);
 
         paste_result?;
         Ok(InjectionMethod::ClipboardPaste)

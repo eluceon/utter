@@ -119,13 +119,38 @@ mod linux_impl {
         }
     }
 
+    /// The chord that asks the focused application to paste.
+    ///
+    /// **Shift+Insert, deliberately not Ctrl+V.** uinput emits raw key
+    /// *codes*, and the compositor translates each one through whatever
+    /// keyboard layout is active at that moment. `KEY_V` is a letter key, so
+    /// under a non-Latin layout it no longer means "v": on the Russian
+    /// layout it is `Cyrillic_em`, and the application receives Ctrl+м —
+    /// not its paste shortcut. It does not paste, and the bare character is
+    /// inserted instead, so a whole dictated sentence arrives as the single
+    /// letter "м".
+    ///
+    /// Picking a different letter key cannot fix this, because a layout that
+    /// has no Latin `v` anywhere offers no key code that means paste; and an
+    /// application cannot switch the user's layout on Wayland. `KEY_INSERT`
+    /// sidesteps the problem entirely by carrying no character at all, so it
+    /// survives translation through any layout unchanged.
+    ///
+    /// The cost is that Shift+Insert reads CLIPBOARD in GTK applications but
+    /// PRIMARY in VTE terminals, which is why
+    /// [`ClipboardPasteInjector`](crate::ClipboardPasteInjector) publishes
+    /// the text to both selections.
+    pub(super) const PASTE_CHORD: [KeyCode; 2] = [KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_INSERT];
+
     /// The union of every key code `char_to_key` can produce, plus the keys
-    /// needed for the Ctrl+V paste combo.
+    /// needed for [`PASTE_CHORD`].
     fn all_supported_keys() -> AttributeSet<KeyCode> {
         let mut keys = AttributeSet::<KeyCode>::new();
         keys.insert(KeyCode::KEY_LEFTCTRL);
         keys.insert(KeyCode::KEY_LEFTSHIFT);
-        keys.insert(KeyCode::KEY_V);
+        for code in PASTE_CHORD {
+            keys.insert(code);
+        }
         for byte in 0u8..=127 {
             if let Some((code, _)) = char_to_key(byte as char) {
                 keys.insert(code);
@@ -162,9 +187,10 @@ mod linux_impl {
             Ok(Self { device })
         }
 
-        /// Synthesizes a Ctrl+V key combo.
-        pub fn ctrl_v(&mut self) -> Result<(), InjectError> {
-            self.chord(&[KeyCode::KEY_LEFTCTRL, KeyCode::KEY_V])
+        /// Synthesizes the paste combo; see [`PASTE_CHORD`] for why it is
+        /// Shift+Insert rather than Ctrl+V.
+        pub fn paste(&mut self) -> Result<(), InjectError> {
+            self.chord(&PASTE_CHORD)
         }
 
         /// Types `text` one character at a time. Pre-validates the whole
@@ -195,7 +221,7 @@ mod linux_impl {
 
         /// Presses then releases `codes` together, e.g. `[Ctrl, V]`, as two
         /// separate uinput writes (one for the press, one for the release).
-        /// Used for the Ctrl+V combo, where the two states are genuinely
+        /// Used for the paste combo, where the two states are genuinely
         /// meant to be visible to the compositor as distinct moments.
         fn chord(&mut self, codes: &[KeyCode]) -> Result<(), InjectError> {
             self.emit(codes, 1)?;
@@ -258,7 +284,7 @@ mod stub_impl {
             ))
         }
 
-        pub fn ctrl_v(&mut self) -> Result<(), InjectError> {
+        pub fn paste(&mut self) -> Result<(), InjectError> {
             match *self {}
         }
 
@@ -275,8 +301,31 @@ pub(crate) use stub_impl::VirtualKeyboard;
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::linux_impl::{char_to_key, validate_typeable};
+    use super::linux_impl::{char_to_key, validate_typeable, PASTE_CHORD};
     use evdev::KeyCode;
+
+    #[test]
+    fn the_paste_chord_survives_a_non_latin_keyboard_layout() {
+        // uinput emits key *codes*; the compositor translates them through
+        // the active layout. A chord built from a character key therefore
+        // means something else under a Cyrillic (or Greek, or Arabic)
+        // layout — Ctrl+V becomes Ctrl+м, which no application treats as
+        // paste, and the letter is typed instead of the transcript.
+        for code in PASTE_CHORD {
+            let types_a_character = (0u8..=127)
+                .filter_map(|byte| char_to_key(byte as char))
+                .any(|(mapped, _)| mapped == code);
+            assert!(
+                !types_a_character,
+                "{code:?} is a character key, so its meaning depends on the active layout"
+            );
+        }
+    }
+
+    #[test]
+    fn the_paste_chord_is_shift_insert() {
+        assert_eq!(PASTE_CHORD, [KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_INSERT]);
+    }
 
     #[test]
     fn maps_lowercase_letter_without_shift() {

@@ -75,8 +75,6 @@ level meter, and the partial transcript as it comes in.
 
 | | |
 |---|---|
-| ![Engines settings page listing whisper.cpp and sherpa-onnx models with install state](docs/img/settings-engines-light.png) | ![Refinement settings page with a provider preset, tone selector, and a live test result](docs/img/settings-refinement-light.png) |
-| **Engines** — download and manage whisper.cpp and sherpa-onnx models, and hold the cloud engine's API key; a profile picks which engine and model it actually uses. | **Refinement** — pick a tone, point at any OpenAI-compatible chat endpoint, and test it against a sample transcript. |
 | ![Dictionary settings page with custom terms and heard/write replacement rules](docs/img/settings-dictionary-light.png) | ![Snippets settings page with trigger phrases and their expansion bodies](docs/img/settings-snippets-light.png) |
 | **Dictionary** — custom terms and literal replacement rules applied to every transcript. | **Snippets** — a spoken trigger expands to a stored template, bypassing refinement. |
 

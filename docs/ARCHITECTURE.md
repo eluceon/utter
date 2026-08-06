@@ -17,7 +17,7 @@ plugged in at the edge.
 | `utter-inject` | Global hotkey capture (evdev, with an X11 `global-hotkey` fallback) and text injection backends (clipboard-paste, direct typing, clipboard-only), chained with automatic fallback. |
 | `utter-store` | TOML settings persistence, the SQLite-backed history repository, and the STT model catalog/downloader. |
 | `apps/desktop/src-tauri` | Tauri 2 shell: boots the runtime from settings, wires adapters together on a worker thread, exposes commands/events to the UI, tray, and windows. |
-| `apps/desktop/ui` | Svelte 5 + TypeScript settings UI and HUD: onboarding, engine/model management, dictionary, snippets, history. |
+| `apps/desktop/ui` | Svelte 5 + TypeScript settings UI and HUD: onboarding, language profiles, engine/model management, dictionary, snippets, history. |
 
 ## Ports and adapters
 
@@ -98,8 +98,13 @@ at `finish()` — it exists for a future streaming engine.
 ## Data flow
 
 1. **Hotkey** — the evdev (or X11 fallback) `HotkeySource` runs on its own
-   thread, parses the configured chord, and sends `HotkeyEvent::Pressed` /
-   `Released` over a channel the runtime worker selects on.
+   thread watching every language profile's chord at once, and sends a
+   `HotkeyEvent::Pressed` / `Released` carrying that chord's `BindingId` over
+   a channel the runtime worker selects on. The worker resolves the id
+   through `ProfileRegistry`, which builds a profile's engine and refiner the
+   first time its binding is actually pressed rather than at boot, and
+   isolates that load's failure to the one profile — see "One chord per
+   language, engines built lazily and isolated" below.
 2. **Capture** — `Session::handle` turns a press into `Effect::StartCapture`;
    the runtime starts `utter-audio`'s `Capture`, which pulls frames from
    `cpal` and resamples them to 16 kHz mono `i16`.
@@ -121,13 +126,31 @@ at `finish()` — it exists for a future streaming engine.
    first, then direct typing, then clipboard-only, stopping at whichever
    succeeds.
 8. **History** — on success, the runtime records the raw and final text,
-   duration, engine, and best-effort target app in the SQLite history
-   database (skipped entirely if history is disabled in settings). Audio
-   itself is discarded once transcription finishes; it is never written to
-   disk at any step above.
+   duration, engine, target app (best-effort), and which profile produced
+   the entry in the SQLite history database (skipped entirely if history is
+   disabled in settings). Audio itself is discarded once transcription
+   finishes; it is never written to disk at any step above.
 
 ## Key decisions
 
+- **One chord per language, engines built lazily and isolated from each
+  other's failures** — a language profile binds a hotkey chord to an engine,
+  model and refinement policy as one unit, so pressing the chord for Russian
+  or English selects everything that follows from that language with no
+  separate engine choice. `ProfileRegistry` (`apps/desktop/src-tauri/src/profiles.rs`)
+  builds a profile's engine and refiner the first time its hotkey is
+  actually pressed, not at app boot, and keeps the result for every press
+  after that. Lazy loading matters because the models a profile can select
+  together weigh about a gigabyte, the app sits in the tray all day, and most
+  sessions only ever speak one language — loading every configured profile's
+  engine at boot would make a bilingual setup cost more idle memory than a
+  monolingual one, even for someone who never presses the second hotkey.
+  Isolation matters because, before profiles, there was exactly one engine:
+  if it failed to load, dictation simply didn't work, and that was the whole
+  story. With more than one profile, a broken model for one language must
+  not take a healthy one down with it — a missing or damaged model for
+  Russian degrades to a per-profile notice on the Russian binding alone; the
+  English binding loads and works normally.
 - **evdev hotkeys over a desktop-portal API** — Wayland has no standard
   global-hotkey protocol, and hold-to-record needs modifier-only chords
   (e.g. `Ctrl+Super`) that compositor shortcut APIs generally don't expose.

@@ -4,7 +4,6 @@
   import Select from '../lib/components/Select.svelte'
   import Toggle from '../lib/components/Toggle.svelte'
   import TextInput from '../lib/components/TextInput.svelte'
-  import HotkeyPicker from '../lib/components/HotkeyPicker.svelte'
   import { settingsStore } from '../lib/stores'
   import type { DictationMode } from '../lib/types'
 
@@ -38,16 +37,6 @@
       bind:value={
         () => settings.dictation.mode,
         (v) => settingsStore.patch({ dictation: { mode: v as DictationMode } })
-      }
-    />
-  </Field>
-
-  <Field label="Hotkey" for="hotkey" hint="Modifiers plus one key, e.g. ctrl+alt+d, or modifiers alone.">
-    <HotkeyPicker
-      id="hotkey"
-      bind:value={
-        () => settings.dictation.hotkey,
-        (v) => settingsStore.patch({ dictation: { hotkey: v } })
       }
     />
   </Field>

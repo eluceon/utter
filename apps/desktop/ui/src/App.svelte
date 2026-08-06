@@ -7,6 +7,7 @@
 
   import General from './pages/General.svelte'
   import Dictation from './pages/Dictation.svelte'
+  import Profiles from './pages/Profiles.svelte'
   import Engines from './pages/Engines.svelte'
   import Refinement from './pages/Refinement.svelte'
   import DictionaryPage from './pages/Dictionary.svelte'
@@ -31,6 +32,7 @@
   const NAV: { hash: string; label: string }[] = [
     { hash: 'general', label: 'General' },
     { hash: 'dictation', label: 'Dictation' },
+    { hash: 'profiles', label: 'Profiles' },
     { hash: 'engines', label: 'Engines' },
     { hash: 'refinement', label: 'Refinement' },
     { hash: 'dictionary', label: 'Dictionary' },
@@ -124,6 +126,8 @@
         <General />
       {:else if hash === 'dictation'}
         <Dictation />
+      {:else if hash === 'profiles'}
+        <Profiles />
       {:else if hash === 'engines'}
         <Engines />
       {:else if hash === 'refinement'}

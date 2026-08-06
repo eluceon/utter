@@ -9,6 +9,7 @@
 //!
 //! This module only builds on Linux; non-Linux targets never reference it.
 
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use crossbeam_channel::RecvTimeoutError;
@@ -16,19 +17,25 @@ use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 
 use crate::hotkey::{
-    is_stale, HotkeyEvent, HotkeySource, HotkeySpec, KeyToken, SHUTDOWN_POLL_INTERVAL,
+    is_stale, BindingId, HotkeyEvent, HotkeySource, HotkeySpec, Key, SHUTDOWN_POLL_INTERVAL,
 };
 
-/// An X11-backed [`HotkeySource`] for a single, non-modifier-only chord.
+/// An X11-backed [`HotkeySource`] watching every non-modifier-only chord in
+/// a `specs` slice at once, indexed by position (`hotkeys[i]` is
+/// `BindingId(i)`).
 pub(crate) struct X11HotkeySource {
-    hotkey: HotKey,
+    hotkeys: Vec<HotKey>,
     generation: u64,
 }
 
 impl X11HotkeySource {
-    pub(crate) fn new(spec: &HotkeySpec, generation: u64) -> anyhow::Result<Self> {
+    pub(crate) fn new(specs: &[HotkeySpec], generation: u64) -> anyhow::Result<Self> {
+        let hotkeys = specs
+            .iter()
+            .map(to_global_hotkey)
+            .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(Self {
-            hotkey: to_global_hotkey(spec)?,
+            hotkeys,
             generation,
         })
     }
@@ -44,9 +51,20 @@ impl HotkeySource for X11HotkeySource {
             }
         };
 
-        if let Err(err) = manager.register(self.hotkey) {
-            tracing::error!("utter-inject: failed to register X11 hotkey: {err}");
-            return;
+        let mut bindings = HashMap::with_capacity(self.hotkeys.len());
+        for (index, hotkey) in self.hotkeys.iter().enumerate() {
+            if let Err(err) = manager.register(*hotkey) {
+                tracing::error!("utter-inject: failed to register X11 hotkey: {err}");
+                // Roll back whichever earlier hotkeys in this batch already
+                // registered, rather than leaving them behind in the X11
+                // server with nothing left in this process to ever
+                // unregister them.
+                for registered in &self.hotkeys[..index] {
+                    let _ = manager.unregister(*registered);
+                }
+                return;
+            }
+            bindings.insert(hotkey.id(), BindingId::from(index));
         }
 
         // `GlobalHotKeyEvent::receiver()` is a process-wide channel shared
@@ -63,13 +81,13 @@ impl HotkeySource for X11HotkeySource {
 
             match receiver.recv_timeout(SHUTDOWN_POLL_INTERVAL) {
                 Ok(event) => {
-                    if event.id() != self.hotkey.id() {
+                    let Some(&binding) = bindings.get(&event.id()) else {
                         continue;
-                    }
+                    };
 
                     let mapped = match event.state() {
-                        HotKeyState::Pressed => HotkeyEvent::Pressed,
-                        HotKeyState::Released => HotkeyEvent::Released,
+                        HotKeyState::Pressed => HotkeyEvent::Pressed { binding },
+                        HotKeyState::Released => HotkeyEvent::Released { binding },
                     };
 
                     if tx.send(mapped).is_err() {
@@ -81,10 +99,13 @@ impl HotkeySource for X11HotkeySource {
             }
         }
 
-        // Best-effort: an unregistered stale hotkey lingering in the X11
-        // server is harmless (its events just get dropped above) but
-        // there's no reason to leave it registered once we're shutting down.
-        let _ = manager.unregister(self.hotkey);
+        // Best-effort: unregistered stale hotkeys lingering in the X11
+        // server are harmless (their events just get dropped above) but
+        // there's no reason to leave them registered once we're shutting
+        // down.
+        for hotkey in &self.hotkeys {
+            let _ = manager.unregister(*hotkey);
+        }
     }
 }
 
@@ -94,14 +115,14 @@ fn to_global_hotkey(spec: &HotkeySpec) -> anyhow::Result<HotKey> {
 
     for token in spec.tokens() {
         match token {
-            KeyToken::Ctrl => mods |= Modifiers::CONTROL,
-            KeyToken::Alt => mods |= Modifiers::ALT,
-            KeyToken::Shift => mods |= Modifiers::SHIFT,
-            KeyToken::Super => mods |= Modifiers::SUPER,
-            KeyToken::Char(c) if c.is_ascii_digit() => key = Some(code_for(&format!("Digit{c}"))?),
-            KeyToken::Char(c) => key = Some(code_for(&format!("Key{}", c.to_ascii_uppercase()))?),
-            KeyToken::Function(n) => key = Some(code_for(&format!("F{n}"))?),
-            KeyToken::Space => key = Some(code_for("Space")?),
+            Key::Ctrl => mods |= Modifiers::CONTROL,
+            Key::Alt => mods |= Modifiers::ALT,
+            Key::Shift => mods |= Modifiers::SHIFT,
+            Key::Super => mods |= Modifiers::SUPER,
+            Key::Char(c) if c.is_ascii_digit() => key = Some(code_for(&format!("Digit{c}"))?),
+            Key::Char(c) => key = Some(code_for(&format!("Key{}", c.to_ascii_uppercase()))?),
+            Key::Function(n) => key = Some(code_for(&format!("F{n}"))?),
+            Key::Space => key = Some(code_for("Space")?),
         }
     }
 

@@ -31,15 +31,12 @@
 </script>
 
 <Section title="General" description="Language, appearance, and startup behavior.">
-  <Field label="Language" for="language" hint="Used as a hint for the speech-to-text engine.">
-    <Select
-      id="language"
-      options={LANGUAGE_OPTIONS}
-      bind:value={
-        () => settings.general.language ?? '',
-        (v) => settingsStore.patch({ general: { language: v === '' ? null : v } })
-      }
-    />
+  <Field
+    label="Language"
+    for="language"
+    hint="No longer used for dictation — each profile on the Profiles page now sets its own language."
+  >
+    <Select id="language" disabled options={LANGUAGE_OPTIONS} value={settings.general.language ?? ''} />
   </Field>
 
   <Field label="Theme" for="theme">

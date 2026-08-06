@@ -1,0 +1,68 @@
+# The same v0.1 config as v1_whisper.toml, but the user had switched to
+# Vosk for Russian dictation. `general.language` is deliberately left at
+# the stale "en" from before the switch: the vosk model id is the more
+# trustworthy signal of what the user actually dictated in, and the
+# migration must prefer it over the stale general-language hint.
+#
+# `[engine.cloud]` and `whisper_model` are deliberately set to non-default
+# values (unlike v1_whisper.toml's, which happen to equal CloudSttCfg's
+# defaults): a migration that discards them and one that preserves them
+# would otherwise produce identical output, so a fixture at the defaults
+# cannot prove either field survived. `[dictation].hotkey` is likewise
+# deliberately non-default and distinct from v1_whisper.toml's, for the same
+# reason.
+
+[general]
+language = "en"
+theme = "dark"
+autostart = true
+
+[dictation]
+mode = "toggle"
+hotkey = "ctrl+shift+r"
+silence_timeout_secs = 45
+hud = true
+
+[engine]
+active = "vosk"
+whisper_model = "large-v3-turbo-q5_0"
+vosk_model = "vosk-model-small-ru-0.22"
+
+[engine.cloud]
+base_url = "https://vosk-user.example.com/v1"
+model = "whisper-1-custom"
+
+[refine]
+enabled = true
+tone = "formal"
+base_url = "http://localhost:11434/v1"
+model = "llama3.2"
+timeout_secs = 20
+
+[dictionary]
+terms = ["PostgreSQL", "Kubernetes", "eluceon"]
+
+[[dictionary.rules]]
+heard = "cube control"
+write = "kubectl"
+
+[[dictionary.rules]]
+heard = "post gres"
+write = "Postgres"
+
+[[snippets]]
+trigger = "sign off"
+body = "Best regards,\nAlex"
+
+[[snippets]]
+trigger = "standup update"
+body = "No blockers, on track."
+
+[history]
+enabled = false
+
+[advanced]
+injection = "clipboard_paste"
+audio_device = "USB Microphone"
+vad_sensitivity = 0.7
+log_level = "debug"

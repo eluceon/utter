@@ -33,23 +33,27 @@ pub struct LlmRefiner {
 impl LlmRefiner {
     /// Builds a refiner from `cfg`.
     ///
-    /// # Panics
-    /// Panics only if the underlying blocking HTTP client cannot be built
-    /// (e.g. TLS backend initialization failure) — that signals a broken
-    /// environment, not a user-recoverable error.
-    pub fn new(cfg: LlmConfig, dictionary_terms: Vec<String>) -> Self {
+    /// # Errors
+    /// Returns the underlying `reqwest` error if the blocking HTTP client
+    /// cannot be built (e.g. TLS backend initialization failure). This used
+    /// to panic, which was safe to call only from a boot path that could
+    /// afford to fail loudly; a per-profile refiner is now built lazily on
+    /// the dictation worker thread (see `ProfileRegistry`), where the same
+    /// panic would kill the worker and, with it, every profile's dictation —
+    /// exactly the "load that poisons the whole registry" failure isolation
+    /// is meant to prevent. Callers degrade to "no refiner" instead.
+    pub fn new(cfg: LlmConfig, dictionary_terms: Vec<String>) -> Result<Self, reqwest::Error> {
         let connect_timeout = cfg.timeout.min(Duration::from_secs(5));
         let client = reqwest::blocking::Client::builder()
             .timeout(cfg.timeout)
             .connect_timeout(connect_timeout)
-            .build()
-            .expect("invariant: failed to build blocking HTTP client");
+            .build()?;
 
-        Self {
+        Ok(Self {
             client,
             config: cfg,
             dictionary_terms,
-        }
+        })
     }
 }
 

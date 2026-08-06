@@ -1,0 +1,80 @@
+# The expected result of migrating v1_vosk.toml. Vosk no longer exists, so
+# the engine is rerouted to the sherpa-onnx model for the language the vosk
+# model id implies (`vosk-model-small-ru-*` -> Russian), which also becomes
+# the profile's language -- overriding the stale `general.language = "en"`
+# left over from before the user switched engines. `whisper_model` and
+# `cloud` are NOT reset: neither is specific to vosk, both configure engines
+# the user can still switch to independently, and both survive migration
+# unchanged from v1_vosk.toml. The hotkey moved off `[dictation]` entirely:
+# it now lives only on the profile.
+
+[general]
+language = "en"
+theme = "dark"
+autostart = true
+
+[dictation]
+mode = "toggle"
+silence_timeout_secs = 45
+hud = true
+
+[engine]
+active = "sherpa"
+whisper_model = "large-v3-turbo-q5_0"
+sherpa_model = "gigaam-v3-e2e-rnnt"
+
+[engine.cloud]
+base_url = "https://vosk-user.example.com/v1"
+model = "whisper-1-custom"
+
+[refine]
+enabled = true
+base_url = "http://localhost:11434/v1"
+model = "llama3.2"
+timeout_secs = 20
+
+[dictionary]
+terms = ["PostgreSQL", "Kubernetes", "eluceon"]
+
+[[dictionary.rules]]
+heard = "cube control"
+write = "kubectl"
+
+[[dictionary.rules]]
+heard = "post gres"
+write = "Postgres"
+
+[[snippets]]
+trigger = "sign off"
+body = "Best regards,\nAlex"
+
+[[snippets]]
+trigger = "standup update"
+body = "No blockers, on track."
+
+[history]
+enabled = false
+
+[advanced]
+injection = "clipboard_paste"
+audio_device = "USB Microphone"
+vad_sensitivity = 0.7
+log_level = "debug"
+
+[[profiles]]
+id = "default"
+hotkey = "ctrl+shift+r"
+language = "ru"
+
+[profiles.engine]
+active = "sherpa"
+whisper_model = "large-v3-turbo-q5_0"
+sherpa_model = "gigaam-v3-e2e-rnnt"
+
+[profiles.engine.cloud]
+base_url = "https://vosk-user.example.com/v1"
+model = "whisper-1-custom"
+
+[profiles.refine]
+enabled = true
+tone = "formal"

@@ -34,4 +34,4 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "Utter ${{ github.ref_name }}"
           releaseDraft: true
-          args: --bundles deb,appimage
+          args: --bundles deb,appimage --features sherpa

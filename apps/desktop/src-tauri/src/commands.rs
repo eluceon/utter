@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use utter_core::TextRefiner;
+use utter_core::{TextRefiner, Tone};
 use utter_inject::PermissionReport;
 use utter_refine::{LlmConfig, LlmRefiner};
 use utter_store::{HistoryEntry, ModelInfo, Settings};
@@ -379,9 +379,14 @@ pub async fn test_refine(app: AppHandle, sample: String) -> Result<String, Strin
                 timeout: Duration::from_secs(settings.refine.timeout_secs),
             },
             settings.dictionary.terms,
-        );
+        )
+        .map_err(|e| format!("could not build the refiner's HTTP client: {e}"))?;
 
-        TextRefiner::refine(&refiner, &sample, settings.refine.tone)
+        // `test_refine` validates connectivity/credentials with a scratch sample, independent of
+        // any particular profile -- `Tone` no longer has a global setting to read (it moved to
+        // `RefinePolicy::tone`, one profile at a time), so this always previews with `Clean`, the
+        // same value both `RefineCfg` and `RefinePolicy` used to default to.
+        TextRefiner::refine(&refiner, &sample, Tone::Clean)
             .map_err(|e| format!("refine failed: {e}"))
     })
     .await

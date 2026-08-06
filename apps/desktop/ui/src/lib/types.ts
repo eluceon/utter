@@ -26,10 +26,11 @@ export interface General {
   autostart: boolean
 }
 
-/** `crates/utter-store/src/settings.rs::Dictation` */
+/** `crates/utter-store/src/settings.rs::Dictation`. The hotkey that triggers
+ * dictation lives on each `LanguageProfile` instead — see
+ * `LanguageProfile.hotkey`. */
 export interface Dictation {
   mode: DictationMode
-  hotkey: string
   silence_timeout_secs: number | null
   hud: boolean
 }
@@ -48,13 +49,37 @@ export interface EngineCfg {
   cloud: CloudSttCfg
 }
 
-/** `crates/utter-store/src/settings.rs::RefineCfg` */
+/** `crates/utter-store/src/settings.rs::RefineCfg`. Master switch plus the
+ * provider connection only — `tone` moved to `RefinePolicy.tone`, set one
+ * profile at a time rather than as one global setting. */
 export interface RefineCfg {
   enabled: boolean
-  tone: Tone
   base_url: string
   model: string
   timeout_secs: number
+}
+
+/** `crates/utter-store/src/profile.rs::RefinePolicy` */
+export interface RefinePolicy {
+  enabled: boolean
+  tone: Tone
+}
+
+/** `crates/utter-store/src/profile.rs::DraftCfg` */
+export interface DraftCfg {
+  model: string
+}
+
+/** `crates/utter-store/src/profile.rs::LanguageProfile`. One hotkey chord
+ * and everything dictating in it implies: which engine transcribes, which
+ * model it loads, and whether the transcript is refined afterwards. */
+export interface LanguageProfile {
+  id: string
+  hotkey: string
+  language: string
+  engine: EngineCfg
+  draft: DraftCfg | null
+  refine: RefinePolicy
 }
 
 /** `crates/utter-refine/src/rules.rs::ReplaceRule` */
@@ -92,12 +117,19 @@ export interface Advanced {
 export interface Settings {
   general: General
   dictation: Dictation
-  engine: EngineCfg
   refine: RefineCfg
   dictionary: Dictionary
   snippets: Snippet[]
   history: HistoryCfg
   advanced: Advanced
+  /** One entry per language the user dictates in, each binding a hotkey to
+   * an engine, a model and a refinement policy.
+   * `defaultSettings()` below MUST seed exactly the one profile
+   * `Settings::default()` does — `App.svelte`'s onboarding gate compares a
+   * freshly loaded `Settings` against this function's output key-for-key
+   * (see `deepEqual`), so a missing or mismatched profile here makes
+   * onboarding never show on a fresh install. */
+  profiles: LanguageProfile[]
 }
 
 /** Mirrors `Settings::default()` in `crates/utter-store/src/settings.rs`. */
@@ -110,22 +142,11 @@ export function defaultSettings(): Settings {
     },
     dictation: {
       mode: 'push_to_talk',
-      hotkey: 'ctrl+super',
       silence_timeout_secs: null,
       hud: true,
     },
-    engine: {
-      active: 'whisper',
-      whisper_model: 'small',
-      sherpa_model: null,
-      cloud: {
-        base_url: 'https://api.openai.com/v1',
-        model: 'whisper-1',
-      },
-    },
     refine: {
       enabled: false,
-      tone: 'clean',
       base_url: 'http://localhost:11434/v1',
       model: 'llama3.2',
       timeout_secs: 10,
@@ -144,6 +165,33 @@ export function defaultSettings(): Settings {
       vad_sensitivity: 0.5,
       log_level: 'info',
     },
+    // Mirrors `Settings::default()`'s single seeded profile exactly: a
+    // fresh install gets one profile on the local sherpa-onnx engine (see
+    // `EngineCfg::sherpa("parakeet-tdt-110m-en")` in
+    // `crates/utter-store/src/settings.rs`), refinement off (the sherpa
+    // models already emit punctuation and casing), and no draft/streaming
+    // model configured yet.
+    profiles: [
+      {
+        id: 'default',
+        hotkey: 'ctrl+super',
+        language: 'en',
+        engine: {
+          active: 'sherpa',
+          whisper_model: 'small',
+          sherpa_model: 'parakeet-tdt-110m-en',
+          cloud: {
+            base_url: 'https://api.openai.com/v1',
+            model: 'whisper-1',
+          },
+        },
+        draft: null,
+        refine: {
+          enabled: false,
+          tone: 'clean',
+        },
+      },
+    ],
   }
 }
 

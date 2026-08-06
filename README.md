@@ -2,12 +2,13 @@
 
 **Utter it. It types.**
 
-Utter is a privacy-first, Linux-first desktop dictation app. Press a global
-hotkey, speak, and clean, formatted text lands in whatever field currently
-has focus — a terminal, an editor, a chat window, anything. Speech recognition
-runs locally by default (whisper.cpp or sherpa-onnx); an optional LLM pass cleans up
-filler words and punctuation before the text is typed. Nothing about the
-pipeline is fixed: engine, model, refinement provider, and injection method
+Utter is a privacy-first, Linux-first desktop dictation app. Each language
+you dictate in gets its own hotkey chord — press it, speak, and clean,
+formatted text lands in whatever field currently has focus — a terminal, an
+editor, a chat window, anything. Speech recognition runs locally by default
+(whisper.cpp or sherpa-onnx); an optional LLM pass cleans up filler words and
+punctuation before the text is typed. Nothing about the pipeline is fixed:
+each profile's engine, model and refinement tone, and the injection method,
 are all swappable in settings.
 
 Audio never touches disk, API keys live in the OS keyring, and the app makes
@@ -21,6 +22,13 @@ endpoint, a model download).
 
 ## Features
 
+- **Language profiles** — bind an independent hotkey chord to each language
+  you dictate in, each with its own speech-to-text engine, model, and
+  refinement tone; press a profile's hotkey and everything downstream
+  follows from it automatically, with no separate engine switch. Engines
+  load lazily, the first time a profile's hotkey is actually pressed, and a
+  profile whose model is missing or damaged never disables another
+  profile's hotkey.
 - **Dictation session** — push-to-talk or toggle mode, a small always-on-top
   HUD showing recording/transcribing/refining state and a live input level
   meter, cancel with Escape or a hotkey tap.
@@ -50,9 +58,10 @@ endpoint, a model download).
   Direct typing synthesizes individual key presses and so covers only what a
   US-QWERTY layout can reach; anything else (Cyrillic, CJK, emoji) falls
   through to clipboard-paste rather than being dropped.
-- **Tray and settings UI** — quick toggles for engine and refinement, a full
-  settings window, and a first-run onboarding flow that walks through mic
-  check, model download, hotkey choice, and permissions.
+- **Tray and settings UI** — a quick refinement on/off toggle, a full
+  settings window (profiles, engines, refinement, dictionary, snippets,
+  history), and a first-run onboarding flow that walks through mic check,
+  model download, hotkey choice, and permissions.
 
 ## Screenshots
 
@@ -66,8 +75,6 @@ level meter, and the partial transcript as it comes in.
 
 | | |
 |---|---|
-| ![Engines settings page listing whisper.cpp and sherpa-onnx models with install state](docs/img/settings-engines-light.png) | ![Refinement settings page with a provider preset, tone selector, and a live test result](docs/img/settings-refinement-light.png) |
-| **Engines** — install and switch between whisper.cpp models, sherpa-onnx models, or a cloud STT endpoint. | **Refinement** — pick a tone, point at any OpenAI-compatible chat endpoint, and test it against a sample transcript. |
 | ![Dictionary settings page with custom terms and heard/write replacement rules](docs/img/settings-dictionary-light.png) | ![Snippets settings page with trigger phrases and their expansion bodies](docs/img/settings-snippets-light.png) |
 | **Dictionary** — custom terms and literal replacement rules applied to every transcript. | **Snippets** — a spoken trigger expands to a stored template, bypassing refinement. |
 
@@ -135,12 +142,13 @@ work out of the box.
 On first launch, onboarding walks through a microphone check, downloading a
 speech-to-text model, picking a hotkey, and a permissions check.
 
-The default hotkey is `Ctrl+Super`, held to record (push-to-talk). Utter
-reads keyboard events directly from `/dev/input` (evdev) and synthesizes the
-paste keystroke through its own virtual keyboard device (`/dev/uinput`),
-since Wayland has no standard global-hotkey protocol. Both require the
-current user to have access to those device nodes; if onboarding reports
-missing permissions, it shows the exact fix:
+The default profile's hotkey is `Ctrl+Super`, held to record (push-to-talk);
+add a profile per additional language in Settings > Profiles, each with its
+own hotkey. Utter reads keyboard events directly from `/dev/input` (evdev)
+and synthesizes the paste keystroke through its own virtual keyboard device
+(`/dev/uinput`), since Wayland has no standard global-hotkey protocol. Both
+require the current user to have access to those device nodes; if onboarding
+reports missing permissions, it shows the exact fix:
 
 ```sh
 sudo usermod -aG input $USER && \
@@ -157,11 +165,15 @@ config dir), reloaded automatically when changed through the settings UI. A
 missing file just means defaults; unknown keys are ignored rather than
 rejected, so the format tolerates being hand-edited or partially upgraded.
 
-- **Engines** — pick `whisper`, `sherpa`, or `cloud` as the active
-  speech-to-text engine; models download to `~/.local/share/utter/models`.
-  The sherpa-onnx catalog has one model per language — GigaAM-v3 is Russian
-  only, Parakeet TDT 110M is English only — so pick the one matching what
-  you're dictating in.
+- **Profiles** — `[[profiles]]` is a list of language profiles, each with
+  its own `hotkey`, `language` tag, `engine` (`whisper`, `sherpa`, or
+  `cloud`) and refine tone; the settings UI's Profiles page edits this list.
+  There is no single active engine — each profile picks its own.
+- **Engines** — models download to `~/.local/share/utter/models` and are
+  managed from the Engines page; which engine a profile actually uses is
+  chosen on the Profiles page. The sherpa-onnx catalog has one model per
+  language — GigaAM-v3 is Russian only, Parakeet TDT 110M is English only —
+  so a profile's engine should match the language it dictates in.
 - **Refinement** — point `refine.base_url` / `refine.model` at any
   OpenAI-compatible chat endpoint; the settings UI ships presets for OpenAI,
   Groq, OpenRouter, DeepSeek, and Ollama. For a fully local setup, run
@@ -195,11 +207,9 @@ including dev setup and test/lint gates, are in
 
 ## Roadmap
 
-- **v0.2** — Language profiles: one hotkey per language, each with its own
-  engine, models and refinement tone; a streaming sherpa-onnx engine driving
-  a live partial-transcript preview in the HUD.
-- **v0.3** — Typing into the target application while the user speaks,
-  building on the draft engine and live preview introduced in v0.2.
+- **v0.3** — A streaming sherpa-onnx engine driving a live partial-transcript
+  preview in the HUD, and typing into the target application as the user
+  speaks.
 - **Later** — Windows and macOS runtime adapters, voice commands ("new
   line", "undo that"), translation mode.
 

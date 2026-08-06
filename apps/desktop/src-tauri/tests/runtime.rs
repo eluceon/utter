@@ -4,6 +4,7 @@
 //! `HistoryRepo`, asserting on the observable state sequence, notices, and
 //! injected/recorded text — never on internal implementation details.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -16,10 +17,11 @@ use utter_core::{
     DictationMode, InjectError, InjectionMethod, RefineError, SttEngine, SttError, TextInjector,
     TextRefiner, Tone, TranscribeOptions, Transcript,
 };
+use utter_desktop_lib::profiles::{ProfileDeps, ProfileLoader, ProfileRegistry};
 use utter_desktop_lib::runtime::{ActiveCapture, CaptureBackend, EventSink, Runtime, RuntimeDeps};
-use utter_inject::HotkeyEvent;
+use utter_inject::{BindingId, HotkeyEvent};
 use utter_refine::{ReplaceRule, Snippet};
-use utter_store::HistoryRepo;
+use utter_store::{HistoryRepo, LanguageProfile};
 
 /// Generous but bounded: every wait in these tests uses this instead of an
 /// unbounded `recv`, so a regression that stalls the worker fails the test
@@ -156,12 +158,19 @@ impl ActiveCapture for NoopActiveCapture {
 /// the partial too).
 type Emission = (String, f32, Option<String>);
 
-/// Records every `emit_state` call (pushed to a channel so tests can wait on
-/// the *next* emission with a bounded timeout instead of polling) and every
-/// `notify` call, in order, into a shared, externally-inspectable Vec.
+/// One `notify` call: kind ("info"/"error") and message.
+type Notice = (String, String);
+
+/// Records every `emit_state` call and every `notify` call, each pushed to
+/// its own channel so tests can wait on the *next* one with a bounded
+/// timeout instead of polling or inferring it from an unrelated event. The
+/// two channels are independent: nothing here orders an emission against a
+/// notice beyond what `dispatch`/`run_effect` themselves guarantee, so a
+/// test that wants a notice must wait for it explicitly via `recv_notice`
+/// rather than assuming it already happened because some state was observed.
 struct FakeSink {
     states_tx: Sender<Emission>,
-    notices: Arc<Mutex<Vec<(String, String)>>>,
+    notices_tx: Sender<Notice>,
 }
 
 impl EventSink for FakeSink {
@@ -172,10 +181,7 @@ impl EventSink for FakeSink {
     }
 
     fn notify(&self, kind: &str, msg: &str) {
-        self.notices
-            .lock()
-            .expect("lock")
-            .push((kind.to_string(), msg.to_string()));
+        let _ = self.notices_tx.send((kind.to_string(), msg.to_string()));
     }
 }
 
@@ -215,6 +221,17 @@ fn recv_partial(rx: &Receiver<Emission>) -> Option<String> {
     }
 }
 
+/// Waits for the next notice with the same bounded timeout `recv_state`
+/// uses, instead of inferring a notice happened from some unrelated state
+/// emission — `emit_state` and `notify` are ordered relative to each other
+/// only by whatever `dispatch`/`run_effect` actually guarantee (see
+/// `run_effect`'s effect ordering), which for some transitions puts the
+/// notice *after* a state a test has already observed.
+fn recv_notice(rx: &Receiver<Notice>) -> Notice {
+    rx.recv_timeout(WAIT)
+        .expect("expected a notify() call within the timeout")
+}
+
 fn assert_no_more_states(rx: &Receiver<Emission>) {
     assert!(
         rx.recv_timeout(Duration::from_millis(200)).is_err(),
@@ -222,8 +239,61 @@ fn assert_no_more_states(rx: &Receiver<Emission>) {
     );
 }
 
-/// Common `RuntimeDeps` fields every test wants; individual fields are
-/// overridden per test before calling `build`.
+/// A `ProfileLoader` that hands back a pre-built `ProfileDeps` for each profile id exactly once
+/// (`.remove()`s it out of a per-id slot), panicking if the registry ever asks for the same
+/// profile's deps a second time -- which only happens if a test's own profile list has a
+/// duplicate id, a fixture bug this is deliberately strict about rather than silently rebuilding
+/// or reusing something. `ProfileRegistry` itself only ever calls `load` once per entry and
+/// caches the result forever (see its own doc comment), so this is never exercised twice for the
+/// same id in practice.
+struct FakeProfileLoader {
+    slots: Mutex<HashMap<String, ProfileDeps>>,
+}
+
+impl ProfileLoader for FakeProfileLoader {
+    fn load(&self, profile: &LanguageProfile) -> (ProfileDeps, Vec<(&'static str, String)>) {
+        let deps = self
+            .slots
+            .lock()
+            .expect("lock")
+            .remove(&profile.id)
+            .unwrap_or_else(|| panic!("no fixture registered for profile \"{}\"", profile.id));
+        (deps, Vec::new())
+    }
+}
+
+/// Builds a `ProfileRegistry` over `profiles`, each paired with the exact `ProfileDeps` it must
+/// resolve to -- the hotkey string in each `LanguageProfile` is never consulted by the worker
+/// (only `runtime_boot::parse_profile_hotkeys` reads it, an earlier step these tests bypass by
+/// constructing `RuntimeDeps` directly and driving `hotkey_rx` with synthetic `BindingId`s), so
+/// any placeholder works.
+fn registry_with(profiles_and_deps: Vec<(LanguageProfile, ProfileDeps)>) -> ProfileRegistry {
+    let mut slots = HashMap::new();
+    let mut profiles = Vec::new();
+    for (profile, deps) in profiles_and_deps {
+        slots.insert(profile.id.clone(), deps);
+        profiles.push(profile);
+    }
+    let loader = Box::new(FakeProfileLoader {
+        slots: Mutex::new(slots),
+    });
+    let (registry, _notices) = ProfileRegistry::new(profiles, loader);
+    registry
+}
+
+fn test_profile(id: &str) -> LanguageProfile {
+    LanguageProfile {
+        id: id.to_string(),
+        ..LanguageProfile::default()
+    }
+}
+
+/// Common `RuntimeDeps`/`ProfileDeps` fields every test wants; individual fields are overridden
+/// per test before calling `build`. Always builds a `ProfileRegistry` with exactly one profile
+/// (id `"default"`, binding 0) -- every existing test presses/toggles `BindingId::from(0)`, so a
+/// single-profile registry keeps them all exercising the same worker-side behaviour they always
+/// have. Multi-profile routing itself is covered separately (see
+/// `each_hotkey_dictates_with_its_own_profile`).
 struct DepsBuilder {
     mode: DictationMode,
     refine_enabled: bool,
@@ -240,6 +310,11 @@ struct DepsBuilder {
     silence: Option<Duration>,
     capture_tx_slot: Arc<Mutex<Option<Sender<AudioFrame>>>>,
     dictionary_terms: Vec<String>,
+    /// The profile's language, as read into `TranscribeOptions.language` by `start_capture`.
+    /// Defaults to `None` like every other fixture; the one test that cares sets a real value
+    /// and asserts it reached `begin_opts`, since this is the single hop that makes a profile's
+    /// language reach the engine at all.
+    language: Option<String>,
     begin_opts: Arc<Mutex<Vec<TranscribeOptions>>>,
 }
 
@@ -261,19 +336,17 @@ impl DepsBuilder {
             silence: None,
             capture_tx_slot: Arc::new(Mutex::new(None)),
             dictionary_terms: Vec::new(),
+            language: None,
             begin_opts: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     fn build(self, hotkey_rx: Receiver<HotkeyEvent>) -> RuntimeDeps {
-        let refiner: Option<Box<dyn TextRefiner>> = self.refiner.map(|(behavior, calls)| {
-            Box::new(FakeRefiner { behavior, calls }) as Box<dyn TextRefiner>
+        let refiner: Option<Arc<dyn TextRefiner>> = self.refiner.map(|(behavior, calls)| {
+            Arc::new(FakeRefiner { behavior, calls }) as Arc<dyn TextRefiner>
         });
 
-        RuntimeDeps {
-            mode: self.mode,
-            refine_enabled: self.refine_enabled,
-            silence: self.silence,
+        let profile_deps = ProfileDeps {
             engine: Box::new(FakeSttEngine {
                 result: self.engine_result,
                 calls: self.calls,
@@ -282,6 +355,19 @@ impl DepsBuilder {
                 begin_opts: self.begin_opts,
             }),
             refiner,
+            refine_enabled: self.refine_enabled,
+            tone: Tone::Clean,
+            language: self.language,
+            engine_label: "fake-engine".to_string(),
+            profile_id: "default".to_string(),
+            dictionary_terms: self.dictionary_terms,
+        };
+        let profiles = registry_with(vec![(test_profile("default"), profile_deps)]);
+
+        RuntimeDeps {
+            mode: self.mode,
+            silence: self.silence,
+            profiles,
             injector: Box::new(FakeInjector {
                 injected: self.injected,
                 fail: self.inject_fail,
@@ -296,24 +382,18 @@ impl DepsBuilder {
             hotkey_rx,
             vad_sensitivity: 0.5,
             refine_timeout: Duration::from_secs(1),
-            tone: Tone::Clean,
-            language: None,
-            engine_label: "fake-engine".to_string(),
-            dictionary_terms: self.dictionary_terms,
         }
     }
 }
 
-type Notices = Arc<Mutex<Vec<(String, String)>>>;
-
-fn fake_sink() -> (Arc<FakeSink>, Receiver<Emission>, Notices) {
+fn fake_sink() -> (Arc<FakeSink>, Receiver<Emission>, Receiver<Notice>) {
     let (states_tx, states_rx) = unbounded();
-    let notices = Arc::new(Mutex::new(Vec::new()));
+    let (notices_tx, notices_rx) = unbounded();
     let sink = Arc::new(FakeSink {
         states_tx,
-        notices: notices.clone(),
+        notices_tx,
     });
-    (sink, states_rx, notices)
+    (sink, states_rx, notices_rx)
 }
 
 /// Retrieves the `Sender<AudioFrame>` a `FakeCaptureBackend` stashed once
@@ -342,13 +422,66 @@ fn capture_tx(slot: &Arc<Mutex<Option<Sender<AudioFrame>>>>) -> Sender<AudioFram
     }
 }
 
+/// Builds a `ProfileDeps` whose engine always returns `text` from `finish()`, with no refiner --
+/// the shape most routing tests need, where only the *identity* of the profile's output matters.
+fn profile_deps_with_transcript(text: &str) -> ProfileDeps {
+    ProfileDeps {
+        engine: Box::new(FakeSttEngine {
+            result: Ok(transcript(text)),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            partial: None,
+            finish_delay: Duration::ZERO,
+            begin_opts: Arc::new(Mutex::new(Vec::new())),
+        }),
+        refiner: None,
+        refine_enabled: false,
+        tone: Tone::Clean,
+        language: None,
+        engine_label: "fake-engine".to_string(),
+        profile_id: "fake-profile".to_string(),
+        dictionary_terms: Vec::new(),
+    }
+}
+
+/// Like `profile_deps_with_transcript`, but with `profile_id` set to `id` instead of the shared
+/// `"fake-profile"` placeholder every routing test uses. Needed by any test asserting on the id a
+/// history row was attributed to: two profiles sharing that placeholder would make such an
+/// assertion unable to tell them apart, and `"fake-profile"` itself is just as unable as
+/// `"default"` to distinguish "the pressed profile's own id" from "a hardcoded string".
+fn profile_deps_with_transcript_and_id(text: &str, id: &str) -> ProfileDeps {
+    ProfileDeps {
+        profile_id: id.to_string(),
+        ..profile_deps_with_transcript(text)
+    }
+}
+
+/// Drives one full no-refine `PushToTalk` session for `binding` (press, release, and the
+/// resulting state sequence) -- the common shape `each_hotkey_dictates_with_its_own_profile` and
+/// `pressing_an_unregistered_binding_starts_no_session`'s companion tests both need.
+fn press_and_release(
+    hotkey_tx: &Sender<HotkeyEvent>,
+    states_rx: &Receiver<Emission>,
+    binding: BindingId,
+) {
+    hotkey_tx
+        .send(HotkeyEvent::Pressed { binding })
+        .expect("send pressed");
+    assert_eq!(recv_state(states_rx), "recording");
+    hotkey_tx
+        .send(HotkeyEvent::Released { binding })
+        .expect("send released");
+    assert_eq!(recv_state(states_rx), "transcribing");
+    assert_eq!(recv_state(states_rx), "injecting");
+    assert_eq!(recv_state(states_rx), "idle");
+}
+
 // ---- tests --------------------------------------------------------------
 
 #[test]
 fn happy_path_emits_full_sequence_and_injects_refined_text() {
     let refine_calls = Arc::new(AtomicUsize::new(0));
     let injected = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -359,11 +492,17 @@ fn happy_path_emits_full_sequence_and_injects_refined_text() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
 
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "refining");
@@ -380,7 +519,7 @@ fn happy_path_emits_full_sequence_and_injects_refined_text() {
 fn refiner_failure_injects_raw_and_notifies() {
     let refine_calls = Arc::new(AtomicUsize::new(0));
     let injected = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, notices) = fake_sink();
+    let (sink, states_rx, notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -394,27 +533,37 @@ fn refiner_failure_injects_raw_and_notifies() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "refining");
     assert_eq!(recv_state(&states_rx), "injecting");
+
+    // `RefineFailed` produces `[Inject(raw), NotifyInfo(..)]` (see
+    // `on_refining` in session.rs): the notice is the *second* effect, run
+    // only after `Inject`'s own nested dispatch has already emitted "idle".
+    // So waiting for "idle" on `states_rx` proves nothing about whether the
+    // notice has fired yet -- wait for it explicitly instead.
+    let (kind, msg) = recv_notice(&notices_rx);
+    assert_eq!(kind, "info");
+    assert!(
+        msg.contains("Refinement unavailable"),
+        "expected a refinement-unavailable notice, got {msg:?}"
+    );
+
     assert_eq!(recv_state(&states_rx), "idle");
 
     assert_eq!(*injected.lock().expect("lock"), vec!["hello world"]);
     assert_eq!(refine_calls.load(Ordering::SeqCst), 1);
-
-    let notices = notices.lock().expect("lock");
-    assert!(
-        notices
-            .iter()
-            .any(|(kind, msg)| kind == "info" && msg.contains("Refinement unavailable")),
-        "expected a refinement-unavailable notice, got {notices:?}"
-    );
-    drop(notices);
 
     handle.shutdown();
 }
@@ -426,7 +575,7 @@ fn dictionary_rule_applied_before_injection_and_history() {
     let history = HistoryRepo::open(&db_path).expect("open history db");
 
     let injected = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("open the pod bay doors")));
@@ -440,10 +589,16 @@ fn dictionary_rule_applied_before_injection_and_history() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "injecting");
@@ -462,25 +617,40 @@ fn dictionary_rule_applied_before_injection_and_history() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].raw_text, "open the pod bay doors");
     assert_eq!(entries[0].final_text, "open the airlock bay doors");
+    assert_eq!(
+        entries[0].profile_id.as_deref(),
+        Some("default"),
+        "the history row must be attributed to the profile that produced it"
+    );
 }
 
+/// Also pins the profile's `language` reaching `TranscribeOptions` (every other fixture in this
+/// file leaves it `None`, which made `start_capture` discarding it undetectable -- see
+/// `start_capture`'s use of `deps.language`).
 #[test]
 fn dictionary_terms_are_passed_to_engine_as_initial_prompt() {
     let begin_opts = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
     builder.dictionary_terms = vec!["SQLite".to_string(), "Tauri".to_string()];
+    builder.language = Some("ru".to_string());
     builder.begin_opts = begin_opts.clone();
     let deps = builder.build(hotkey_rx);
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "injecting");
@@ -489,6 +659,12 @@ fn dictionary_terms_are_passed_to_engine_as_initial_prompt() {
     let opts = begin_opts.lock().expect("lock");
     assert_eq!(opts.len(), 1);
     assert_eq!(opts[0].initial_prompt, Some("SQLite, Tauri".to_string()));
+    assert_eq!(
+        opts[0].language,
+        Some("ru".to_string()),
+        "the profile's own language must reach the engine's TranscribeOptions -- the single hop \
+         that makes a hotkey's profile dictate in its configured language"
+    );
     drop(opts);
 
     handle.shutdown();
@@ -497,7 +673,7 @@ fn dictionary_terms_are_passed_to_engine_as_initial_prompt() {
 #[test]
 fn empty_dictionary_terms_produce_no_initial_prompt() {
     let begin_opts = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -506,10 +682,16 @@ fn empty_dictionary_terms_produce_no_initial_prompt() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "injecting");
@@ -527,7 +709,7 @@ fn empty_dictionary_terms_produce_no_initial_prompt() {
 fn snippet_trigger_bypasses_refiner() {
     let refine_calls = Arc::new(AtomicUsize::new(0));
     let injected = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("insert my signature")));
@@ -542,10 +724,16 @@ fn snippet_trigger_bypasses_refiner() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "refining");
@@ -566,7 +754,7 @@ fn snippet_trigger_bypasses_refiner() {
 fn cancel_during_recording_injects_nothing() {
     let injected = Arc::new(Mutex::new(Vec::new()));
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("should never be seen")));
@@ -576,7 +764,11 @@ fn cancel_during_recording_injects_nothing() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
 
     handle.cancel();
@@ -602,7 +794,7 @@ fn cancel_after_finish_before_transcript_ready_injects_nothing() {
     // returns and the runtime checks for a pending cancel.
     let injected = Arc::new(Mutex::new(Vec::new()));
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -613,10 +805,16 @@ fn cancel_after_finish_before_transcript_ready_injects_nothing() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
 
@@ -641,7 +839,7 @@ fn cancel_during_refine_injects_nothing() {
     // distinguishable commit point to test beyond this one.
     let injected = Arc::new(Mutex::new(Vec::new()));
     let refine_calls = Arc::new(AtomicUsize::new(0));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -655,10 +853,16 @@ fn cancel_during_refine_injects_nothing() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "refining");
@@ -678,7 +882,7 @@ fn cancel_during_refine_injects_nothing() {
 #[test]
 fn empty_transcript_notifies_and_injects_nothing() {
     let injected = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, notices) = fake_sink();
+    let (sink, states_rx, notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("   ")));
@@ -687,23 +891,31 @@ fn empty_transcript_notifies_and_injects_nothing() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "idle");
 
+    // Absence assertion: checked directly, not awaited -- there's nothing to
+    // wait for here, only a Vec that must still be empty.
     assert!(injected.lock().expect("lock").is_empty());
-    let notices = notices.lock().expect("lock");
-    assert!(
-        notices
-            .iter()
-            .any(|(kind, msg)| kind == "info" && msg == "Nothing heard"),
-        "expected a 'Nothing heard' notice, got {notices:?}"
-    );
-    drop(notices);
+
+    // `TranscriptReady` with empty text produces `[NotifyInfo(..)]` after the
+    // transition to "idle" is already emitted (see `on_transcribing` in
+    // session.rs), so the notice can genuinely still be in flight here.
+    // Wait for it explicitly instead of inferring it already happened.
+    let (kind, msg) = recv_notice(&notices_rx);
+    assert_eq!(kind, "info");
+    assert_eq!(msg, "Nothing heard");
 
     handle.shutdown();
 }
@@ -716,7 +928,7 @@ fn history_entry_recorded_with_raw_and_final_text() {
 
     let refine_calls = Arc::new(AtomicUsize::new(0));
     let injected = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -728,10 +940,16 @@ fn history_entry_recorded_with_raw_and_final_text() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "refining");
@@ -759,7 +977,7 @@ fn reload_swaps_deps_between_sessions() {
     let injected_a = Arc::new(Mutex::new(Vec::new()));
     let injected_b = Arc::new(Mutex::new(Vec::new()));
     let begin_opts_b = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder_a = DepsBuilder::new(Ok(transcript("hello world")));
@@ -780,11 +998,15 @@ fn reload_swaps_deps_between_sessions() {
     handle.reload(deps_b);
 
     hotkey_tx_b
-        .send(HotkeyEvent::Pressed)
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
         .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
     hotkey_tx_b
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
     assert_eq!(recv_state(&states_rx), "transcribing");
     assert_eq!(recv_state(&states_rx), "injecting");
@@ -794,7 +1016,7 @@ fn reload_swaps_deps_between_sessions() {
     assert_eq!(*injected_b.lock().expect("lock"), vec!["second session"]);
 
     // The reloaded deps' dictionary terms must reach the STT engine as an
-    // `initial_prompt`, proving `WorkerCtx::apply` copies `dictionary_terms`
+    // `initial_prompt`, proving `WorkerCtx::apply` copies `profiles`
     // just like every other field (not just at `WorkerCtx::new`).
     let opts_b = begin_opts_b.lock().expect("lock");
     assert_eq!(opts_b.len(), 1);
@@ -803,7 +1025,9 @@ fn reload_swaps_deps_between_sessions() {
 
     // The old hotkey channel's receiver was dropped by `reload`; sending on
     // it now simply fails rather than resurrecting the old session.
-    let _ = hotkey_tx.send(HotkeyEvent::Pressed);
+    let _ = hotkey_tx.send(HotkeyEvent::Pressed {
+        binding: BindingId::from(0),
+    });
 
     handle.shutdown();
 }
@@ -811,7 +1035,7 @@ fn reload_swaps_deps_between_sessions() {
 #[test]
 fn toggle_drives_a_full_session_in_toggle_mode() {
     let injected = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (_hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("toggled")));
@@ -838,7 +1062,7 @@ fn toggle_drives_a_full_session_in_toggle_mode() {
 fn audio_frames_are_fed_to_engine_and_partial_reaches_sink() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let tx_slot = Arc::new(Mutex::new(None));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -849,7 +1073,11 @@ fn audio_frames_are_fed_to_engine_and_partial_reaches_sink() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
 
     let tx = capture_tx(&tx_slot);
@@ -880,7 +1108,7 @@ fn audio_frames_are_fed_to_engine_and_partial_reaches_sink() {
 fn trailing_frames_are_fed_before_finish_is_called() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let tx_slot = Arc::new(Mutex::new(None));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -890,7 +1118,11 @@ fn trailing_frames_are_fed_before_finish_is_called() {
 
     let handle = Runtime::spawn(deps, sink);
 
-    hotkey_tx.send(HotkeyEvent::Pressed).expect("send pressed");
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
     assert_eq!(recv_state(&states_rx), "recording");
 
     let tx = capture_tx(&tx_slot);
@@ -909,7 +1141,9 @@ fn trailing_frames_are_fed_before_finish_is_called() {
     })
     .expect("send frame 2");
     hotkey_tx
-        .send(HotkeyEvent::Released)
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
         .expect("send released");
 
     // Depending on which the `select!` loop happens to service first, zero,
@@ -948,7 +1182,7 @@ fn trailing_frames_are_fed_before_finish_is_called() {
 #[test]
 fn silence_timeout_stops_recording_without_hotkey_release() {
     let tx_slot = Arc::new(Mutex::new(None));
-    let (sink, states_rx, _notices) = fake_sink();
+    let (sink, states_rx, _notices_rx) = fake_sink();
 
     let (_hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -980,6 +1214,337 @@ fn silence_timeout_stops_recording_without_hotkey_release() {
     recv_until(&states_rx, "transcribing");
     recv_until(&states_rx, "injecting");
     recv_until(&states_rx, "idle");
+
+    handle.shutdown();
+}
+
+/// Pins the whole point of per-profile routing: which profile a press resolves to must actually
+/// be driven by its `BindingId`, not just "whichever engine happened to load first". The two
+/// profiles are
+/// deliberately given *different* output text (Russian vs. English) rather than the same text --
+/// a routing bug that always used binding 0's profile, or that shared one `Session`/engine across
+/// bindings, would still pass a test whose profiles produced identical text. Both directions are
+/// asserted (press 1 then 0, not just 0 then 1) so a bug that only gets the *first* press right
+/// (e.g. one that latches onto whichever profile started the worker) cannot slip through.
+#[test]
+fn each_hotkey_dictates_with_its_own_profile() {
+    let injected = Arc::new(Mutex::new(Vec::new()));
+    let (sink, states_rx, _notices_rx) = fake_sink();
+    let (hotkey_tx, hotkey_rx) = unbounded();
+
+    let profiles = registry_with(vec![
+        (test_profile("ru"), profile_deps_with_transcript("привет")),
+        (test_profile("en"), profile_deps_with_transcript("hello")),
+    ]);
+
+    let deps = RuntimeDeps {
+        mode: DictationMode::PushToTalk,
+        silence: None,
+        profiles,
+        injector: Box::new(FakeInjector {
+            injected: injected.clone(),
+            fail: false,
+        }),
+        rules: Vec::new(),
+        snippets: Vec::new(),
+        history: None,
+        capture_device: None,
+        capture: Box::new(FakeCaptureBackend {
+            tx_slot: Arc::new(Mutex::new(None)),
+        }),
+        hotkey_rx,
+        vad_sensitivity: 0.5,
+        refine_timeout: Duration::from_secs(1),
+    };
+
+    let handle = Runtime::spawn(deps, sink);
+
+    press_and_release(&hotkey_tx, &states_rx, BindingId::from(1));
+    assert_eq!(
+        injected.lock().expect("lock").last(),
+        Some(&"hello".to_string()),
+        "binding 1 must dictate with the \"en\" profile, loaded lazily on this first press"
+    );
+
+    press_and_release(&hotkey_tx, &states_rx, BindingId::from(0));
+    assert_eq!(
+        injected.lock().expect("lock").last(),
+        Some(&"привет".to_string()),
+        "binding 0 must dictate with the \"ru\" profile, not stay latched on binding 1's"
+    );
+
+    handle.shutdown();
+}
+
+/// Pins the `Session::new`-at-press-time fix the task brief calls out: `refine_enabled` is a
+/// per-profile value now, so a session started by one binding must not carry over whatever the
+/// *previous* binding's flag was. Binding 0's profile has refinement off, binding 1's has it on
+/// (with a real, distinguishable refiner); pressing 0 then 1 proves the flag is read fresh at
+/// each press rather than fixed for the worker's whole lifetime.
+#[test]
+fn each_profile_applies_its_own_refine_enabled_flag_at_press_time() {
+    let injected = Arc::new(Mutex::new(Vec::new()));
+    let refine_calls = Arc::new(AtomicUsize::new(0));
+    let (sink, states_rx, _notices_rx) = fake_sink();
+    let (hotkey_tx, hotkey_rx) = unbounded();
+
+    let off_deps = profile_deps_with_transcript("plain");
+
+    let mut on_deps = profile_deps_with_transcript("fancy");
+    on_deps.refine_enabled = true;
+    on_deps.refiner = Some(Arc::new(FakeRefiner {
+        behavior: RefineBehavior::Uppercase,
+        calls: refine_calls.clone(),
+    }));
+
+    let profiles = registry_with(vec![
+        (test_profile("off"), off_deps),
+        (test_profile("on"), on_deps),
+    ]);
+
+    let deps = RuntimeDeps {
+        mode: DictationMode::PushToTalk,
+        silence: None,
+        profiles,
+        injector: Box::new(FakeInjector {
+            injected: injected.clone(),
+            fail: false,
+        }),
+        rules: Vec::new(),
+        snippets: Vec::new(),
+        history: None,
+        capture_device: None,
+        capture: Box::new(FakeCaptureBackend {
+            tx_slot: Arc::new(Mutex::new(None)),
+        }),
+        hotkey_rx,
+        vad_sensitivity: 0.5,
+        refine_timeout: Duration::from_secs(1),
+    };
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+    hotkey_tx
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
+        .expect("send released");
+    assert_eq!(recv_state(&states_rx), "transcribing");
+    assert_eq!(recv_state(&states_rx), "injecting");
+    assert_eq!(recv_state(&states_rx), "idle");
+    assert_eq!(
+        injected.lock().expect("lock").last(),
+        Some(&"plain".to_string())
+    );
+    assert_eq!(
+        refine_calls.load(Ordering::SeqCst),
+        0,
+        "binding 0's profile has refinement off"
+    );
+
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(1),
+        })
+        .expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+    hotkey_tx
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(1),
+        })
+        .expect("send released");
+    assert_eq!(recv_state(&states_rx), "transcribing");
+    assert_eq!(recv_state(&states_rx), "refining");
+    assert_eq!(recv_state(&states_rx), "injecting");
+    assert_eq!(recv_state(&states_rx), "idle");
+    assert_eq!(
+        injected.lock().expect("lock").last(),
+        Some(&"FANCY".to_string())
+    );
+    assert_eq!(
+        refine_calls.load(Ordering::SeqCst),
+        1,
+        "binding 1's profile has refinement on and must actually run it"
+    );
+
+    handle.shutdown();
+}
+
+/// Pins the `session.state() == State::Idle` guard in `handle_hotkey_pressed` (see its module doc
+/// comment): a binding is only ever (re)selected while the session is `Idle`. `Toggle` mode's
+/// second press -- the one that stops recording -- need not come from the same binding that
+/// started it (a user could, in principle, hit a different profile's chord mid-utterance); the
+/// guard is what makes that press stop the in-flight session instead of being treated as a fresh
+/// selection. Without it, `start_session_for` would run again, reconstructing `Session` back to
+/// `Idle` and making `on_idle(HotkeyPressed)` start a *new* recording rather than stop the old
+/// one -- so `Toggle`-mode dictation could never be stopped by its own hotkey, and the
+/// overwritten `ctx.active_capture` would drop the first press's capture handle without
+/// `stop()`, leaking its audio stream. Two profiles with deliberately different transcripts:
+/// press binding 0 to start, then press binding 1 while `Recording`. The correct outcome is a
+/// single `"transcribing"` emission (the *same* session stopping) and an injected transcript
+/// from binding 0's profile -- binding 1 must never be consulted.
+#[test]
+fn second_binding_pressed_mid_recording_in_toggle_mode_stops_binding_zeros_session() {
+    let injected = Arc::new(Mutex::new(Vec::new()));
+    let (sink, states_rx, _notices_rx) = fake_sink();
+    let (hotkey_tx, hotkey_rx) = unbounded();
+
+    let profiles = registry_with(vec![
+        (test_profile("zero"), profile_deps_with_transcript("first")),
+        (test_profile("one"), profile_deps_with_transcript("second")),
+    ]);
+
+    let deps = RuntimeDeps {
+        mode: DictationMode::Toggle,
+        silence: None,
+        profiles,
+        injector: Box::new(FakeInjector {
+            injected: injected.clone(),
+            fail: false,
+        }),
+        rules: Vec::new(),
+        snippets: Vec::new(),
+        history: None,
+        capture_device: None,
+        capture: Box::new(FakeCaptureBackend {
+            tx_slot: Arc::new(Mutex::new(None)),
+        }),
+        hotkey_rx,
+        vad_sensitivity: 0.5,
+        refine_timeout: Duration::from_secs(1),
+    };
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+
+    // Binding 1, pressed while binding 0's session is `Recording` -- not `Idle` -- must not be
+    // consulted at all (see `handle_hotkey_pressed`'s doc comment): this press just stops the
+    // in-flight session.
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(1),
+        })
+        .expect("send pressed");
+    assert_eq!(
+        recv_state(&states_rx),
+        "transcribing",
+        "the second press must stop binding 0's session, not rebuild it and start recording \
+         again with binding 1's profile"
+    );
+    assert_eq!(recv_state(&states_rx), "injecting");
+    assert_eq!(recv_state(&states_rx), "idle");
+
+    assert_eq!(
+        injected.lock().expect("lock").last(),
+        Some(&"first".to_string()),
+        "the utterance must still transcribe with binding 0's profile -- binding 1 was pressed \
+         mid-recording and must never be consulted"
+    );
+
+    assert_no_more_states(&states_rx);
+
+    handle.shutdown();
+}
+
+/// Pins that a history row is attributed to the profile that actually produced it, on a
+/// registry where that is provable -- a *two*-profile registry whose ids are neither "default"
+/// (the id `LanguageProfile::default()` and `DepsBuilder`'s single-profile fixture both happen to
+/// use) nor `profile_deps_with_transcript`'s shared `"fake-profile"` placeholder. Both existing
+/// history tests (`dictionary_rule_applied_before_injection_and_history`,
+/// `history_entry_recorded_with_raw_and_final_text`) build a single-profile registry whose only
+/// profile is named "default" and assert `profile_id == Some("default")`, which cannot
+/// distinguish "the pressed profile's own id was copied" from "the string default was hardcoded"
+/// -- the fixture-at-its-defaults shape this branch has hit repeatedly. Pressing binding 1 here
+/// must write binding 1's id ("en"), not binding 0's ("ru") and not "default".
+#[test]
+fn history_entry_attributes_to_the_profile_that_was_actually_pressed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("history.sqlite3");
+    let history = HistoryRepo::open(&db_path).expect("open history db");
+
+    let (sink, states_rx, _notices_rx) = fake_sink();
+    let (hotkey_tx, hotkey_rx) = unbounded();
+
+    let profiles = registry_with(vec![
+        (
+            test_profile("ru"),
+            profile_deps_with_transcript_and_id("привет", "ru"),
+        ),
+        (
+            test_profile("en"),
+            profile_deps_with_transcript_and_id("hello", "en"),
+        ),
+    ]);
+
+    let deps = RuntimeDeps {
+        mode: DictationMode::PushToTalk,
+        silence: None,
+        profiles,
+        injector: Box::new(FakeInjector {
+            injected: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        }),
+        rules: Vec::new(),
+        snippets: Vec::new(),
+        history: Some(history),
+        capture_device: None,
+        capture: Box::new(FakeCaptureBackend {
+            tx_slot: Arc::new(Mutex::new(None)),
+        }),
+        hotkey_rx,
+        vad_sensitivity: 0.5,
+        refine_timeout: Duration::from_secs(1),
+    };
+
+    let handle = Runtime::spawn(deps, sink);
+
+    press_and_release(&hotkey_tx, &states_rx, BindingId::from(1));
+
+    handle.shutdown();
+
+    let verify = HistoryRepo::open(&db_path).expect("reopen history db");
+    let entries = verify.list(None, 10).expect("list history");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].profile_id.as_deref(),
+        Some("en"),
+        "the history row must be attributed to binding 1's profile (\"en\"), not binding 0's \
+         (\"ru\") and not a hardcoded \"default\""
+    );
+}
+
+/// `ProfileRegistry::deps_for` returning `None` means only one thing: no binding with that id
+/// exists (see its doc comment). In production this is unreachable -- `create_source` is only
+/// ever handed specs for bindings the registry also has entries for -- but the worker still
+/// checks explicitly (`handle_hotkey_pressed`) rather than assuming, and this pins that a press
+/// for an unknown id is dropped silently: no session starts, nothing crashes.
+#[test]
+fn pressing_an_unregistered_binding_starts_no_session() {
+    let (sink, states_rx, _notices_rx) = fake_sink();
+    let (hotkey_tx, hotkey_rx) = unbounded();
+
+    let builder = DepsBuilder::new(Ok(transcript("hello world")));
+    let deps = builder.build(hotkey_rx); // single-profile registry: only binding 0 exists.
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(1),
+        })
+        .expect("send pressed");
+    assert_no_more_states(&states_rx);
 
     handle.shutdown();
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { formatCombo, isModifierToken, tokenFor } from '../hotkey'
+import { chordsConflict, formatCombo, isModifierToken, parseChordTokens, tokenFor } from '../hotkey'
 
 describe('tokenFor', () => {
   it('reads plain letters and digits from `key` when `code` is absent', () => {
@@ -79,5 +79,52 @@ describe('formatCombo', () => {
 
   it('supports a modifier-only chord', () => {
     expect(formatCombo(new Set(['super', 'ctrl']))).toBe('ctrl+super')
+  })
+})
+
+describe('parseChordTokens', () => {
+  it('lowercases and trims tokens', () => {
+    expect(parseChordTokens('Ctrl+ Super ')).toEqual(new Set(['ctrl', 'super']))
+  })
+
+  it('treats a chord with no tokens as unparseable, mirroring HotkeyParseError::Empty', () => {
+    expect(parseChordTokens('')).toBeNull()
+    expect(parseChordTokens('+')).toBeNull()
+    expect(parseChordTokens('   ')).toBeNull()
+  })
+})
+
+// Mirrors `chords_that_can_complete_together_conflict_but_nested_ones_do_not`
+// in `crates/utter-inject/src/hotkey.rs`, token-for-token, so the two
+// implementations of "conflict" are checked against the same fixture chords
+// rather than against independently-invented ones.
+describe('chordsConflict', () => {
+  const tokens = (chord: string) => parseChordTokens(chord)!
+
+  it('identical chords conflict', () => {
+    const a = tokens('ctrl+super')
+    const b = tokens('ctrl+super')
+    expect(chordsConflict(a, b)).toBe(true)
+  })
+
+  it('a nested chord does not conflict with the shorter chord it contains', () => {
+    // ctrl+alt+super can complete on the same event as ctrl+super, but the Rust
+    // matcher's most-specific-wins latch already resolves that deterministically,
+    // so this check has nothing useful to report for the nested pair.
+    const shorter = tokens('ctrl+super')
+    const nested = tokens('ctrl+alt+super')
+    expect(chordsConflict(shorter, nested)).toBe(false)
+  })
+
+  it('two chords that overlap without either containing the other conflict', () => {
+    // Holding ctrl+alt and then pressing super completes both ctrl+alt and
+    // alt+super at once.
+    const partner = tokens('ctrl+alt')
+    const overlapping = tokens('alt+super')
+    expect(chordsConflict(partner, overlapping)).toBe(true)
+  })
+
+  it('disjoint chords do not conflict', () => {
+    expect(chordsConflict(tokens('ctrl+super'), tokens('alt+shift+d'))).toBe(false)
   })
 })

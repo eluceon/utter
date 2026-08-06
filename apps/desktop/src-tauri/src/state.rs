@@ -32,6 +32,12 @@ pub struct AppState {
     /// the next successful `save_settings` spins one up (see
     /// `runtime_boot::rebuild`).
     pub session_ctl: Mutex<Option<RuntimeHandle>>,
+    /// Set when settings could not be loaded because a v0.1 config failed to
+    /// migrate (see `utter_store::MigrationFailed`): the app boots with
+    /// `Settings::default()` for this run and `runtime_boot::boot` queues
+    /// this as a user-facing notice once the runtime is up. `None` on every
+    /// other startup, including a normal migration.
+    pub startup_notice: Option<String>,
     /// Live mirror of `settings.dictation.hud`, shared with every
     /// `TauriEventSink` (see `crate::sink`). A plain `RwLock<Settings>` read
     /// isn't enough on its own: the sink used by an already-running
@@ -47,9 +53,25 @@ impl AppState {
     /// Builds application state: loads settings from disk (defaulting if
     /// absent), and opens the history database, creating both the on-disk
     /// config and data directories as needed.
+    ///
+    /// A config that fails to migrate degrades rather than aborting startup:
+    /// the original file is left exactly as `utter_store::load` left it (see
+    /// its doc comment), this run boots with `Settings::default()`, and
+    /// `startup_notice` carries a message for `runtime_boot::boot` to queue.
+    /// Any other load failure (unreadable file, genuinely malformed TOML
+    /// unrelated to migration) still aborts startup, as it did before.
     pub fn new() -> Result<Self> {
-        let settings =
-            utter_store::load(&utter_store::config_path()).context("failed to load settings")?;
+        let config_path = utter_store::config_path();
+        let (settings, startup_notice) = match utter_store::load(&config_path) {
+            Ok(settings) => (settings, None),
+            Err(err) => match err.downcast_ref::<utter_store::MigrationFailed>() {
+                Some(failed) => {
+                    tracing::warn!("{err:#}");
+                    (Settings::default(), Some(migration_notice(failed)))
+                }
+                None => return Err(err).context("failed to load settings"),
+            },
+        };
         let hud_enabled = Arc::new(AtomicBool::new(settings.dictation.hud));
 
         let models = Arc::new(ModelManager::new(data_dir()?));
@@ -61,8 +83,31 @@ impl AppState {
             models,
             history: Mutex::new(history),
             session_ctl: Mutex::new(None),
+            startup_notice,
             hud_enabled,
         })
+    }
+}
+
+/// Builds the notice `AppState::new` queues for a config that could not be
+/// migrated. Names the backup only when `failed.backup` is `Some` — a
+/// `None` means the backup step itself is what failed, so the file at
+/// `failed.path` (left untouched) is the user's only copy, and the message
+/// must not claim a safety net that was never written.
+fn migration_notice(failed: &utter_store::MigrationFailed) -> String {
+    match &failed.backup {
+        Some(backup) => format!(
+            "Your settings at {} could not be upgraded to the new format and \
+             were left unchanged; a backup was saved at {}. Utter is running \
+             with default settings for now.",
+            failed.path.display(),
+            backup.display()
+        ),
+        None => format!(
+            "Your settings at {} could not be upgraded to the new format and \
+             were left unchanged. Utter is running with default settings for now.",
+            failed.path.display()
+        ),
     }
 }
 
@@ -81,4 +126,41 @@ fn data_dir() -> Result<PathBuf> {
 /// worker thread whenever `Settings.history.enabled` is true.
 pub(crate) fn history_db_path() -> Result<PathBuf> {
     Ok(data_dir()?.join(HISTORY_DB_FILE))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_notice_without_a_backup_does_not_claim_one_was_saved() {
+        // `backup: None` is what a real `MigrationFailed` carries when the
+        // backup step itself is what failed — see
+        // `utter_store::settings::migrate_and_persist`. The notice built
+        // from it must not tell the user a backup exists.
+        let failed = utter_store::MigrationFailed {
+            path: PathBuf::from("/home/user/.config/utter/config.toml"),
+            backup: None,
+        };
+
+        let notice = migration_notice(&failed);
+
+        assert!(
+            !notice.to_lowercase().contains("backup"),
+            "no backup was written, so the notice must not mention one: {notice}"
+        );
+        assert!(notice.contains("config.toml"), "must still name the file");
+    }
+
+    #[test]
+    fn a_notice_with_a_backup_names_it() {
+        let failed = utter_store::MigrationFailed {
+            path: PathBuf::from("/home/user/.config/utter/config.toml"),
+            backup: Some(PathBuf::from("/home/user/.config/utter/config.toml.v1.bak")),
+        };
+
+        let notice = migration_notice(&failed);
+
+        assert!(notice.contains("config.toml.v1.bak"));
+    }
 }

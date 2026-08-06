@@ -443,6 +443,18 @@ fn profile_deps_with_transcript(text: &str) -> ProfileDeps {
     }
 }
 
+/// Like `profile_deps_with_transcript`, but with `profile_id` set to `id` instead of the shared
+/// `"fake-profile"` placeholder every routing test uses. Needed by any test asserting on the id a
+/// history row was attributed to: two profiles sharing that placeholder would make such an
+/// assertion unable to tell them apart, and `"fake-profile"` itself is just as unable as
+/// `"default"` to distinguish "the pressed profile's own id" from "a hardcoded string".
+fn profile_deps_with_transcript_and_id(text: &str, id: &str) -> ProfileDeps {
+    ProfileDeps {
+        profile_id: id.to_string(),
+        ..profile_deps_with_transcript(text)
+    }
+}
+
 /// Drives one full no-refine `PushToTalk` session for `binding` (press, release, and the
 /// resulting state sequence) -- the common shape `each_hotkey_dictates_with_its_own_profile` and
 /// `pressing_an_unregistered_binding_starts_no_session`'s companion tests both need.
@@ -1443,6 +1455,73 @@ fn second_binding_pressed_mid_recording_in_toggle_mode_stops_binding_zeros_sessi
     assert_no_more_states(&states_rx);
 
     handle.shutdown();
+}
+
+/// Pins that a history row is attributed to the profile that actually produced it, on a
+/// registry where that is provable -- a *two*-profile registry whose ids are neither "default"
+/// (the id `LanguageProfile::default()` and `DepsBuilder`'s single-profile fixture both happen to
+/// use) nor `profile_deps_with_transcript`'s shared `"fake-profile"` placeholder. Both existing
+/// history tests (`dictionary_rule_applied_before_injection_and_history`,
+/// `history_entry_recorded_with_raw_and_final_text`) build a single-profile registry whose only
+/// profile is named "default" and assert `profile_id == Some("default")`, which cannot
+/// distinguish "the pressed profile's own id was copied" from "the string default was hardcoded"
+/// -- the fixture-at-its-defaults shape this branch has hit repeatedly. Pressing binding 1 here
+/// must write binding 1's id ("en"), not binding 0's ("ru") and not "default".
+#[test]
+fn history_entry_attributes_to_the_profile_that_was_actually_pressed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("history.sqlite3");
+    let history = HistoryRepo::open(&db_path).expect("open history db");
+
+    let (sink, states_rx, _notices_rx) = fake_sink();
+    let (hotkey_tx, hotkey_rx) = unbounded();
+
+    let profiles = registry_with(vec![
+        (
+            test_profile("ru"),
+            profile_deps_with_transcript_and_id("привет", "ru"),
+        ),
+        (
+            test_profile("en"),
+            profile_deps_with_transcript_and_id("hello", "en"),
+        ),
+    ]);
+
+    let deps = RuntimeDeps {
+        mode: DictationMode::PushToTalk,
+        silence: None,
+        profiles,
+        injector: Box::new(FakeInjector {
+            injected: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        }),
+        rules: Vec::new(),
+        snippets: Vec::new(),
+        history: Some(history),
+        capture_device: None,
+        capture: Box::new(FakeCaptureBackend {
+            tx_slot: Arc::new(Mutex::new(None)),
+        }),
+        hotkey_rx,
+        vad_sensitivity: 0.5,
+        refine_timeout: Duration::from_secs(1),
+    };
+
+    let handle = Runtime::spawn(deps, sink);
+
+    press_and_release(&hotkey_tx, &states_rx, BindingId::from(1));
+
+    handle.shutdown();
+
+    let verify = HistoryRepo::open(&db_path).expect("reopen history db");
+    let entries = verify.list(None, 10).expect("list history");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].profile_id.as_deref(),
+        Some("en"),
+        "the history row must be attributed to binding 1's profile (\"en\"), not binding 0's \
+         (\"ru\") and not a hardcoded \"default\""
+    );
 }
 
 /// `ProfileRegistry::deps_for` returning `None` means only one thing: no binding with that id

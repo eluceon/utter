@@ -631,6 +631,7 @@ mod tests {
         );
 
         let mut profile = LanguageProfile {
+            id: "ru".to_string(),
             language: "ru".to_string(),
             ..LanguageProfile::default()
         };
@@ -658,8 +659,11 @@ mod tests {
             "the profile's own tone must reach ProfileDeps"
         );
         assert_eq!(
-            deps.profile_id, "default",
-            "the profile's own id must reach ProfileDeps, not be left blank"
+            deps.profile_id, "ru",
+            "the profile's own id must reach ProfileDeps, not be hardcoded -- the profile's id \
+             is deliberately not \"default\" here, since a fixture built from \
+             `LanguageProfile::default()` (whose id is literally \"default\") cannot tell a \
+             copied id from a hardcoded string"
         );
     }
 

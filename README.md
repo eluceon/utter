@@ -192,8 +192,10 @@ rejected, so the format tolerates being hand-edited or partially upgraded.
   never in `config.toml`.
 - **Injection** — `advanced.injection` picks the strategy: `auto` (try every
   backend in order), or pin `clipboard_paste`, `type`, or `clipboard_only`.
-  `auto` suits most desktops; `type` is the more reliable choice for
-  terminals, where `Ctrl+V` is not the paste shortcut.
+  `auto` suits most desktops. Clipboard-paste synthesizes Shift+Insert rather
+  than Ctrl+V, and publishes the text to both the CLIPBOARD and PRIMARY
+  selections, so it works with a non-Latin keyboard layout active and in
+  terminals alike.
 - **Dictionary and snippets** — custom terms and replacement rules live
   under `[dictionary]`; snippets are a list of trigger/body pairs under
   `[[snippets]]`. Both are editable from the settings UI.

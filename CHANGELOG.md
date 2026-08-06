@@ -35,6 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Clipboard-paste injection synthesizes Shift+Insert instead of Ctrl+V, and
+  publishes the transcript to both the CLIPBOARD and PRIMARY selections.
+  uinput emits raw key codes, which the compositor reads through whichever
+  keyboard layout is active: with a Russian layout the Ctrl+V code means
+  Ctrl+м, so nothing pasted and the bare letter "м" was inserted instead of
+  the transcript. Insert carries no character, so it survives any layout.
 - Decoding switches from greedy to beam search automatically once the
   dictionary has terms, so hotword biasing is available without the
   latency cost falling on users with an empty dictionary.

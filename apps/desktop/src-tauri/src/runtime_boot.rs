@@ -319,7 +319,7 @@ pub(crate) fn build_engine(
 fn build_whisper(model_id: &str, models: &ModelManager) -> (Box<dyn SttEngine>, Option<String>) {
     let Some(path) = models.path_for(model_id) else {
         let reason = format!(
-            "whisper model \"{model_id}\" is not downloaded; open Settings > Models to download it"
+            "whisper model \"{model_id}\" is not downloaded; open Settings > Engines to download it"
         );
         return (unavailable_engine(reason.clone()), Some(reason));
     };
@@ -355,7 +355,7 @@ fn build_sherpa(
 ) -> (Box<dyn SttEngine>, Option<String>) {
     let Some(model_id) = model_id else {
         let reason =
-            "no sherpa model configured; open Settings > Models to download one".to_string();
+            "no sherpa model configured; open Settings > Engines to download one".to_string();
         return (unavailable_engine(reason.clone()), Some(reason));
     };
 
@@ -364,13 +364,13 @@ fn build_sherpa(
         Err(IntegrityError::SizeMismatch { artifact, .. }) => {
             let reason = format!(
                 "sherpa model \"{model_id}\" is damaged (artifact \"{artifact}\" has the wrong \
-                 size); re-download it from Settings > Models"
+                 size); re-download it from Settings > Engines"
             );
             return (unavailable_engine(reason.clone()), Some(reason));
         }
         Err(_) => {
             let reason = format!(
-                "sherpa model \"{model_id}\" is not downloaded; open Settings > Models to \
+                "sherpa model \"{model_id}\" is not downloaded; open Settings > Engines to \
                  download it"
             );
             return (unavailable_engine(reason.clone()), Some(reason));
@@ -397,8 +397,8 @@ fn build_sherpa(
     _models: &ModelManager,
     _dictionary_terms: &[String],
 ) -> (Box<dyn SttEngine>, Option<String>) {
-    let reason = "this build was compiled without sherpa support; switch engines in Settings, \
-                   or install a build with the sherpa feature enabled"
+    let reason = "this build was compiled without sherpa support; switch this profile's engine \
+                   in Settings > Profiles, or install a build with the sherpa feature enabled"
         .to_string();
     (unavailable_engine(reason.clone()), Some(reason))
 }
@@ -412,7 +412,7 @@ const CLOUD_STT_TIMEOUT: Duration = Duration::from_secs(30);
 fn build_cloud(cfg: &CloudSttCfg) -> (Box<dyn SttEngine>, Option<String>) {
     let api_key = keyring_password(STT_KEY_SERVICE);
     let notice = api_key.is_none().then(|| {
-        "no cloud speech-to-text API key configured; open Settings > Engine to add one".to_string()
+        "no cloud speech-to-text API key configured; open Settings > Engines to add one".to_string()
     });
 
     let engine = CloudEngine::new(CloudSttConfig {
@@ -543,7 +543,7 @@ fn spawn_hotkey_sources(specs: &[HotkeySpec]) -> (Receiver<HotkeyEvent>, Option<
                 rx,
                 Some(format!(
                     "failed to start hotkey capture: {e}; check input group / uinput \
-                     permissions in Settings > Permissions"
+                     permissions (the checks onboarding ran at first launch)"
                 )),
             );
         }

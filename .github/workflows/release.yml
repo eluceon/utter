@@ -25,7 +25,14 @@ jobs:
             libayatana-appindicator3-dev librsvg2-dev \
             pkg-config build-essential cmake
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # No rust-cache here, deliberately. Its key covers the job name and
+      # `runner.os` ("Linux") but not the runner image, so moving this job
+      # from `ubuntu-latest` to `ubuntu-22.04` restored a cache the 24.04
+      # runner had filled: the `whisper-rs-sys` build script came back
+      # prebuilt against glibc 2.39 and could not execute, failing the build
+      # with the very error this pin exists to prevent. A release runs rarely
+      # and must not inherit binaries from a machine it is not running on;
+      # the few minutes a cold build costs buy that guarantee.
       - uses: actions/setup-node@v6
         with:
           node-version: "20"

@@ -142,6 +142,18 @@ mod linux_impl {
     /// the text to both selections.
     pub(super) const PASTE_CHORD: [KeyCode; 2] = [KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_INSERT];
 
+    /// The key transitions a chord expands to: every key pressed in the
+    /// order given, then released in the reverse order, so a modifier listed
+    /// first is down before — and still down after — the key it modifies.
+    ///
+    /// Pure so the ordering can be tested without a uinput device; see
+    /// [`VirtualKeyboard::chord`] for why the ordering matters.
+    pub(super) fn chord_steps(codes: &[KeyCode]) -> Vec<(KeyCode, i32)> {
+        let down = codes.iter().map(|&code| (code, 1));
+        let up = codes.iter().rev().map(|&code| (code, 0));
+        down.chain(up).collect()
+    }
+
     /// The union of every key code `char_to_key` can produce, plus the keys
     /// needed for [`PASTE_CHORD`].
     fn all_supported_keys() -> AttributeSet<KeyCode> {
@@ -219,13 +231,25 @@ mod linux_impl {
             Ok(())
         }
 
-        /// Presses then releases `codes` together, e.g. `[Ctrl, V]`, as two
-        /// separate uinput writes (one for the press, one for the release).
-        /// Used for the paste combo, where the two states are genuinely
-        /// meant to be visible to the compositor as distinct moments.
+        /// Presses `codes` in order and releases them in reverse, each key
+        /// transition in its own uinput write and therefore its own
+        /// `SYN_REPORT`.
+        ///
+        /// The ordering is the point. A real keyboard can never report a
+        /// modifier and the key it modifies going down at the same instant:
+        /// Shift settles into the modifier state first, and only the next
+        /// input frame carries Insert. Emitting both in one frame — as this
+        /// did until a `Shift+Insert` paste turned out to do nothing in
+        /// Chrome — leaves a toolkit free to process the second key before
+        /// it has applied the first, seeing a bare `Insert` and pasting
+        /// nothing. Wine and GTK tolerate the batched form; not everything
+        /// does, and hardware never produces it.
         fn chord(&mut self, codes: &[KeyCode]) -> Result<(), InjectError> {
-            self.emit(codes, 1)?;
-            self.emit(codes, 0)
+            for (code, value) in chord_steps(codes) {
+                self.emit(&[code], value)?;
+                std::thread::sleep(INTER_KEY_DELAY);
+            }
+            Ok(())
         }
 
         /// Presses and releases `codes` as a single uinput write carrying
@@ -301,8 +325,25 @@ pub(crate) use stub_impl::VirtualKeyboard;
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::linux_impl::{char_to_key, validate_typeable, PASTE_CHORD};
+    use super::linux_impl::{char_to_key, chord_steps, validate_typeable, PASTE_CHORD};
     use evdev::KeyCode;
+
+    #[test]
+    fn a_chord_presses_its_modifier_before_the_key_and_releases_it_after() {
+        // Hardware cannot report a modifier and its key going down in the
+        // same input frame, and a toolkit that processes the frame in order
+        // may apply the key before the modifier — seeing a bare Insert, and
+        // pasting nothing.
+        assert_eq!(
+            chord_steps(&PASTE_CHORD),
+            vec![
+                (KeyCode::KEY_LEFTSHIFT, 1),
+                (KeyCode::KEY_INSERT, 1),
+                (KeyCode::KEY_INSERT, 0),
+                (KeyCode::KEY_LEFTSHIFT, 0),
+            ]
+        );
+    }
 
     #[test]
     fn the_paste_chord_survives_a_non_latin_keyboard_layout() {

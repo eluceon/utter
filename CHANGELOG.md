@@ -41,6 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keyboard layout is active: with a Russian layout the Ctrl+V code means
   Ctrl+м, so nothing pasted and the bare letter "м" was inserted instead of
   the transcript. Insert carries no character, so it survives any layout.
+- A synthesized chord now presses its modifier in its own input frame and
+  releases it after the key, the way a real keyboard does, instead of
+  reporting both keys in one frame. Applications that process an input frame
+  in order could otherwise see the key before the modifier had been applied —
+  a bare Insert, which pastes nothing. Wine and GTK tolerated the batched
+  form; Chrome under Wayland did not, so dictation silently inserted nothing
+  there.
 - Decoding switches from greedy to beam search automatically once the
   dictionary has terms, so hotword biasing is available without the
   latency cost falling on users with an empty dictionary.

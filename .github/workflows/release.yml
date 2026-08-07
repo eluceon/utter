@@ -6,7 +6,15 @@ permissions:
   contents: write
 jobs:
   release:
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`. A binary links against the glibc of the
+    # machine that built it and will not start on anything older: built on
+    # 24.04 it demands GLIBC_2.39, so the published .deb died at exec time on
+    # Ubuntu 22.04 with `version 'GLIBC_2.39' not found`. Nothing catches
+    # that earlier -- the bundle's Depends names only the webkit/gtk
+    # libraries, so apt installs it happily. Building on the oldest release
+    # we support makes the floor glibc 2.35, which every newer distribution
+    # satisfies. Raise this only together with the minimum in the README.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
       - name: install system dependencies

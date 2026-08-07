@@ -118,6 +118,9 @@ Prebuilt `.deb` and AppImage packages are on the
 sherpa-onnx engine, so the offline models the default profile uses work
 without any extra setup.
 
+They are built on Ubuntu 22.04 and need **glibc 2.35 or newer** — Ubuntu
+22.04+, Debian 12+, Fedora 37+. On anything older, build from source.
+
 ### Build from source
 
 System dependencies (Debian/Ubuntu; see the [Tauri prerequisites

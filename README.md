@@ -113,9 +113,10 @@ default choice.
 
 ## Install
 
-Prebuilt `.deb` and AppImage packages will be published on the
-[Releases](https://github.com/eluceon/utter/releases) page starting with the
-v0.1 release.
+Prebuilt `.deb` and AppImage packages are on the
+[Releases](https://github.com/eluceon/utter/releases) page. They bundle the
+sherpa-onnx engine, so the offline models the default profile uses work
+without any extra setup.
 
 ### Build from source
 

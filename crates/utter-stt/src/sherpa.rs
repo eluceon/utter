@@ -1,16 +1,23 @@
-//! sherpa-onnx-backed offline [`SttEngine`] adapter.
+//! sherpa-onnx-backed [`SttEngine`] adapters.
 //!
 //! sherpa-onnx's offline recognizer is a batch API: the whole utterance is
 //! handed to it in one `accept_waveform` call rather than streamed
 //! incrementally. [`SherpaOfflineEngine`] therefore buffers samples during
 //! [`SttEngine::feed`] and runs the full decode in [`SttEngine::finish`]; it
-//! never emits partial transcripts. (Phase 3 adds a separate streaming
-//! engine over sherpa-onnx's *online* recognizer for that.)
+//! never emits partial transcripts.
+//!
+//! [`SherpaStreamingEngine`] wraps sherpa-onnx's *online* recognizer instead:
+//! each [`SttEngine::feed`] call decodes immediately and may return a
+//! partial hypothesis, which is what drives the live preview HUD. It is a
+//! draft engine — fast and streaming, but lower accuracy than the offline
+//! models — so its output is never the text that gets injected.
 
 use std::path::{Path, PathBuf};
 
 use sherpa_onnx::{
     OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig,
+    OnlineModelConfig, OnlineRecognizer, OnlineRecognizerConfig, OnlineStream,
+    OnlineTransducerModelConfig,
 };
 use utter_core::{SttEngine, SttError, TranscribeOptions, Transcript, SAMPLE_RATE};
 
@@ -23,7 +30,10 @@ use utter_core::{SttEngine, SttError, TranscribeOptions, Transcript, SAMPLE_RATE
 /// shared name.
 const ENCODER_CANDIDATES: [&str; 2] = ["encoder.int8.onnx", "encoder.onnx"];
 
-/// Configuration for [`SherpaOfflineEngine::load`].
+/// Configuration for [`SherpaOfflineEngine::load`] and
+/// [`SherpaStreamingEngine::load`]. Shared between the two engines rather
+/// than duplicated: both load a transducer from a model directory and both
+/// take the same knobs.
 #[derive(Debug, Clone, Default)]
 pub struct SherpaConfig {
     /// Number of onnxruntime inference threads. Clamped to at least one.
@@ -234,8 +244,7 @@ fn run_offline_decode(
     opts: &TranscribeOptions,
     samples: &[i16],
 ) -> Result<Transcript, SttError> {
-    // i16 -> f32 in [-1.0, 1.0), the format sherpa-onnx's feature extractor expects.
-    let audio: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
+    let audio = samples_to_f32(samples);
 
     let stream = match hotwords {
         Some(hotwords) => recognizer.create_stream_with_hotwords(hotwords),
@@ -253,6 +262,14 @@ fn run_offline_decode(
         text: result.text.trim().to_string(),
         language: opts.language.clone(),
     })
+}
+
+/// Converts `i16` PCM samples to `f32` in `[-1.0, 1.0)`, the format
+/// sherpa-onnx's feature extractor expects. Shared by the offline and
+/// streaming engines, which otherwise each convert a `&[i16]` buffer just
+/// before handing it to their respective `accept_waveform`.
+fn samples_to_f32(samples: &[i16]) -> Vec<f32> {
+    samples.iter().map(|&s| s as f32 / 32768.0).collect()
 }
 
 /// Locates the first of `candidates` that exists as a file inside `dir`.
@@ -320,9 +337,10 @@ fn build_hotwords_arg(hotwords: &[String]) -> Result<Option<String>, SttError> {
 ///
 /// This assumes the model being decoded is a transducer: the same upstream
 /// page states that hotwords only work for that model family.
-/// [`SherpaOfflineEngine::load`] only ever builds transducer configs (see
-/// its doc comment), so that assumption always holds at its call site. A
-/// loader that also accepted CTC models would need to detect that case
+/// [`SherpaOfflineEngine::load`] and [`SherpaStreamingEngine::load`] only
+/// ever build transducer configs (see their doc comments), so that
+/// assumption always holds at both call sites. A loader that also accepted
+/// CTC models would need to detect that case
 /// itself, log a warning naming the limitation, and force
 /// `"greedy_search"` regardless of the dictionary — silently dropping
 /// hotwords is safer than failing the load, but applying this function's
@@ -342,6 +360,243 @@ pub fn decoding_method(hotwords: &[String]) -> &'static str {
 /// waiting for text to appear, which is the worst possible moment.
 pub fn default_threads(available: usize) -> usize {
     (available / 2).clamp(1, 4)
+}
+
+/// A sherpa-onnx online (streaming) speech-to-text engine, loaded from a
+/// directory of streaming transducer model files and reusable across many
+/// begin/feed/finish transcription cycles.
+///
+/// Unlike [`SherpaOfflineEngine`], this decodes incrementally as samples
+/// arrive in [`SttEngine::feed`], which is what lets it surface a partial
+/// hypothesis while the user is still speaking.
+pub struct SherpaStreamingEngine {
+    /// The loaded recognizer. Only `None` for the `test_engine` double used
+    /// in this module's tests to exercise the begin/feed/finish ordering
+    /// rules without a real model; [`SherpaStreamingEngine::load`] is the
+    /// sole public constructor and always sets it to `Some`.
+    recognizer: Option<OnlineRecognizer>,
+    /// Joined hotwords string for `create_stream_with_hotwords`, or `None`
+    /// when the dictionary is empty and a plain stream should be used.
+    hotwords: Option<String>,
+    /// `Some` between `begin` and `finish`; `None` otherwise. Doubles as the
+    /// "has begin() been called yet" flag that `feed`/`finish` check.
+    opts: Option<TranscribeOptions>,
+    /// The stream for the in-progress utterance. Created lazily on the first
+    /// `feed()` call after `begin()` rather than in `begin()` itself, so
+    /// `begin()` never needs the recognizer — that keeps the begin/feed
+    /// ordering rules testable without a real model, the same way
+    /// [`begin_session`] is for the offline engine.
+    stream: Option<OnlineStream>,
+    /// The most recent partial text handed back by [`SttEngine::feed`], so
+    /// [`track_partial`] can suppress re-emitting an unchanged hypothesis.
+    last_partial: String,
+}
+
+// `OnlineRecognizer` and `OnlineStream` do not implement `Debug` (they wrap
+// raw FFI pointers), so this is written by hand instead of derived,
+// reporting only whether a recognizer is loaded.
+impl std::fmt::Debug for SherpaStreamingEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SherpaStreamingEngine")
+            .field("loaded", &self.recognizer.is_some())
+            .field("hotwords", &self.hotwords)
+            .field("in_progress", &self.opts.is_some())
+            .finish()
+    }
+}
+
+impl SherpaStreamingEngine {
+    /// Loads a sherpa-onnx online (streaming) transducer model from `dir`.
+    ///
+    /// Unlike [`SherpaOfflineEngine::load`], filenames are not tried against
+    /// a candidate list: the catalog installs streaming models under exactly
+    /// `encoder.onnx`, `decoder.onnx`, `joiner.onnx` and `tokens.txt`, so a
+    /// single fixed name is resolved for each.
+    ///
+    /// `dir` must be a model *directory* as resolved by
+    /// `ModelManager::path_for` — never a bare catalog id, for the same
+    /// reason documented on [`SherpaOfflineEngine::load`].
+    ///
+    /// # Errors
+    /// Returns [`SttError::ModelNotFound`] if `dir` does not exist, or if any
+    /// of the expected encoder/decoder/joiner/tokens files are missing from
+    /// it. Returns [`SttError::Engine`] if `cfg.hotwords` contains an
+    /// interior null byte, if any resolved path is not valid UTF-8, or if
+    /// sherpa-onnx refuses to build a recognizer from files that are all
+    /// present — see [`SherpaOfflineEngine::load`]'s doc comment for why
+    /// that last case is treated as an engine error rather than a
+    /// missing-model one.
+    pub fn load(dir: &Path, cfg: SherpaConfig) -> Result<Self, SttError> {
+        if !dir.is_dir() {
+            return Err(SttError::ModelNotFound(dir.display().to_string()));
+        }
+
+        let hotwords = build_hotwords_arg(&cfg.hotwords)?;
+
+        let encoder = resolve_required_file(dir, &["encoder.onnx"])?;
+        let decoder = resolve_required_file(dir, &["decoder.onnx"])?;
+        let joiner = resolve_required_file(dir, &["joiner.onnx"])?;
+        let tokens = resolve_required_file(dir, &["tokens.txt"])?;
+
+        let config = OnlineRecognizerConfig {
+            model_config: OnlineModelConfig {
+                transducer: OnlineTransducerModelConfig {
+                    encoder: Some(path_to_string(&encoder)?),
+                    decoder: Some(path_to_string(&decoder)?),
+                    joiner: Some(path_to_string(&joiner)?),
+                },
+                tokens: Some(path_to_string(&tokens)?),
+                num_threads: cfg.num_threads.clamp(1, i32::MAX as usize) as i32,
+                // These are icefall-style streaming zipformer transducers,
+                // not NeMo exports (unlike the offline engine's catalog
+                // models) — model_type is left at the config default so
+                // sherpa-onnx auto-detects the layout instead.
+                ..Default::default()
+            },
+            decoding_method: Some(decoding_method(&cfg.hotwords).to_string()),
+            ..Default::default()
+        };
+
+        // As in `SherpaOfflineEngine::load`: every expected file is already
+        // confirmed present above, so a rejection here means sherpa-onnx
+        // itself refused their contents, which is an engine failure rather
+        // than a missing-model one.
+        let recognizer = OnlineRecognizer::create(&config).ok_or_else(|| {
+            SttError::Engine(format!(
+                "sherpa-onnx rejected the model in {}",
+                dir.display()
+            ))
+        })?;
+
+        Ok(Self {
+            recognizer: Some(recognizer),
+            hotwords,
+            opts: None,
+            stream: None,
+            last_partial: String::new(),
+        })
+    }
+}
+
+impl SttEngine for SherpaStreamingEngine {
+    fn begin(&mut self, opts: &TranscribeOptions) -> Result<(), SttError> {
+        begin_streaming_session(
+            &mut self.opts,
+            &mut self.stream,
+            &mut self.last_partial,
+            opts,
+        );
+        Ok(())
+    }
+
+    fn feed(&mut self, samples: &[i16]) -> Result<Option<String>, SttError> {
+        if self.opts.is_none() {
+            return Err(SttError::Engine(
+                "feed called before begin: no transcription in progress".to_string(),
+            ));
+        }
+
+        // Borrowed directly from the fields (rather than through a
+        // `&self` helper method, as `SherpaOfflineEngine::recognizer` uses)
+        // so this and the `self.stream` borrow below stay disjoint: a
+        // method call would borrow all of `self` and rule out the `&mut`
+        // access `get_or_insert_with` needs.
+        let recognizer = self
+            .recognizer
+            .as_ref()
+            .expect("invariant: SherpaStreamingEngine::load always sets recognizer to Some");
+        let hotwords = self.hotwords.as_deref();
+        let stream = self.stream.get_or_insert_with(|| match hotwords {
+            Some(hotwords) => recognizer.create_stream_with_hotwords(hotwords),
+            None => recognizer.create_stream(),
+        });
+
+        stream.accept_waveform(SAMPLE_RATE as i32, &samples_to_f32(samples));
+        while recognizer.is_ready(stream) {
+            recognizer.decode(stream);
+        }
+        let text = recognizer
+            .get_result(stream)
+            .map(|result| result.text)
+            .unwrap_or_default();
+
+        Ok(track_partial(&mut self.last_partial, &text))
+    }
+
+    fn finish(&mut self) -> Result<Transcript, SttError> {
+        let opts = self.opts.take().ok_or_else(|| {
+            SttError::Engine("finish called before begin: no transcription in progress".to_string())
+        })?;
+
+        let recognizer = self
+            .recognizer
+            .as_ref()
+            .expect("invariant: SherpaStreamingEngine::load always sets recognizer to Some");
+        let hotwords = self.hotwords.as_deref();
+        // `feed` is expected to have run at least once, but a begin()
+        // immediately followed by finish() must not panic — fall back to a
+        // fresh, silent stream so it decodes to empty text instead.
+        let stream = self.stream.take().unwrap_or_else(|| match hotwords {
+            Some(hotwords) => recognizer.create_stream_with_hotwords(hotwords),
+            None => recognizer.create_stream(),
+        });
+
+        stream.input_finished();
+        while recognizer.is_ready(&stream) {
+            recognizer.decode(&stream);
+        }
+        let result = recognizer.get_result(&stream).ok_or_else(|| {
+            SttError::Engine("sherpa-onnx produced no recognition result".to_string())
+        })?;
+
+        Ok(Transcript {
+            text: result.text.trim().to_string(),
+            language: opts.language,
+        })
+    }
+}
+
+/// Starts a new utterance: records `new_opts`, clears the last emitted
+/// partial, and drops any stream left over from a previous begin/feed/finish
+/// cycle (or from a `begin` that was never followed by `finish`), so nothing
+/// from a previous utterance leaks into this one.
+///
+/// Split out from [`SttEngine::begin`] as a free function, for the same
+/// testability reason as [`SherpaOfflineEngine`]'s `begin_session`: unlike
+/// `feed` and `finish`, it needs no recognizer, so the opts-recording and
+/// last-partial-clearing behavior stay unit-testable without a real model on
+/// disk. The `*stream = None` line is not independently exercised by that
+/// test: building a populated `Some(OnlineStream)` fixture needs a real
+/// recognizer, which needs a downloaded model. It is verified by inspection
+/// instead — the assignment is unconditional, so it is correct regardless of
+/// what `stream` held on entry.
+fn begin_streaming_session(
+    opts: &mut Option<TranscribeOptions>,
+    stream: &mut Option<OnlineStream>,
+    last_partial: &mut String,
+    new_opts: &TranscribeOptions,
+) {
+    *opts = Some(new_opts.clone());
+    *stream = None;
+    last_partial.clear();
+}
+
+/// Compares the just-observed recognition hypothesis `observed` against the
+/// last one emitted (`last`), returning `Some(observed)` and updating `last`
+/// only when it actually changed.
+///
+/// An online recognizer's result grows monotonically as more audio arrives —
+/// it is a hypothesis over everything decoded so far, not a delta — so
+/// without this, [`SttEngine::feed`] would re-emit the same string on every
+/// call between chunks where the recognizer had nothing new to add, and the
+/// HUD would redraw pointlessly.
+fn track_partial(last: &mut String, observed: &str) -> Option<String> {
+    if observed == last {
+        None
+    } else {
+        *last = observed.to_string();
+        Some(observed.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -380,6 +635,91 @@ mod tests {
         let mut engine = test_engine();
         assert_eq!(engine.begin(&TranscribeOptions::default()), Ok(()));
         assert_eq!(engine.feed(&[0i16; 1600]), Ok(None));
+    }
+
+    /// Builds a `SherpaStreamingEngine` double with no loaded recognizer, for
+    /// tests that only exercise the begin/feed/finish ordering rules and
+    /// never reach a real decode (which would panic on this double — see the
+    /// `recognizer.as_ref().expect(...)` calls in `feed`/`finish`). Loading a
+    /// real model needs a downloaded catalog entry, which unit tests must
+    /// not depend on.
+    fn test_streaming_engine() -> SherpaStreamingEngine {
+        SherpaStreamingEngine {
+            recognizer: None,
+            hotwords: None,
+            opts: None,
+            stream: None,
+            last_partial: String::new(),
+        }
+    }
+
+    #[test]
+    fn streaming_loading_a_missing_model_directory_reports_model_not_found() {
+        let err =
+            SherpaStreamingEngine::load(Path::new("/nonexistent/model"), SherpaConfig::default())
+                .expect_err("a missing model directory must not load");
+        assert!(matches!(err, SttError::ModelNotFound(_)));
+    }
+
+    #[test]
+    fn streaming_loading_a_directory_missing_required_files_reports_model_not_found() {
+        let dir = std::env::temp_dir().join("utter-stt-test-sherpa-streaming-empty-model");
+        std::fs::create_dir_all(&dir).expect("failed to create empty test model dir");
+
+        let err = SherpaStreamingEngine::load(&dir, SherpaConfig::default())
+            .expect_err("a model directory missing its files must not load");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(matches!(err, SttError::ModelNotFound(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn streaming_feed_before_begin_returns_engine_error() {
+        let mut engine = test_streaming_engine();
+
+        let err = engine
+            .feed(&[0i16; 10])
+            .expect_err("feed before begin must fail");
+
+        assert!(matches!(err, SttError::Engine(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn streaming_finish_before_begin_returns_engine_error() {
+        let mut engine = test_streaming_engine();
+
+        let err = engine.finish().expect_err("finish before begin must fail");
+
+        assert!(matches!(err, SttError::Engine(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn begin_streaming_session_records_opts_and_clears_last_partial() {
+        // The `*stream = None` line in `begin_streaming_session` is not
+        // covered here: a fixture that starts as `Some(OnlineStream)` would
+        // need a real recognizer, which needs a downloaded model — see that
+        // function's doc comment for why it is verified by inspection
+        // instead. A `stream` fixture that starts at `None`, as below, would
+        // pass this assertion whether or not that line existed, which is
+        // exactly the kind of vacuous check this codebase has been burned by
+        // before, so it is deliberately left out rather than kept as
+        // decoration.
+        let mut opts: Option<TranscribeOptions> = None;
+        let mut stream: Option<OnlineStream> = None;
+        let mut last_partial = "привет".to_string();
+
+        begin_streaming_session(
+            &mut opts,
+            &mut stream,
+            &mut last_partial,
+            &TranscribeOptions::default(),
+        );
+
+        assert!(opts.is_some(), "begin must record the new opts");
+        assert!(
+            last_partial.is_empty(),
+            "begin must clear the last emitted partial from a previous utterance"
+        );
     }
 
     #[test]
@@ -526,5 +866,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(resolved.expect("must resolve"), present);
+    }
+
+    #[test]
+    fn an_unchanged_partial_is_not_re_emitted() {
+        // Same port contract vosk followed: feed() returns Some only when the
+        // partial actually changed, so the HUD is not redrawn pointlessly.
+        let mut last = String::new();
+        assert_eq!(track_partial(&mut last, "прив"), Some("прив".to_string()));
+        assert_eq!(track_partial(&mut last, "прив"), None);
+        assert_eq!(
+            track_partial(&mut last, "привет"),
+            Some("привет".to_string())
+        );
     }
 }

@@ -515,12 +515,9 @@ impl SttEngine for SherpaStreamingEngine {
         while recognizer.is_ready(stream) {
             recognizer.decode(stream);
         }
-        let text = recognizer
-            .get_result(stream)
-            .map(|result| result.text)
-            .unwrap_or_default();
+        let text = recognizer.get_result(stream).map(|result| result.text);
 
-        Ok(track_partial(&mut self.last_partial, &text))
+        Ok(feed_result(&mut self.last_partial, text.as_deref()))
     }
 
     fn finish(&mut self) -> Result<Transcript, SttError> {
@@ -597,6 +594,27 @@ fn track_partial(last: &mut String, observed: &str) -> Option<String> {
         *last = observed.to_string();
         Some(observed.to_string())
     }
+}
+
+/// Turns a `get_result` outcome into what [`SttEngine::feed`] should return.
+///
+/// `text: None` means the read genuinely failed — a null result pointer, or
+/// a JSON body that failed to deserialize, per `RecognizerResult`'s
+/// `Deserialize` impl — the same condition [`SherpaStreamingEngine::finish`]
+/// treats as [`SttError::Engine`]. It is *not* promoted to an error here,
+/// unlike in `finish`: this is a draft engine whose `feed` is polled on
+/// every chunk purely to refresh the HUD, so one failed poll must not abort
+/// the in-progress utterance — the offline engine's `finish` is what
+/// actually produces the injected text, unaffected by this engine's read
+/// failures. Falling back to an empty string instead (an earlier version of
+/// this code did exactly that) would feed that empty text through
+/// `track_partial` and wipe a good partial off the HUD, misreporting a read
+/// failure as "the user said nothing." Passing `None` straight through
+/// instead, without touching `last_partial`, avoids that: a failed read
+/// leaves whatever the HUD is already showing untouched rather than
+/// erasing it.
+fn feed_result(last_partial: &mut String, text: Option<&str>) -> Option<String> {
+    text.and_then(|text| track_partial(last_partial, text))
 }
 
 #[cfg(test)]
@@ -878,6 +896,42 @@ mod tests {
         assert_eq!(
             track_partial(&mut last, "привет"),
             Some("привет".to_string())
+        );
+    }
+
+    #[test]
+    fn a_failed_read_does_not_erase_a_shown_partial() {
+        // `text: None` stands in for `get_result` returning `None` (a null
+        // result pointer or undeserializable JSON) after a partial was
+        // already on screen. The fix under test is that this must not be
+        // reported as "the user said nothing": no partial is emitted, and
+        // the HUD's last known-good text is left alone.
+        let mut last_partial = "привет".to_string();
+
+        let emitted = feed_result(&mut last_partial, None);
+
+        assert_eq!(emitted, None, "a failed read must not emit anything");
+        assert_eq!(
+            last_partial, "привет",
+            "a failed read must not erase what the HUD is already showing"
+        );
+    }
+
+    #[test]
+    fn a_successful_read_still_flows_through_track_partial() {
+        // Guards against a fix that swallows every result, not just failed
+        // ones: a real reading must still reach `track_partial` and follow
+        // its change-only-emits contract.
+        let mut last_partial = String::new();
+
+        assert_eq!(
+            feed_result(&mut last_partial, Some("прив")),
+            Some("прив".to_string())
+        );
+        assert_eq!(
+            feed_result(&mut last_partial, Some("прив")),
+            None,
+            "an unchanged successful read must still be suppressed"
         );
     }
 }

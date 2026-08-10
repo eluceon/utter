@@ -678,6 +678,23 @@ fn start_capture(ctx: &mut WorkerCtx) {
         language,
         initial_prompt,
     };
+    // The draft engine begins on exactly the same options: it is a second
+    // view of the same utterance, not a differently-configured one. This is
+    // also the *only* per-utterance reset it gets — `finish()` is never
+    // called on it (see `feed_draft`) — which is sufficient, since `begin`
+    // discards a streaming engine's whole decoding stream.
+    //
+    // It goes *first*, before the final engine, because the final engine's
+    // `begin` can fail and returns below without unwinding the session: a
+    // draft engine begun after that point would never be begun at all, while
+    // the session it belongs to stays `Recording` and keeps fanning frames
+    // out to it. `feed` on an un-begun engine is an invariant violation, and
+    // the user would be shown its wording in a toast and lose the preview
+    // for the rest of the run (`disable_draft` outlives the session). The
+    // two are therefore begun together or not at all; beginning a draft for
+    // a session that is about to fail costs nothing, since no frame ever
+    // reaches it.
+    begin_draft(ctx, &opts);
     // `Session` has no event for "capture failed to start" (see the module
     // doc comment): the cleanest recovery available here is to notify and
     // leave the session in `Recording`. A subsequent stop (hotkey
@@ -690,12 +707,6 @@ fn start_capture(ctx: &mut WorkerCtx) {
             .notify("error", &format!("failed to start transcription: {e}"));
         return;
     }
-    // The draft engine begins on exactly the same options: it is a second
-    // view of the same utterance, not a differently-configured one. This is
-    // also the *only* per-utterance reset it gets — `finish()` is never
-    // called on it (see `feed_draft`) — which is sufficient, since `begin`
-    // discards a streaming engine's whole decoding stream.
-    begin_draft(ctx, &opts);
 
     match ctx
         .capture

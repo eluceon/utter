@@ -439,6 +439,13 @@ struct DepsBuilder {
     /// is still speaking. `None` (the default, and what every pre-existing test uses) means the
     /// profile has no preview at all, exactly as before this field existed.
     draft_engine: Option<Box<dyn SttEngine>>,
+    /// Replaces the `FakeSttEngine` `build` would otherwise assemble from `engine_result`,
+    /// `calls`, `partial`, `finish_delay` and `begin_opts` -- for the one case those fields
+    /// cannot express, a *final* engine whose `begin` fails. Deliberately an override rather
+    /// than another flag on `FakeSttEngine`: a failure switch defaulted to "off" on the fixture
+    /// every other test shares is exactly the kind of field that sits at its default forever and
+    /// makes a test green for a reason it never claimed.
+    engine: Option<Box<dyn SttEngine>>,
 }
 
 impl DepsBuilder {
@@ -462,6 +469,7 @@ impl DepsBuilder {
             language: None,
             begin_opts: Arc::new(Mutex::new(Vec::new())),
             draft_engine: None,
+            engine: None,
         }
     }
 
@@ -470,14 +478,19 @@ impl DepsBuilder {
             Arc::new(FakeRefiner { behavior, calls }) as Arc<dyn TextRefiner>
         });
 
-        let profile_deps = ProfileDeps {
-            engine: Box::new(FakeSttEngine {
+        let engine: Box<dyn SttEngine> = match self.engine {
+            Some(engine) => engine,
+            None => Box::new(FakeSttEngine {
                 result: self.engine_result,
                 calls: self.calls,
                 partial: self.partial,
                 finish_delay: self.finish_delay,
                 begin_opts: self.begin_opts,
             }),
+        };
+
+        let profile_deps = ProfileDeps {
+            engine,
             draft_engine: self.draft_engine,
             refiner,
             refine_enabled: self.refine_enabled,
@@ -2051,6 +2064,66 @@ fn a_draft_engine_that_fails_to_begin_does_not_stop_the_session() {
         "a draft engine that failed to begin must never be fed, got {draft:?}"
     );
     drop(draft);
+
+    handle.shutdown();
+}
+
+/// The ordering inside `start_capture`: the draft engine is begun *before* the final one.
+///
+/// The final engine's `begin` can fail, and when it does `start_capture` returns early while
+/// deliberately leaving the session in `Recording` (see its comment). Begun after that point,
+/// the draft engine would be skipped and yet still fanned out to by any frame already buffered
+/// in the audio channel -- `feed` on an engine that was never begun, which a real
+/// `SherpaStreamingEngine` answers with an internal invariant message the user would see in a
+/// toast, and which costs them the preview for the rest of the run since `disable_draft` is not
+/// scoped to the session.
+///
+/// The error notice is the synchronisation point rather than a poll: the worker emits it from
+/// the very `if let Err` arm that follows `begin_draft`, so by the time it has been received the
+/// draft engine has either been begun or been skipped for good -- no sleep, and no window in
+/// which a wrong ordering could still pass.
+#[test]
+fn the_draft_engine_is_begun_even_when_the_final_engine_fails_to_begin() {
+    let draft_calls = Arc::new(Mutex::new(Vec::new()));
+    let draft_opts = Arc::new(Mutex::new(Vec::new()));
+    let (sink, states_rx, notices_rx) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("never reached")));
+    builder.engine = Some(Box::new(FailingSttEngine {
+        fail_begin: true,
+        calls: Arc::new(Mutex::new(Vec::new())),
+    }));
+    builder.draft_engine = Some(draft_engine(
+        "preview",
+        draft_calls.clone(),
+        draft_opts.clone(),
+    ));
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+
+    let (kind, msg) = recv_notice(&notices_rx);
+    assert_eq!(kind, "error");
+    assert!(
+        msg.contains("failed to start transcription"),
+        "expected the final engine's begin failure to be reported, got {msg:?}"
+    );
+
+    assert_eq!(
+        begun_with(&draft_opts).len(),
+        1,
+        "the draft engine must be begun before the final engine, so a final engine that fails to \
+         begin cannot leave a still-Recording session fanning frames out to an un-begun draft"
+    );
+    assert_no_more_notices(&notices_rx);
 
     handle.shutdown();
 }

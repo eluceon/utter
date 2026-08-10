@@ -129,6 +129,10 @@ impl SherpaOfflineEngine {
             // the one model family `decoding_method` assumes — see its doc
             // comment for why that assumption matters.
             decoding_method: Some(decoding_method(&cfg.hotwords).to_string()),
+            // Both explicit, never inherited — see the constants' own doc
+            // comments for the differing-defaults trap they exist to close.
+            max_active_paths: MAX_ACTIVE_PATHS,
+            hotwords_score: HOTWORDS_SCORE,
             ..Default::default()
         };
 
@@ -354,6 +358,30 @@ pub fn decoding_method(hotwords: &[String]) -> &'static str {
     }
 }
 
+/// Beam width for `modified_beam_search`, matching upstream sherpa-onnx's own
+/// default.
+///
+/// Set explicitly at *both* recognizer call sites, and deliberately never left
+/// to `..Default::default()`, because the two sherpa-onnx config types
+/// disagree on it: `OfflineRecognizerConfig::default` uses `4` (commented "a
+/// reasonable default" in the crate source) while `OnlineRecognizerConfig`
+/// uses `0`. A beam width of zero is not merely a narrower search — it is an
+/// empty hypothesis set, and [`decoding_method`] selects beam search for every
+/// user whose dictionary is non-empty. Pinning it on both engines is what
+/// stops the streaming loader from silently inheriting the one default that
+/// breaks it.
+const MAX_ACTIVE_PATHS: i32 = 4;
+
+/// The score added to a hotword during `modified_beam_search`, matching
+/// upstream sherpa-onnx's `--hotwords-score` default.
+///
+/// Pinned for the same reason as [`MAX_ACTIVE_PATHS`] but against a different
+/// failure: *both* config types default this to `0.0`, which boosts a hotword
+/// by nothing at all and makes passing hotwords a no-op. Leaving it at the
+/// crate default silently renders the whole dictionary-terms-as-hotwords
+/// feature inert rather than failing visibly.
+const HOTWORDS_SCORE: f32 = 1.5;
+
 /// Half the machine's cores, at least one and at most four.
 ///
 /// Saturating every core freezes the desktop exactly while the user is
@@ -454,6 +482,13 @@ impl SherpaStreamingEngine {
                 ..Default::default()
             },
             decoding_method: Some(decoding_method(&cfg.hotwords).to_string()),
+            // Both explicit, never inherited. This is the call site the trap
+            // actually bites: `OnlineRecognizerConfig::default` sets
+            // `max_active_paths` to 0, so `..Default::default()` alone would
+            // run the beam search `decoding_method` just selected with a beam
+            // width of zero. See the constants' doc comments.
+            max_active_paths: MAX_ACTIVE_PATHS,
+            hotwords_score: HOTWORDS_SCORE,
             ..Default::default()
         };
 

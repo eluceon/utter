@@ -75,6 +75,91 @@ impl SttEngine for FakeSttEngine {
     }
 }
 
+/// An engine that always fails, either from `begin` or from every `feed`, recording every call it
+/// was asked to make. Used as a *draft* engine, where the runtime's policy is to warn once, drop
+/// it, and carry on: the recorded calls are what prove the drop actually happened (a runtime that
+/// merely swallowed the error would keep calling it on every subsequent frame).
+struct FailingSttEngine {
+    fail_begin: bool,
+    calls: Arc<Mutex<Vec<CallRecord>>>,
+}
+
+impl SttEngine for FailingSttEngine {
+    fn begin(&mut self, _opts: &TranscribeOptions) -> Result<(), SttError> {
+        if self.fail_begin {
+            return Err(SttError::Engine("draft model failed to start".to_string()));
+        }
+        Ok(())
+    }
+
+    fn feed(&mut self, samples: &[i16]) -> Result<Option<String>, SttError> {
+        self.calls
+            .lock()
+            .expect("lock")
+            .push(CallRecord::Feed(samples.to_vec()));
+        Err(SttError::Engine("draft model decode failed".to_string()))
+    }
+
+    fn finish(&mut self) -> Result<Transcript, SttError> {
+        self.calls.lock().expect("lock").push(CallRecord::Finish);
+        Err(SttError::Engine("draft model decode failed".to_string()))
+    }
+}
+
+/// A working draft engine: emits `partial` from every `feed` and records every call into `calls`.
+///
+/// Its `finish()` transcript is deliberately a string no assertion in this file ever expects to
+/// see, because the runtime must never call `finish()` on a draft engine at all (spec D9). If
+/// that ever changed and the result were used, the injected text would name the leak rather than
+/// quietly resembling something plausible.
+fn draft_engine(partial: &str, calls: Arc<Mutex<Vec<CallRecord>>>) -> Box<dyn SttEngine> {
+    Box::new(FakeSttEngine {
+        result: Ok(transcript("DRAFT-FINISH-MUST-NEVER-BE-CALLED")),
+        calls,
+        partial: Some(partial.to_string()),
+        finish_delay: Duration::ZERO,
+        begin_opts: Arc::new(Mutex::new(Vec::new())),
+    })
+}
+
+/// The samples of every `feed` in a recorded call log, in order — the shape the frame fan-out
+/// invariant is stated in ("both engines saw the same frames"), with `Finish` filtered out since
+/// only one of the two engines is ever finished.
+fn fed_samples(calls: &Arc<Mutex<Vec<CallRecord>>>) -> Vec<Vec<i16>> {
+    calls
+        .lock()
+        .expect("lock")
+        .iter()
+        .filter_map(|call| match call {
+            CallRecord::Feed(samples) => Some(samples.clone()),
+            CallRecord::Finish => None,
+        })
+        .collect()
+}
+
+/// Waits until `calls` has recorded `count` `feed`s.
+///
+/// The fan-out contract is scoped to *recording*, so a test that pushes frames and then
+/// releases the hotkey has to know its frames actually took the live recording path rather than
+/// being left for `StopCapture`'s trailing drain -- which the `select!` loop, not the test,
+/// decides. Waiting on the call log itself settles that by construction: nothing else advances
+/// it. Bounded by `WAIT` so a runtime that stops feeding fails the test loudly instead of
+/// hanging the suite.
+fn wait_for_feeds(calls: &Arc<Mutex<Vec<CallRecord>>>, count: usize) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let fed = fed_samples(calls);
+        if fed.len() >= count {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected {count} frames to have been fed within {WAIT:?}, got {fed:?}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn transcript(text: &str) -> Transcript {
     Transcript {
         text: text.to_string(),
@@ -239,6 +324,15 @@ fn assert_no_more_states(rx: &Receiver<Emission>) {
     );
 }
 
+fn assert_no_more_notices(rx: &Receiver<Notice>) {
+    let extra = rx.recv_timeout(Duration::from_millis(200));
+    assert!(
+        extra.is_err(),
+        "expected no further notices, got {:?}",
+        extra.ok()
+    );
+}
+
 /// A `ProfileLoader` that hands back a pre-built `ProfileDeps` for each profile id exactly once
 /// (`.remove()`s it out of a per-id slot), panicking if the registry ever asks for the same
 /// profile's deps a second time -- which only happens if a test's own profile list has a
@@ -316,6 +410,10 @@ struct DepsBuilder {
     /// language reach the engine at all.
     language: Option<String>,
     begin_opts: Arc<Mutex<Vec<TranscribeOptions>>>,
+    /// The profile's optional draft engine, whose partials drive the HUD preview while the user
+    /// is still speaking. `None` (the default, and what every pre-existing test uses) means the
+    /// profile has no preview at all, exactly as before this field existed.
+    draft_engine: Option<Box<dyn SttEngine>>,
 }
 
 impl DepsBuilder {
@@ -338,6 +436,7 @@ impl DepsBuilder {
             dictionary_terms: Vec::new(),
             language: None,
             begin_opts: Arc::new(Mutex::new(Vec::new())),
+            draft_engine: None,
         }
     }
 
@@ -354,6 +453,7 @@ impl DepsBuilder {
                 finish_delay: self.finish_delay,
                 begin_opts: self.begin_opts,
             }),
+            draft_engine: self.draft_engine,
             refiner,
             refine_enabled: self.refine_enabled,
             tone: Tone::Clean,
@@ -433,6 +533,7 @@ fn profile_deps_with_transcript(text: &str) -> ProfileDeps {
             finish_delay: Duration::ZERO,
             begin_opts: Arc::new(Mutex::new(Vec::new())),
         }),
+        draft_engine: None,
         refiner: None,
         refine_enabled: false,
         tone: Tone::Clean,
@@ -1545,6 +1646,320 @@ fn pressing_an_unregistered_binding_starts_no_session() {
         })
         .expect("send pressed");
     assert_no_more_states(&states_rx);
+
+    handle.shutdown();
+}
+
+/// The fan-out itself, stated as the contract actually is: **while the session is recording**, a
+/// profile's draft engine is fed every frame its final engine is, with the same samples in the
+/// same order. (Frames drained after capture stops reach the final engine alone -- see
+/// `stop_capture_and_maybe_transcribe` -- so the two logs are equal only over the recording
+/// window, and this test does not claim otherwise.)
+///
+/// The hotkey is released only once the draft engine has been observed to receive both frames,
+/// which is what makes the assertion deterministic: the `select!` loop, not the test, decides
+/// whether a pushed frame is serviced as a recording frame or left to the trailing drain, and
+/// waiting on the call log settles that without a sleep. The two frames carry different samples,
+/// so "same order" is falsifiable, and the draft engine's log length is asserted outright --
+/// a prefix assertion alone would pass trivially against an empty log, which is precisely what a
+/// deleted fan-out produces.
+#[test]
+fn both_engines_are_fed_the_same_frames_while_recording() {
+    let final_calls = Arc::new(Mutex::new(Vec::new()));
+    let draft_calls = Arc::new(Mutex::new(Vec::new()));
+    let tx_slot = Arc::new(Mutex::new(None));
+    let (sink, states_rx, _notices_rx) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
+    builder.calls = final_calls.clone();
+    builder.capture_tx_slot = tx_slot.clone();
+    builder.draft_engine = Some(draft_engine("preview", draft_calls.clone()));
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+
+    let tx = capture_tx(&tx_slot);
+    tx.send(AudioFrame {
+        samples: vec![1, 2, 3],
+    })
+    .expect("send frame 1");
+    tx.send(AudioFrame {
+        samples: vec![4, 5, 6],
+    })
+    .expect("send frame 2");
+
+    // Both frames have now gone through the recording path -- and therefore through the
+    // fan-out -- so releasing here cannot leave either of them to the trailing drain.
+    wait_for_feeds(&draft_calls, 2);
+
+    hotkey_tx
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
+        .expect("send released");
+
+    recv_until(&states_rx, "transcribing");
+    recv_until(&states_rx, "injecting");
+    recv_until(&states_rx, "idle");
+
+    let fed_to_draft = fed_samples(&draft_calls);
+    assert_eq!(
+        fed_to_draft,
+        vec![vec![1i16, 2, 3], vec![4i16, 5, 6]],
+        "the draft engine must be fed every frame the final engine is while recording, with the \
+         same samples in the same order"
+    );
+    assert!(
+        fed_samples(&final_calls).starts_with(&fed_to_draft),
+        "the final engine must have seen the same frames, in the same order, before anything \
+         the trailing drain may have added: got {:?}",
+        fed_samples(&final_calls)
+    );
+    assert!(
+        !draft_calls
+            .lock()
+            .expect("lock")
+            .contains(&CallRecord::Finish),
+        "finish() must never be called on the draft engine: not producing a draft transcript at \
+         all is what makes it structurally impossible for one to be injected (spec D9)"
+    );
+
+    handle.shutdown();
+}
+
+/// Spec D9: the draft engine drives the preview and nothing else. The three strings here are
+/// deliberately unmistakable for one another -- the draft's partial, the final engine's own
+/// partial, and the final transcript -- because a fixture where any two could coincide would let
+/// a leak pass unnoticed, which is the exact failure mode this branch has hit before.
+///
+/// The preview assertion is what keeps the rest from being vacuous: it proves the draft engine
+/// really was running and its text really was in play at the moment the final transcript was
+/// injected, rather than the injected text being clean because the draft never produced anything.
+#[test]
+fn draft_text_never_reaches_the_injected_result_or_history() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("history.sqlite3");
+    let history = HistoryRepo::open(&db_path).expect("open history db");
+
+    let draft_calls = Arc::new(Mutex::new(Vec::new()));
+    let injected = Arc::new(Mutex::new(Vec::new()));
+    let tx_slot = Arc::new(Mutex::new(None));
+    let (sink, states_rx, _notices_rx) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("the accurate transcript")));
+    builder.partial = Some("FINAL-ENGINE-PARTIAL".to_string());
+    builder.draft_engine = Some(draft_engine("DRAFT-LEAK", draft_calls.clone()));
+    builder.injected = injected.clone();
+    builder.history = Some(history);
+    builder.capture_tx_slot = tx_slot.clone();
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+
+    let tx = capture_tx(&tx_slot);
+    tx.send(AudioFrame {
+        samples: vec![100; 50],
+    })
+    .expect("send frame");
+
+    assert_eq!(
+        recv_partial(&states_rx).as_deref(),
+        Some("DRAFT-LEAK"),
+        "a profile with a draft engine must preview *its* partial, not the final engine's"
+    );
+
+    hotkey_tx
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
+        .expect("send released");
+    recv_until(&states_rx, "transcribing");
+    recv_until(&states_rx, "injecting");
+    recv_until(&states_rx, "idle");
+
+    assert_eq!(
+        *injected.lock().expect("lock"),
+        vec!["the accurate transcript"],
+        "the injected text comes from the final engine alone"
+    );
+
+    handle.shutdown();
+
+    let verify = HistoryRepo::open(&db_path).expect("reopen history db");
+    let entries = verify.list(None, 10).expect("list history");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].raw_text, "the accurate transcript");
+    assert_eq!(entries[0].final_text, "the accurate transcript");
+    assert!(
+        !entries[0].raw_text.contains("DRAFT") && !entries[0].final_text.contains("DRAFT"),
+        "no trace of the preview may reach the history row, got {:?}",
+        entries[0]
+    );
+}
+
+/// A draft engine that fails mid-utterance is warned about exactly once and then dropped, and the
+/// dictation it was only ever an accessory to finishes normally. The second frame is what pins
+/// the drop: a runtime that merely swallowed each error would call the broken engine again (and
+/// warn again) for every frame that followed, dozens per second. Both frames are waited for on
+/// the *final* engine's log before the release, so both are known to have gone through the
+/// recording path -- where the fan-out lives -- rather than one of them reaching the final engine
+/// alone via the trailing drain, which would make the "fed exactly once" assertion pass for the
+/// wrong reason.
+#[test]
+fn a_failing_draft_engine_does_not_break_dictation() {
+    let final_calls = Arc::new(Mutex::new(Vec::new()));
+    let draft_calls = Arc::new(Mutex::new(Vec::new()));
+    let injected = Arc::new(Mutex::new(Vec::new()));
+    let tx_slot = Arc::new(Mutex::new(None));
+    let (sink, states_rx, notices_rx) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("still works")));
+    builder.calls = final_calls.clone();
+    builder.draft_engine = Some(Box::new(FailingSttEngine {
+        fail_begin: false,
+        calls: draft_calls.clone(),
+    }));
+    builder.injected = injected.clone();
+    builder.capture_tx_slot = tx_slot.clone();
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+
+    let tx = capture_tx(&tx_slot);
+    tx.send(AudioFrame {
+        samples: vec![1, 2, 3],
+    })
+    .expect("send frame 1");
+    tx.send(AudioFrame {
+        samples: vec![4, 5, 6],
+    })
+    .expect("send frame 2");
+
+    wait_for_feeds(&final_calls, 2);
+
+    hotkey_tx
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
+        .expect("send released");
+
+    recv_until(&states_rx, "transcribing");
+    recv_until(&states_rx, "injecting");
+    recv_until(&states_rx, "idle");
+
+    assert_eq!(
+        *injected.lock().expect("lock"),
+        vec!["still works"],
+        "a broken preview must be invisible in the result"
+    );
+
+    let (kind, msg) = recv_notice(&notices_rx);
+    assert_eq!(kind, "warning");
+    assert!(
+        msg.contains("live preview unavailable"),
+        "expected a preview-unavailable warning, got {msg:?}"
+    );
+    assert_no_more_notices(&notices_rx);
+    assert_eq!(
+        fed_samples(&draft_calls),
+        vec![vec![1i16, 2, 3]],
+        "the draft engine must be dropped after its first failure, not fed the frames that follow"
+    );
+
+    handle.shutdown();
+}
+
+/// The same policy at the other end of the draft engine's life: one that cannot even start is
+/// dropped at `begin` and never fed, and the session it failed inside of proceeds as if it had
+/// never been configured. The frame is waited for on the final engine's log before the release,
+/// so it is known to have passed through the fan-out site itself -- a frame that only ever
+/// reached the final engine via the trailing drain would leave the draft engine unfed no matter
+/// what `begin` had returned.
+#[test]
+fn a_draft_engine_that_fails_to_begin_does_not_stop_the_session() {
+    let final_calls = Arc::new(Mutex::new(Vec::new()));
+    let draft_calls = Arc::new(Mutex::new(Vec::new()));
+    let injected = Arc::new(Mutex::new(Vec::new()));
+    let tx_slot = Arc::new(Mutex::new(None));
+    let (sink, states_rx, notices_rx) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("still works")));
+    builder.calls = final_calls.clone();
+    builder.draft_engine = Some(Box::new(FailingSttEngine {
+        fail_begin: true,
+        calls: draft_calls.clone(),
+    }));
+    builder.injected = injected.clone();
+    builder.capture_tx_slot = tx_slot.clone();
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    hotkey_tx
+        .send(HotkeyEvent::Pressed {
+            binding: BindingId::from(0),
+        })
+        .expect("send pressed");
+    assert_eq!(recv_state(&states_rx), "recording");
+
+    let tx = capture_tx(&tx_slot);
+    tx.send(AudioFrame {
+        samples: vec![1, 2, 3],
+    })
+    .expect("send frame");
+
+    wait_for_feeds(&final_calls, 1);
+
+    hotkey_tx
+        .send(HotkeyEvent::Released {
+            binding: BindingId::from(0),
+        })
+        .expect("send released");
+
+    recv_until(&states_rx, "transcribing");
+    recv_until(&states_rx, "injecting");
+    recv_until(&states_rx, "idle");
+
+    assert_eq!(*injected.lock().expect("lock"), vec!["still works"]);
+
+    let (kind, msg) = recv_notice(&notices_rx);
+    assert_eq!(kind, "warning");
+    assert!(
+        msg.contains("live preview unavailable"),
+        "expected a preview-unavailable warning, got {msg:?}"
+    );
+    assert_no_more_notices(&notices_rx);
+    let draft = draft_calls.lock().expect("lock");
+    assert!(
+        draft.is_empty(),
+        "a draft engine that failed to begin must never be fed, got {draft:?}"
+    );
+    drop(draft);
 
     handle.shutdown();
 }

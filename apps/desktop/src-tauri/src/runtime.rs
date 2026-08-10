@@ -40,6 +40,30 @@
 //! the refiner, and it keeps the "the refiner was never called" guarantee
 //! regardless of the user's refine-enabled setting.
 //!
+//! ## The draft engine, and why it can never leak (spec D9)
+//!
+//! A profile may carry a second, streaming engine beside the one that
+//! produces the text (`ProfileDeps::draft_engine`). The contract is: **while
+//! the session is recording, the draft engine is fed every frame the final
+//! engine is** — one site, [`handle_audio_frame`], feeding both in turn.
+//! Only the draft engine decodes as it goes, and its partials are what the
+//! HUD previews while the user is still speaking.
+//!
+//! The fan-out ends there. The trailing frames drained after capture stops
+//! reach the final engine alone; [`stop_capture_and_maybe_transcribe`] says
+//! why.
+//!
+//! Spec D9 requires that this preview can never influence the injected text.
+//! That is enforced structurally rather than by care: [`begin_draft`] and
+//! [`feed_draft`] are the *only* calls ever made on a draft engine, so no
+//! draft transcript is ever produced, so there is nothing that could be
+//! mistaken for one. `finish()` on it would look like the obvious missing
+//! third call and is deliberately absent — see [`feed_draft`].
+//!
+//! [`handle_partial`] is the single place a partial reaches the UI, which is
+//! the seam v0.3 replaces to type into the target application as the user
+//! speaks (design spec §11).
+//!
 //! ## Cancel commit points
 //!
 //! Because a whole utterance unwinds as one straight-line call chain (see
@@ -666,6 +690,12 @@ fn start_capture(ctx: &mut WorkerCtx) {
             .notify("error", &format!("failed to start transcription: {e}"));
         return;
     }
+    // The draft engine begins on exactly the same options: it is a second
+    // view of the same utterance, not a differently-configured one. This is
+    // also the *only* per-utterance reset it gets — `finish()` is never
+    // called on it (see `feed_draft`) — which is sufficient, since `begin`
+    // discards a streaming engine's whole decoding stream.
+    begin_draft(ctx, &opts);
 
     match ctx
         .capture
@@ -678,6 +708,77 @@ fn start_capture(ctx: &mut WorkerCtx) {
     }
 }
 
+/// Starts the active profile's draft engine, if it has one, on the same
+/// options the final engine was just begun with. A failure here degrades
+/// exactly like a failing `feed` — see [`disable_draft`] — rather than
+/// stopping a session the preview is only an accessory to.
+fn begin_draft(ctx: &mut WorkerCtx, opts: &TranscribeOptions) {
+    let outcome = active_profile(ctx)
+        .draft_engine
+        .as_mut()
+        .map(|draft| draft.begin(opts));
+    if let Some(Err(e)) = outcome {
+        disable_draft(ctx, &e.to_string());
+    }
+}
+
+/// Feeds `samples` to the active profile's draft engine.
+///
+/// Returns `None` if this profile has no working draft engine (either it
+/// never had one, or this very call is what broke it), and `Some(partial)` —
+/// where `partial` is itself the engine's `Option` — if it has one. The two
+/// levels are deliberately distinct: "no preview to show" and "a preview
+/// that happens not to have changed this frame" send the HUD to different
+/// places (see [`handle_audio_frame`]).
+///
+/// `finish()` is never called on the draft engine, here or anywhere else.
+/// That looks like an oversight and is not: nothing consumes a draft
+/// transcript, and never producing one is the *structural* guarantee behind
+/// spec D9 — there is no code path along which draft text could be mistaken
+/// for the transcript that gets injected or recorded.
+fn feed_draft(ctx: &mut WorkerCtx, samples: &[i16]) -> Option<Option<String>> {
+    let outcome = active_profile(ctx)
+        .draft_engine
+        .as_mut()
+        .map(|draft| draft.feed(samples));
+    match outcome {
+        None => None,
+        Some(Ok(partial)) => Some(partial),
+        Some(Err(e)) => {
+            disable_draft(ctx, &e.to_string());
+            None
+        }
+    }
+}
+
+/// Reports a draft-engine failure once and drops the engine, leaving the
+/// profile with no preview and the session otherwise untouched (spec D9: the
+/// draft engine's failure must be invisible in the result).
+///
+/// **This is not "for this session".** `ProfileRegistry` caches a profile's
+/// [`ProfileDeps`] for as long as the registry lives (see its doc comment),
+/// so clearing `draft_engine` here disables the preview for that profile
+/// until the app restarts or settings are reloaded — not just until the
+/// hotkey is next pressed. That is the intent rather than an accident: a
+/// preview model that failed to decode one frame will fail on the next one
+/// too, and a warning per frame — dozens per second — would be far worse
+/// than a single one and a dark preview.
+fn disable_draft(ctx: &mut WorkerCtx, reason: &str) {
+    active_profile(ctx).draft_engine = None;
+    ctx.sink
+        .notify("warning", &format!("live preview unavailable: {reason}"));
+}
+
+/// The single place a recognition partial reaches the UI, and therefore the
+/// one function v0.3 changes to type into the target application while the
+/// user speaks rather than only painting the HUD (design spec §11).
+///
+/// [`dispatch`]'s own `emit_state` is not a second such place: it reports a
+/// phase change and passes no partial at all, by construction.
+fn handle_partial(sink: &dyn EventSink, level: f32, partial: Option<&str>) {
+    sink.emit_state("recording", level, partial);
+}
+
 fn handle_audio_frame(session: &mut Session, ctx: &mut WorkerCtx, frame: AudioFrame) {
     if session.state() != State::Recording {
         // Stray frame after capture already stopped (e.g. one last buffered
@@ -686,7 +787,7 @@ fn handle_audio_frame(session: &mut Session, ctx: &mut WorkerCtx, frame: AudioFr
     }
 
     let level = rms_level(&frame.samples);
-    let partial = match active_profile(ctx).engine.feed(&frame.samples) {
+    let final_partial = match active_profile(ctx).engine.feed(&frame.samples) {
         Ok(partial) => partial,
         Err(e) => {
             ctx.sink
@@ -694,7 +795,17 @@ fn handle_audio_frame(session: &mut Session, ctx: &mut WorkerCtx, frame: AudioFr
             None
         }
     };
-    ctx.sink.emit_state("recording", level, partial.as_deref());
+    // The fan-out (design spec §8), and the only one: while recording, the
+    // final engine accumulates every frame and the draft engine decodes it
+    // now. A profile with a
+    // working draft engine shows *its* partial and only its — falling back
+    // to the final engine's on a frame the draft merely had nothing new to
+    // say about would make the preview flicker between two recognizers.
+    // Without one, the final engine's own partial drives the HUD exactly as
+    // it did before (which, for every offline engine in the catalog, means
+    // no preview at all).
+    let partial = feed_draft(ctx, &frame.samples).unwrap_or(final_partial);
+    handle_partial(ctx.sink.as_ref(), level, partial.as_deref());
 
     let silence_fired = ctx
         .silence_detector
@@ -734,6 +845,16 @@ fn stop_capture_and_maybe_transcribe(session: &mut Session, ctx: &mut WorkerCtx)
                 &format!("speech engine error while flushing: {e}"),
             );
         }
+        // Deliberately *not* fanned out to the draft engine: the fan-out
+        // ends when recording does (see the module doc comment). This loop
+        // runs while the session is already `Transcribing` — the moment the
+        // user is waiting for their text — and a draft decode here would buy
+        // nothing at all, since `finish()` is never called on the draft
+        // engine and so nothing would ever read the result. It is not a free
+        // nothing either: the draft engine is deliberately given a single
+        // inference thread to stay out of the final engine's way, and
+        // spending it after the release inverts that (design spec §5, and
+        // the thread-count measurements behind it).
     }
 
     let result = active_profile(ctx).engine.finish();

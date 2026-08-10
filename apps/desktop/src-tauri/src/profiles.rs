@@ -51,6 +51,21 @@ use crate::runtime_boot::{build_engine, build_refiner, engine_label, QueuedNotic
 /// duplicated per profile.
 pub struct ProfileDeps {
     pub engine: Box<dyn SttEngine>,
+    /// Optional streaming engine fed the same frames as `engine`, whose
+    /// partials drive the HUD preview while the user is still speaking. Its
+    /// text never contributes to what gets injected or recorded (spec D9) —
+    /// `crate::runtime` never calls `finish()` on it, so there is no code
+    /// path where its output could be mistaken for a transcript.
+    ///
+    /// Per-profile rather than per-runtime because a preview model is
+    /// language-specific exactly like the profile's own engine: one global
+    /// draft engine would show Russian speech as garbled English.
+    ///
+    /// `None` disables the preview for the profile, which is every profile
+    /// today: nothing builds a draft engine yet, and the runtime treats
+    /// `None` as "show whatever partial the final engine itself produces",
+    /// i.e. nothing at all for the offline engines in the catalog.
+    pub draft_engine: Option<Box<dyn SttEngine>>,
     /// `Arc` rather than `Box`: `ProfileRegistry` caches a profile's `ProfileDeps` forever once
     /// loaded (see its own doc comment), so the worker needs to hand out a cheap clone of the
     /// refiner on every press of the same binding — a `refine_with_timeout` call races it on a
@@ -151,6 +166,11 @@ impl ProfileLoader for RealProfileLoader {
 
         let deps = ProfileDeps {
             engine,
+            // No profile selects a preview model yet: choosing one is a
+            // config/UI concern of its own, and the runtime is complete
+            // without it (a `None` draft engine simply leaves the preview
+            // dark, exactly as it was before).
+            draft_engine: None,
             refiner,
             refine_enabled,
             tone: profile.refine.tone,
@@ -346,6 +366,7 @@ mod tests {
     fn fake_deps(engine_label: &str) -> ProfileDeps {
         ProfileDeps {
             engine: Box::new(HealthyEngine),
+            draft_engine: None,
             refiner: None,
             refine_enabled: false,
             tone: Tone::Clean,

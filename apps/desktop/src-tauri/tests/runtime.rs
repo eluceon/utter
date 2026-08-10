@@ -342,6 +342,30 @@ fn recv_notice(rx: &Receiver<Notice>) -> Notice {
         .expect("expected a notify() call within the timeout")
 }
 
+/// Asserts the one notice a draft engine's death produces, whichever end of its life it died at.
+///
+/// Both the severity and the tail are pinned, and deliberately together: the loss is `"info"`,
+/// not the `"warning"` a lost *transcript* earns, and it carries the same closing sentence
+/// `runtime_boot::build_streaming_draft` appends when a preview cannot be built in the first
+/// place. Asserting the kind alone would let the two halves of the preview's life drift back
+/// into describing the identical loss in two different voices, which is what this reunites.
+fn assert_preview_lost_notice(rx: &Receiver<Notice>) {
+    let (kind, msg) = recv_notice(rx);
+    assert_eq!(
+        kind, "info",
+        "a lost preview costs no transcript and reports as info, like every loader-side preview \
+         failure; got kind {kind:?} with {msg:?}"
+    );
+    assert!(
+        msg.contains("live preview unavailable"),
+        "expected a preview-unavailable notice, got {msg:?}"
+    );
+    assert!(
+        msg.contains("Dictation is unaffected — only the live preview is off."),
+        "expected the same tail the loader-side preview failures carry, got {msg:?}"
+    );
+}
+
 fn assert_no_more_states(rx: &Receiver<Emission>) {
     assert!(
         rx.recv_timeout(Duration::from_millis(200)).is_err(),
@@ -1981,12 +2005,7 @@ fn a_failing_draft_engine_does_not_break_dictation() {
         "a broken preview must be invisible in the result"
     );
 
-    let (kind, msg) = recv_notice(&notices_rx);
-    assert_eq!(kind, "warning");
-    assert!(
-        msg.contains("live preview unavailable"),
-        "expected a preview-unavailable warning, got {msg:?}"
-    );
+    assert_preview_lost_notice(&notices_rx);
     assert_no_more_notices(&notices_rx);
     assert_eq!(
         fed_samples(&draft_calls),
@@ -2051,12 +2070,7 @@ fn a_draft_engine_that_fails_to_begin_does_not_stop_the_session() {
 
     assert_eq!(*injected.lock().expect("lock"), vec!["still works"]);
 
-    let (kind, msg) = recv_notice(&notices_rx);
-    assert_eq!(kind, "warning");
-    assert!(
-        msg.contains("live preview unavailable"),
-        "expected a preview-unavailable warning, got {msg:?}"
-    );
+    assert_preview_lost_notice(&notices_rx);
     assert_no_more_notices(&notices_rx);
     let draft = draft_calls.lock().expect("lock");
     assert!(

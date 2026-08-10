@@ -772,12 +772,24 @@ fn feed_draft(ctx: &mut WorkerCtx, samples: &[i16]) -> Option<Option<String>> {
 /// until the app restarts or settings are reloaded — not just until the
 /// hotkey is next pressed. That is the intent rather than an accident: a
 /// preview model that failed to decode one frame will fail on the next one
-/// too, and a warning per frame — dozens per second — would be far worse
+/// too, and a notice per frame — dozens per second — would be far worse
 /// than a single one and a dark preview.
+///
+/// `"info"` and the reassuring tail are not a softening of the message: they
+/// are the *same* wording `build_draft_engine` already queues when a preview
+/// cannot be built at load time (see `runtime_boot::build_streaming_draft`).
+/// The user loses exactly the same thing either way — the preview, never a
+/// word of their transcript — and which side of that boundary the failure
+/// happened on is an implementation detail they have no way to act on.
 fn disable_draft(ctx: &mut WorkerCtx, reason: &str) {
     active_profile(ctx).draft_engine = None;
-    ctx.sink
-        .notify("warning", &format!("live preview unavailable: {reason}"));
+    ctx.sink.notify(
+        "info",
+        &format!(
+            "live preview unavailable: {reason}. Dictation is unaffected — only the live \
+             preview is off."
+        ),
+    );
 }
 
 /// The single place a recognition partial reaches the UI, and therefore the

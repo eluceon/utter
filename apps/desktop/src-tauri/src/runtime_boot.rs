@@ -511,6 +511,21 @@ pub(crate) fn build_draft_engine(
 #[cfg(feature = "sherpa")]
 const DRAFT_THREADS: usize = 1;
 
+/// The [`utter_stt::SherpaConfig`] every draft engine is loaded with.
+///
+/// Split out of [`build_streaming_draft`] so that [`DRAFT_THREADS`] actually
+/// reaches something a test can look at: the only other observer of it is
+/// onnxruntime, well past the point any test can go. It is the sole
+/// construction site of a draft `SherpaConfig`, so what this returns is what
+/// the draft engine gets.
+#[cfg(feature = "sherpa")]
+fn draft_sherpa_config(dictionary_terms: &[String]) -> utter_stt::SherpaConfig {
+    utter_stt::SherpaConfig {
+        num_threads: DRAFT_THREADS,
+        hotwords: dictionary_terms.to_vec(),
+    }
+}
+
 #[cfg(feature = "sherpa")]
 fn build_streaming_draft(
     model_id: &str,
@@ -548,12 +563,7 @@ fn build_streaming_draft(
         }
     };
 
-    let cfg = utter_stt::SherpaConfig {
-        num_threads: DRAFT_THREADS,
-        hotwords: dictionary_terms.to_vec(),
-    };
-
-    match utter_stt::SherpaStreamingEngine::load(&path, cfg) {
+    match utter_stt::SherpaStreamingEngine::load(&path, draft_sherpa_config(dictionary_terms)) {
         Ok(engine) => (Some(Box::new(engine)), None),
         Err(e) => {
             let reason = format!(
@@ -1013,6 +1023,42 @@ mod tests {
             !notice.contains("not downloaded"),
             "an id no catalog entry has cannot be downloaded, so saying so would misdirect the \
              user, got {notice:?}"
+        );
+    }
+
+    /// The draft engine is loaded on exactly one inference thread, never on
+    /// [`sherpa_thread_count`] like the final engine.
+    ///
+    /// Nothing downstream of here can be observed from a test — the number's
+    /// only other reader is onnxruntime — so this is asserted at the last
+    /// point it is still visible, [`draft_sherpa_config`], which is the sole
+    /// construction site of a draft `SherpaConfig`. Without it the constant
+    /// is pinned by nothing at all: swapping it for `sherpa_thread_count()`
+    /// leaves the whole suite green while reintroducing the 18% latency cost
+    /// of the two engines oversubscribing the same cores, which only shows up
+    /// on a stopwatch.
+    ///
+    /// Asserting the literal `1` rather than "less than the final engine's"
+    /// is deliberate: on a single-core machine the two are equal and the
+    /// difference is unassertable, but on such a machine there is also no
+    /// oversubscription to prevent, so the invariant worth stating is the
+    /// absolute one. The hotwords assertion rides along because a config
+    /// helper that forgot to forward them would silently cost the preview its
+    /// dictionary biasing.
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn the_draft_engine_is_configured_for_a_single_inference_thread() {
+        let cfg = draft_sherpa_config(&["Kubernetes".to_string()]);
+
+        assert_eq!(
+            cfg.num_threads, 1,
+            "the draft engine runs concurrently with the final one and must stay out of its \
+             way; see DRAFT_THREADS"
+        );
+        assert_eq!(
+            cfg.hotwords,
+            vec!["Kubernetes".to_string()],
+            "the preview is biased by the same dictionary terms the final engine is"
         );
     }
 

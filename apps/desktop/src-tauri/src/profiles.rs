@@ -30,8 +30,10 @@
 //! sherpa's C++ layer call `_Exit()`, which takes the whole process down —
 //! every profile, healthy ones included, with no chance for Rust to catch
 //! it. [`RealProfileLoader`] reuses `runtime_boot::build_engine` (which
-//! reuses `build_sherpa`) rather than reimplementing engine construction, so
-//! that check is never bypassed by a profile-specific load path.
+//! reuses `build_sherpa`) and `runtime_boot::build_draft_engine` rather than
+//! reimplementing engine construction, so that check is never bypassed by a
+//! profile-specific load path — for the preview model just as much as for the
+//! one whose text gets injected.
 
 use std::sync::Arc;
 
@@ -40,7 +42,9 @@ use utter_inject::BindingId;
 use utter_store::settings::{refinement_is_on, RefineCfg};
 use utter_store::{LanguageProfile, ModelManager};
 
-use crate::runtime_boot::{build_engine, build_refiner, engine_label, QueuedNotice};
+use crate::runtime_boot::{
+    build_draft_engine, build_engine, build_refiner, engine_label, QueuedNotice,
+};
 
 /// The per-profile slice of what a dictation session needs: everything
 /// [`crate::runtime::RuntimeDeps`] does *not* already own once and share
@@ -61,10 +65,11 @@ pub struct ProfileDeps {
     /// language-specific exactly like the profile's own engine: one global
     /// draft engine would show Russian speech as garbled English.
     ///
-    /// `None` disables the preview for the profile, which is every profile
-    /// today: nothing builds a draft engine yet, and the runtime treats
-    /// `None` as "show whatever partial the final engine itself produces",
-    /// i.e. nothing at all for the offline engines in the catalog.
+    /// `None` disables the preview for the profile — the default, and the
+    /// state of any profile whose [`LanguageProfile::draft`] is unset or
+    /// whose preview model could not be built. The runtime treats `None` as
+    /// "show whatever partial the final engine itself produces", i.e.
+    /// nothing at all for the offline engines in the catalog.
     pub draft_engine: Option<Box<dyn SttEngine>>,
     /// `Arc` rather than `Box`: `ProfileRegistry` caches a profile's `ProfileDeps` forever once
     /// loaded (see its own doc comment), so the worker needs to hand out a cheap clone of the
@@ -142,6 +147,17 @@ impl ProfileLoader for RealProfileLoader {
             notices.push(("warning", msg));
         }
 
+        // `"info"`, not the `"warning"` the final engine's failure earns: a
+        // preview that cannot be built costs the user no transcript, only
+        // the preview itself, and this profile keeps dictating normally with
+        // `draft_engine: None`. `build_refiner`'s degradation is `"info"`
+        // for the same reason.
+        let (draft_engine, draft_notice) =
+            build_draft_engine(profile.draft.as_ref(), &self.models, &self.dictionary_terms);
+        if let Some(msg) = draft_notice {
+            notices.push(("info", msg));
+        }
+
         // Computed once and used to decide *both* whether refinement runs
         // for this profile *and* whether a refiner is even built — a
         // profile with refinement switched off (globally or by its own
@@ -166,11 +182,7 @@ impl ProfileLoader for RealProfileLoader {
 
         let deps = ProfileDeps {
             engine,
-            // No profile selects a preview model yet: choosing one is a
-            // config/UI concern of its own, and the runtime is complete
-            // without it (a `None` draft engine simply leaves the preview
-            // dark, exactly as it was before).
-            draft_engine: None,
+            draft_engine,
             refiner,
             refine_enabled,
             tone: profile.refine.tone,
@@ -319,7 +331,7 @@ mod tests {
     use std::sync::Arc;
 
     use utter_core::{SttError, TranscribeOptions, Transcript};
-    use utter_store::profile::LanguageProfile;
+    use utter_store::profile::{DraftCfg, LanguageProfile};
 
     use super::*;
     use crate::runtime_boot::unavailable_engine;
@@ -686,6 +698,213 @@ mod tests {
              `LanguageProfile::default()` (whose id is literally \"default\") cannot tell a \
              copied id from a hardcoded string"
         );
+    }
+
+    /// The production loader must actually *read* `profile.draft`. With no models on disk the
+    /// draft engine ends up `None` either way, so `draft_engine.is_none()` proves nothing at all
+    /// here -- the notice is what distinguishes "the loader tried to build the configured preview
+    /// model and found it missing" from "the loader never looked at `profile.draft`". Both
+    /// directions are asserted in one test on purpose: a profile with no preview configured must
+    /// stay silent, or every single-language user would be told at boot about a preview they
+    /// never asked for.
+    ///
+    /// Deliberately build-agnostic: what the notice *says* differs between a build with the
+    /// `sherpa` feature (the model is looked up and found missing) and one without it (no
+    /// streaming engine exists to load it into at all), so the wording of each is pinned by its
+    /// own `cfg`-gated test below, and this one asserts only what must hold in both.
+    #[test]
+    fn a_configured_preview_model_is_looked_up_and_a_missing_one_only_costs_the_preview() {
+        let loader = RealProfileLoader::new(
+            Arc::new(ModelManager::new(PathBuf::from("/nonexistent"))),
+            RefineCfg::default(),
+            Vec::new(),
+        );
+
+        let off = LanguageProfile::default();
+        assert_eq!(
+            off.draft, None,
+            "fixture check: this profile really has no preview configured"
+        );
+        let (deps, notices) = loader.load(&off);
+        assert!(
+            deps.draft_engine.is_none(),
+            "no preview configured, none built"
+        );
+        assert!(
+            !notices.iter().any(|(_, msg)| msg.contains("preview")),
+            "a profile with the preview off must say nothing about it, got {notices:?}"
+        );
+
+        let on = LanguageProfile {
+            draft: Some(DraftCfg {
+                model: "zipformer-ru-small".to_string(),
+            }),
+            ..LanguageProfile::default()
+        };
+        let (deps, notices) = loader.load(&on);
+        assert!(
+            deps.draft_engine.is_none(),
+            "a preview model that is not downloaded leaves the preview off"
+        );
+
+        let (kind, msg) = notices
+            .iter()
+            .find(|(_, msg)| msg.contains("zipformer-ru-small"))
+            .expect("a configured but undownloaded preview model must be reported by name");
+        assert_eq!(
+            *kind, "info",
+            "a preview that cannot be built costs no transcript, so it is not a warning"
+        );
+        assert!(
+            msg.contains("Settings > "),
+            "the notice must point at a Settings page, got {msg:?}"
+        );
+    }
+
+    /// The wording of the missing-preview-model notice on a build that *has* the streaming
+    /// engine: it must send the user to the one page that can fix it (Engines, where the model
+    /// is downloaded) and say plainly that dictation itself still works.
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn an_undownloaded_preview_model_points_at_the_engines_page() {
+        let loader = RealProfileLoader::new(
+            Arc::new(ModelManager::new(PathBuf::from("/nonexistent"))),
+            RefineCfg::default(),
+            Vec::new(),
+        );
+
+        let profile = LanguageProfile {
+            draft: Some(DraftCfg {
+                model: "zipformer-ru-small".to_string(),
+            }),
+            ..LanguageProfile::default()
+        };
+
+        let (_deps, notices) = loader.load(&profile);
+        let (_, msg) = notices
+            .iter()
+            .find(|(_, msg)| msg.contains("zipformer-ru-small"))
+            .expect("a configured but undownloaded preview model must be reported by name");
+
+        assert!(msg.contains("not downloaded"), "got {msg:?}");
+        assert!(msg.contains("Settings > Engines"), "got {msg:?}");
+        assert!(
+            msg.contains("only the live preview is off"),
+            "the notice must say dictation is unaffected, got {msg:?}"
+        );
+    }
+
+    /// The same profile on a build compiled without the `sherpa` feature: there is no streaming
+    /// engine to load the model into, so the notice must send the user to Profiles (where the
+    /// preview is switched off) rather than to Engines, which could not help.
+    #[cfg(not(feature = "sherpa"))]
+    #[test]
+    fn a_preview_model_on_a_build_without_sherpa_points_at_the_profiles_page() {
+        let loader = RealProfileLoader::new(
+            Arc::new(ModelManager::new(PathBuf::from("/nonexistent"))),
+            RefineCfg::default(),
+            Vec::new(),
+        );
+
+        let profile = LanguageProfile {
+            draft: Some(DraftCfg {
+                model: "zipformer-ru-small".to_string(),
+            }),
+            ..LanguageProfile::default()
+        };
+
+        let (_deps, notices) = loader.load(&profile);
+        let (_, msg) = notices
+            .iter()
+            .find(|(_, msg)| msg.contains("zipformer-ru-small"))
+            .expect("a configured preview model must be reported even on a build without sherpa");
+
+        assert!(msg.contains("without sherpa support"), "got {msg:?}");
+        assert!(msg.contains("Settings > Profiles"), "got {msg:?}");
+        assert!(
+            msg.contains("only the live preview is off"),
+            "the notice must say dictation is unaffected, got {msg:?}"
+        );
+    }
+
+    /// A preview model configured as a blank id is the off state too (the shape a hand-edited
+    /// config produces; the Profiles page writes `null`), and must be as silent as `None` --
+    /// not reported as a missing model the user never selected.
+    #[test]
+    fn a_blank_preview_model_id_is_the_off_state_and_is_silent() {
+        let loader = RealProfileLoader::new(
+            Arc::new(ModelManager::new(PathBuf::from("/nonexistent"))),
+            RefineCfg::default(),
+            Vec::new(),
+        );
+
+        let profile = LanguageProfile {
+            draft: Some(DraftCfg {
+                model: "   ".to_string(),
+            }),
+            ..LanguageProfile::default()
+        };
+
+        let (deps, notices) = loader.load(&profile);
+
+        assert!(deps.draft_engine.is_none());
+        assert!(
+            !notices.iter().any(|(_, msg)| msg.contains("preview")),
+            "a blank preview model is a choice, not a degradation, got {notices:?}"
+        );
+    }
+
+    /// The `_Exit()` guard, on the draft path this time: a damaged preview model (here a
+    /// truncated `encoder.onnx` among correctly sized siblings) must be caught by
+    /// `verify_installed` and never reach `SherpaStreamingEngine::load`, which would hand it to
+    /// sherpa-onnx's C++ layer -- and that calls `_Exit()`, killing the app, every profile
+    /// included. The notice has to name the artifact and say re-download, not "not downloaded":
+    /// the files *are* there, they are just wrong.
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn a_damaged_preview_model_is_caught_before_it_reaches_sherpa() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model_dir = dir.path().join("models").join("zipformer-ru-small");
+        std::fs::create_dir_all(&model_dir).expect("create model dir");
+        // Sizes from the catalog entry (`crates/utter-store/src/models.rs`); only the encoder is
+        // wrong, so nothing but the size check can tell this install from a healthy one.
+        std::fs::write(model_dir.join("encoder.onnx"), b"truncated").expect("write encoder");
+        std::fs::write(model_dir.join("decoder.onnx"), vec![0u8; 2_093_080])
+            .expect("write decoder");
+        std::fs::write(model_dir.join("joiner.onnx"), vec![0u8; 259_417]).expect("write joiner");
+        std::fs::write(model_dir.join("tokens.txt"), vec![0u8; 6_388]).expect("write tokens");
+
+        let loader = RealProfileLoader::new(
+            Arc::new(ModelManager::new(dir.path().to_path_buf())),
+            RefineCfg::default(),
+            Vec::new(),
+        );
+
+        let profile = LanguageProfile {
+            draft: Some(DraftCfg {
+                model: "zipformer-ru-small".to_string(),
+            }),
+            ..LanguageProfile::default()
+        };
+
+        let (deps, notices) = loader.load(&profile);
+
+        assert!(
+            deps.draft_engine.is_none(),
+            "a damaged preview model must leave the preview off, not load"
+        );
+
+        let (kind, msg) = notices
+            .iter()
+            .find(|(_, msg)| msg.contains("zipformer-ru-small"))
+            .expect("a damaged preview model must be reported");
+        assert_eq!(*kind, "info");
+        assert!(msg.contains("damaged"), "got {msg:?}");
+        assert!(
+            msg.contains("encoder.onnx"),
+            "the notice must name the offending artifact, got {msg:?}"
+        );
+        assert!(msg.contains("re-download"), "got {msg:?}");
     }
 
     /// A blank language -- the shape `Profiles.svelte`'s free `TextInput` produces for a newly

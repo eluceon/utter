@@ -35,7 +35,7 @@ use utter_refine::{LlmConfig, LlmRefiner};
 use utter_store::settings::{CloudSttCfg, EngineCfg, EngineKind, InjectionPreference, RefineCfg};
 #[cfg(feature = "sherpa")]
 use utter_store::IntegrityError;
-use utter_store::{LanguageProfile, ModelManager, Settings};
+use utter_store::{DraftCfg, LanguageProfile, ModelManager, Settings};
 use utter_stt::{CloudEngine, CloudSttConfig, WhisperEngine};
 
 use crate::profiles::{ProfileRegistry, RealProfileLoader};
@@ -400,6 +400,107 @@ fn build_sherpa(
                    in Settings > Profiles, or install a build with the sherpa feature enabled"
         .to_string();
     (unavailable_engine(reason.clone()), Some(reason))
+}
+
+/// Builds a profile's draft (preview) engine from its [`DraftCfg`], plus a
+/// notice if one was configured but could not be built.
+///
+/// Unlike [`build_engine`], failure has no stand-in: `None` already means
+/// "this profile has no preview", and the runtime treats it exactly that way
+/// (see [`ProfileDeps::draft_engine`](crate::profiles::ProfileDeps::draft_engine)).
+/// A missing, damaged or unloadable preview model therefore costs the user
+/// nothing but the preview itself — the profile still dictates and still
+/// injects the final engine's text — which is why callers queue this
+/// function's notice as `"info"` rather than the `"warning"` a broken final
+/// engine earns.
+///
+/// `None`, or a blank model id, is the configured-off state (what the
+/// Profiles page writes when the preview is switched off) and is silent: it
+/// is a choice, not a degradation.
+pub(crate) fn build_draft_engine(
+    cfg: Option<&DraftCfg>,
+    models: &ModelManager,
+    dictionary_terms: &[String],
+) -> (Option<Box<dyn SttEngine>>, Option<String>) {
+    let model_id = cfg.map(|draft| draft.model.trim()).unwrap_or_default();
+    if model_id.is_empty() {
+        return (None, None);
+    }
+
+    build_streaming_draft(model_id, models, dictionary_terms)
+}
+
+/// The number of onnxruntime inference threads the draft engine gets:
+/// exactly one, deliberately *not* [`sherpa_thread_count`].
+///
+/// The draft engine decodes concurrently with the final engine on the same
+/// machine, so its threads come out of the same pool. Benchmarking on the
+/// target hardware put the final engine's latency optimum at 4 threads of 6,
+/// with the oversubscription of running both at that width costing 18%. A
+/// small int8 streaming model keeps up on a single thread, and staying out of
+/// the final engine's way is the entire point of it: the preview is a
+/// courtesy, the injected text is not.
+#[cfg(feature = "sherpa")]
+const DRAFT_THREADS: usize = 1;
+
+#[cfg(feature = "sherpa")]
+fn build_streaming_draft(
+    model_id: &str,
+    models: &ModelManager,
+    dictionary_terms: &[String],
+) -> (Option<Box<dyn SttEngine>>, Option<String>) {
+    // `verify_installed`, never `path_for`: a truncated or otherwise damaged
+    // model makes sherpa-onnx's C++ layer call `_Exit()` on load, taking the
+    // whole app down with no chance for Rust to catch it. See `build_sherpa`,
+    // which guards the final engine's path the same way.
+    let path = match models.verify_installed(model_id) {
+        Ok(path) => path,
+        Err(IntegrityError::SizeMismatch { artifact, .. }) => {
+            let reason = format!(
+                "preview model \"{model_id}\" is damaged (artifact \"{artifact}\" has the wrong \
+                 size); re-download it from Settings > Engines. Dictation is unaffected — only \
+                 the live preview is off."
+            );
+            return (None, Some(reason));
+        }
+        Err(_) => {
+            let reason = format!(
+                "preview model \"{model_id}\" is not downloaded; open Settings > Engines to \
+                 download it. Dictation is unaffected — only the live preview is off."
+            );
+            return (None, Some(reason));
+        }
+    };
+
+    let cfg = utter_stt::SherpaConfig {
+        num_threads: DRAFT_THREADS,
+        hotwords: dictionary_terms.to_vec(),
+    };
+
+    match utter_stt::SherpaStreamingEngine::load(&path, cfg) {
+        Ok(engine) => (Some(Box::new(engine)), None),
+        Err(e) => {
+            let reason = format!(
+                "failed to load preview model \"{model_id}\": {e}. Dictation is unaffected — \
+                 only the live preview is off."
+            );
+            (None, Some(reason))
+        }
+    }
+}
+
+#[cfg(not(feature = "sherpa"))]
+fn build_streaming_draft(
+    model_id: &str,
+    _models: &ModelManager,
+    _dictionary_terms: &[String],
+) -> (Option<Box<dyn SttEngine>>, Option<String>) {
+    let reason = format!(
+        "this build was compiled without sherpa support, so the preview model \"{model_id}\" \
+         cannot be loaded; switch the preview off in Settings > Profiles, or install a build \
+         with the sherpa feature enabled. Dictation is unaffected — only the live preview is off."
+    );
+    (None, Some(reason))
 }
 
 /// A generous but bounded default for the cloud engine's HTTP timeout:

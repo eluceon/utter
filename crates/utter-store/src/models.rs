@@ -345,6 +345,23 @@ impl ModelManager {
         self.find(id).map(|entry| entry.engine)
     }
 
+    /// The file names `id`'s artifacts are installed under, in catalog
+    /// order, or `None` if `id` is not in the catalog at all.
+    ///
+    /// The contents of a model directory are a contract with whoever loads
+    /// it: an engine opens fixed file names inside the directory this
+    /// manager installed, and [`Artifact::name`] is what decides those names
+    /// — deliberately independent of the URL, since upstream file names vary
+    /// per release (`encoder.int8.onnx`, `encoder-epoch-99-avg-1.int8.onnx`,
+    /// ...) and an engine cannot chase them. That contract is otherwise
+    /// stated twice, in two crates that cannot see each other, with nothing
+    /// checking the copies still agree; this is the accessor that lets a
+    /// crate downstream of both hold them against one another.
+    pub fn artifact_names(&self, id: &str) -> Option<Vec<&'static str>> {
+        self.find(id)
+            .map(|entry| entry.artifacts.iter().map(|a| a.name).collect())
+    }
+
     /// Downloads and installs the model identified by `id`.
     ///
     /// Each artifact's response body streams into a `.part` file inside a

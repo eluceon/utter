@@ -433,13 +433,26 @@ impl std::fmt::Debug for SherpaStreamingEngine {
     }
 }
 
+/// The four files a streaming model directory must contain, in the order
+/// [`SherpaStreamingEngine::load`] resolves them.
+///
+/// This is one half of a contract with whatever installed the directory: the
+/// model catalog normalises every streaming artifact to these names, no
+/// matter what upstream calls the file in its URL (`encoder.int8.onnx`,
+/// `encoder-epoch-99-avg-1.int8.onnx`, ...). It is public so the crate that
+/// owns the other half can be held against it rather than restating it — a
+/// renamed artifact would otherwise cost nothing but a preview that silently
+/// never loads.
+pub const STREAMING_MODEL_FILES: [&str; 4] =
+    ["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"];
+
 impl SherpaStreamingEngine {
     /// Loads a sherpa-onnx online (streaming) transducer model from `dir`.
     ///
     /// Unlike [`SherpaOfflineEngine::load`], filenames are not tried against
     /// a candidate list: the catalog installs streaming models under exactly
-    /// `encoder.onnx`, `decoder.onnx`, `joiner.onnx` and `tokens.txt`, so a
-    /// single fixed name is resolved for each.
+    /// the names in [`STREAMING_MODEL_FILES`], so a single fixed name is
+    /// resolved for each.
     ///
     /// `dir` must be a model *directory* as resolved by
     /// `ModelManager::path_for` — never a bare catalog id, for the same
@@ -461,10 +474,11 @@ impl SherpaStreamingEngine {
 
         let hotwords = build_hotwords_arg(&cfg.hotwords)?;
 
-        let encoder = resolve_required_file(dir, &["encoder.onnx"])?;
-        let decoder = resolve_required_file(dir, &["decoder.onnx"])?;
-        let joiner = resolve_required_file(dir, &["joiner.onnx"])?;
-        let tokens = resolve_required_file(dir, &["tokens.txt"])?;
+        let [encoder_name, decoder_name, joiner_name, tokens_name] = STREAMING_MODEL_FILES;
+        let encoder = resolve_required_file(dir, &[encoder_name])?;
+        let decoder = resolve_required_file(dir, &[decoder_name])?;
+        let joiner = resolve_required_file(dir, &[joiner_name])?;
+        let tokens = resolve_required_file(dir, &[tokens_name])?;
 
         let config = OnlineRecognizerConfig {
             model_config: OnlineModelConfig {

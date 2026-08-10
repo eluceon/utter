@@ -1026,6 +1026,56 @@ mod tests {
         );
     }
 
+    /// The catalog installs every streaming model under exactly the file
+    /// names `SherpaStreamingEngine::load` opens.
+    ///
+    /// The two halves live in crates that cannot see each other —
+    /// `utter-store` decides the installed names via `Artifact.name`,
+    /// `utter-stt` resolves four fixed ones — and this crate is the first
+    /// place downstream of both. Nothing else checks them: renaming an
+    /// artifact back to its upstream file name (`encoder.int8.onnx`,
+    /// `encoder-epoch-99-avg-1.int8.onnx`) leaves every other test green
+    /// while the preview quietly never loads for that language, since a
+    /// preview that fails to load is by design only an `"info"` notice.
+    ///
+    /// Driven off the catalog rather than a hardcoded id list, so an entry
+    /// added later is covered without anyone remembering to come back here;
+    /// the emptiness guard is what keeps that from silently becoming a loop
+    /// over nothing. Names are compared as sorted sets because the loader
+    /// resolves each by name and does not care in what order the catalog
+    /// happens to list them.
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn every_streaming_catalog_entry_installs_the_filenames_the_loader_resolves() {
+        let models = ModelManager::new(std::path::PathBuf::from("/nonexistent"));
+
+        let mut expected = utter_stt::sherpa::STREAMING_MODEL_FILES.to_vec();
+        expected.sort_unstable();
+
+        let ids: Vec<String> = models
+            .catalog()
+            .into_iter()
+            .filter(|m| m.engine == STREAMING_ENGINE)
+            .map(|m| m.id)
+            .collect();
+        assert!(
+            !ids.is_empty(),
+            "the catalog has no {STREAMING_ENGINE} entries, so this test would assert nothing"
+        );
+
+        for id in ids {
+            let mut names = models
+                .artifact_names(&id)
+                .expect("an id taken from the catalog is in the catalog");
+            names.sort_unstable();
+            assert_eq!(
+                names, expected,
+                "{id} must install the artifact names SherpaStreamingEngine::load resolves, or \
+                 its preview will never load"
+            );
+        }
+    }
+
     /// The draft engine is loaded on exactly one inference thread, never on
     /// [`sherpa_thread_count`] like the final engine.
     ///

@@ -236,7 +236,7 @@
     <Field
       label="Live preview"
       for="profile-{index}-preview"
-      hint="A streaming model that shows words in the HUD while you speak. The inserted text always comes from the engine above, never from this. Off by default; download preview models on the Engines page."
+      hint="A streaming model that shows words in the HUD while you speak. The inserted text always comes from the engine above, never from this. Off by default. Download the model on the Engines page first — one selected before it is downloaded stays silent until you restart the app."
     >
       <Select
         id="profile-{index}-preview"

@@ -22,10 +22,20 @@ export function previewModels(models: ModelInfo[]): ModelInfo[] {
 
 /** The options of a profile's preview-model picker: the preview switched off
  * first (the default — an empty value the caller maps back to a `null`
- * `LanguageProfile.draft`), then one entry per streaming model. */
+ * `LanguageProfile.draft`), then one entry per streaming model.
+ *
+ * A model that is not installed yet is still offered, but says so: selecting
+ * one is legal and saves fine, it simply produces no preview until the model
+ * is downloaded on the Engines page *and* the app is restarted, since a
+ * profile's engines are built once and cached for the run. Naming that up
+ * front is what pushes the working order — download first, then select — for
+ * a picker that otherwise looks like every option in it is ready to use. */
 export function previewModelOptions(models: ModelInfo[]): { value: string; label: string }[] {
   return [
     { value: '', label: 'Off' },
-    ...previewModels(models).map((m) => ({ value: m.id, label: m.label })),
+    ...previewModels(models).map((m) => ({
+      value: m.id,
+      label: m.installed ? m.label : `${m.label} (not downloaded)`,
+    })),
   ]
 }

@@ -106,20 +106,45 @@ impl SttEngine for FailingSttEngine {
     }
 }
 
-/// A working draft engine: emits `partial` from every `feed` and records every call into `calls`.
+/// A working draft engine: emits `partial` from every `feed`, records every call into `calls`,
+/// and records the options it was begun with into `begin_opts`.
+///
+/// `begin_opts` is caller-supplied rather than a private `Arc` this function makes up, because
+/// options nobody holds a handle to cannot be asserted on: the runtime must begin the draft
+/// engine on the *same* `TranscribeOptions` as the final one, and a fixture that swallowed them
+/// would leave that unfalsifiable (see
+/// `the_draft_engine_begins_on_the_same_options_as_the_final_engine`).
 ///
 /// Its `finish()` transcript is deliberately a string no assertion in this file ever expects to
 /// see, because the runtime must never call `finish()` on a draft engine at all (spec D9). If
 /// that ever changed and the result were used, the injected text would name the leak rather than
 /// quietly resembling something plausible.
-fn draft_engine(partial: &str, calls: Arc<Mutex<Vec<CallRecord>>>) -> Box<dyn SttEngine> {
+fn draft_engine(
+    partial: &str,
+    calls: Arc<Mutex<Vec<CallRecord>>>,
+    begin_opts: Arc<Mutex<Vec<TranscribeOptions>>>,
+) -> Box<dyn SttEngine> {
     Box::new(FakeSttEngine {
         result: Ok(transcript("DRAFT-FINISH-MUST-NEVER-BE-CALLED")),
         calls,
         partial: Some(partial.to_string()),
         finish_delay: Duration::ZERO,
-        begin_opts: Arc::new(Mutex::new(Vec::new())),
+        begin_opts,
     })
+}
+
+/// The `Debug` rendering of every `TranscribeOptions` an engine was begun with.
+///
+/// `TranscribeOptions` implements `Debug` but not `PartialEq`, and `utter-core` is deliberately
+/// not modified for a test's convenience, so two engines' options are compared by rendering.
+/// That has a property field-by-field assertions lack: a field added to `TranscribeOptions`
+/// later is covered automatically instead of silently escaping the comparison.
+fn begun_with(opts: &Arc<Mutex<Vec<TranscribeOptions>>>) -> Vec<String> {
+    opts.lock()
+        .expect("lock")
+        .iter()
+        .map(|opts| format!("{opts:?}"))
+        .collect()
 }
 
 /// The samples of every `feed` in a recorded call log, in order — the shape the frame fan-out
@@ -1674,7 +1699,11 @@ fn both_engines_are_fed_the_same_frames_while_recording() {
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
     builder.calls = final_calls.clone();
     builder.capture_tx_slot = tx_slot.clone();
-    builder.draft_engine = Some(draft_engine("preview", draft_calls.clone()));
+    builder.draft_engine = Some(draft_engine(
+        "preview",
+        draft_calls.clone(),
+        Arc::new(Mutex::new(Vec::new())),
+    ));
     let deps = builder.build(hotkey_rx);
 
     let handle = Runtime::spawn(deps, sink);
@@ -1735,6 +1764,64 @@ fn both_engines_are_fed_the_same_frames_while_recording() {
     handle.shutdown();
 }
 
+/// The draft engine is begun on the *same* `TranscribeOptions` as the final one: it is a second
+/// view of a single utterance, not a differently-configured recognizer.
+///
+/// Both fields are deliberately given non-default values, and the final engine's recorded options
+/// are checked to actually carry them, so the equality below cannot be satisfied by two
+/// `TranscribeOptions::default()` meeting in the middle -- which is exactly what a
+/// `begin_draft(ctx, &TranscribeOptions::default())` regression would produce. What that costs in
+/// practice is named in `ProfileDeps.draft_engine`'s own doc comment: a preview begun without the
+/// profile's language shows Russian speech as garbled English, which is the reason the field is
+/// per-profile rather than per-runtime in the first place. Unreachable today, since nothing
+/// constructs a real draft engine yet; reachable the moment Task 21 does.
+#[test]
+fn the_draft_engine_begins_on_the_same_options_as_the_final_engine() {
+    let final_opts = Arc::new(Mutex::new(Vec::new()));
+    let draft_opts = Arc::new(Mutex::new(Vec::new()));
+    let (sink, states_rx, _notices_rx) = fake_sink();
+
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
+    builder.language = Some("ru".to_string());
+    builder.dictionary_terms = vec!["SQLite".to_string(), "Tauri".to_string()];
+    builder.begin_opts = final_opts.clone();
+    builder.draft_engine = Some(draft_engine(
+        "preview",
+        Arc::new(Mutex::new(Vec::new())),
+        draft_opts.clone(),
+    ));
+    let deps = builder.build(hotkey_rx);
+
+    let handle = Runtime::spawn(deps, sink);
+
+    press_and_release(&hotkey_tx, &states_rx, BindingId::from(0));
+
+    let final_begun = final_opts.lock().expect("lock");
+    assert_eq!(final_begun.len(), 1);
+    assert_eq!(
+        final_begun[0].language.as_deref(),
+        Some("ru"),
+        "fixture check: the final engine must genuinely have been begun on a non-default \
+         language, or the comparison below would prove nothing"
+    );
+    assert_eq!(
+        final_begun[0].initial_prompt.as_deref(),
+        Some("SQLite, Tauri"),
+        "fixture check: the same for the dictionary hints"
+    );
+    drop(final_begun);
+
+    assert_eq!(
+        begun_with(&draft_opts),
+        begun_with(&final_opts),
+        "the draft engine must be begun on the same options as the final engine -- the profile's \
+         language and dictionary hints included, not a default it was handed instead"
+    );
+
+    handle.shutdown();
+}
+
 /// Spec D9: the draft engine drives the preview and nothing else. The three strings here are
 /// deliberately unmistakable for one another -- the draft's partial, the final engine's own
 /// partial, and the final transcript -- because a fixture where any two could coincide would let
@@ -1757,7 +1844,11 @@ fn draft_text_never_reaches_the_injected_result_or_history() {
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("the accurate transcript")));
     builder.partial = Some("FINAL-ENGINE-PARTIAL".to_string());
-    builder.draft_engine = Some(draft_engine("DRAFT-LEAK", draft_calls.clone()));
+    builder.draft_engine = Some(draft_engine(
+        "DRAFT-LEAK",
+        draft_calls.clone(),
+        Arc::new(Mutex::new(Vec::new())),
+    ));
     builder.injected = injected.clone();
     builder.history = Some(history);
     builder.capture_tx_slot = tx_slot.clone();

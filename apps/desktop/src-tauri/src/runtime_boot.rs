@@ -346,6 +346,70 @@ fn sherpa_thread_count() -> usize {
     utter_stt::sherpa::default_threads(available)
 }
 
+/// The catalog `engine` string of the offline models whose text is injected.
+#[cfg(feature = "sherpa")]
+const OFFLINE_ENGINE: &str = "sherpa";
+
+/// The catalog `engine` string of the streaming models that drive the live
+/// preview. Mirrored in the UI as `PREVIEW_ENGINE`
+/// (`apps/desktop/ui/src/lib/models.ts`), which keeps the two out of each
+/// other's pickers; this module is what keeps a config that got one wrong
+/// anyway from reaching a decoder.
+#[cfg(feature = "sherpa")]
+const STREAMING_ENGINE: &str = "sherpa-streaming";
+
+/// How a notice refers to the models catalogued under `engine`.
+#[cfg(feature = "sherpa")]
+fn model_kind_description(engine: &str) -> String {
+    match engine {
+        OFFLINE_ENGINE => "an offline transcription model".to_string(),
+        STREAMING_ENGINE => "a streaming preview model".to_string(),
+        "whisper" => "a whisper model".to_string(),
+        other => format!("a \"{other}\" model"),
+    }
+}
+
+/// Rejects a model id that is catalogued under an engine other than
+/// `expected_engine`, returning the reason to report if so.
+///
+/// **This is a process-liveness check, not a validation nicety, and it must
+/// run before [`ModelManager::verify_installed`].** `verify_installed`
+/// answers "are these files intact"; it cannot answer "are these the files
+/// this engine can read", and a model of the wrong kind is usually perfectly
+/// intact. The two sherpa engines resolve overlapping fixed artifact names —
+/// `parakeet-tdt-110m-en` (offline) installs as exactly the
+/// `encoder.onnx`/`decoder.onnx`/`joiner.onnx`/`tokens.txt` quartet
+/// `SherpaStreamingEngine::load` looks for — so an intact offline model
+/// handed to the streaming recognizer sails through every existing check and
+/// reaches sherpa-onnx, which reads streaming-only metadata keys
+/// (`decode_chunk_len`, encoder dims) that an offline export does not carry
+/// and terminates the process rather than returning an error. Nothing in Rust
+/// can catch that, which is why the id's *kind* is settled here, first, on
+/// catalog data alone.
+///
+/// An id that is not in the catalog at all is rejected too, with its own
+/// wording: it has no kind to check, nothing could install it, and letting it
+/// fall through would report a typo'd id as merely "not downloaded".
+#[cfg(feature = "sherpa")]
+fn wrong_model_kind(
+    models: &ModelManager,
+    model_id: &str,
+    expected_engine: &str,
+) -> Option<String> {
+    match models.engine_of(model_id) {
+        Some(engine) if engine == expected_engine => None,
+        Some(engine) => Some(format!(
+            "model \"{model_id}\" is {}, not {}; choose a different model in Settings > Profiles",
+            model_kind_description(engine),
+            model_kind_description(expected_engine)
+        )),
+        None => Some(format!(
+            "model \"{model_id}\" is not in the model catalog; choose a model in Settings > \
+             Profiles"
+        )),
+    }
+}
+
 #[cfg(feature = "sherpa")]
 fn build_sherpa(
     model_id: Option<&str>,
@@ -357,6 +421,10 @@ fn build_sherpa(
             "no sherpa model configured; open Settings > Engines to download one".to_string();
         return (unavailable_engine(reason.clone()), Some(reason));
     };
+
+    if let Some(reason) = wrong_model_kind(models, model_id, OFFLINE_ENGINE) {
+        return (unavailable_engine(reason.clone()), Some(reason));
+    }
 
     let path = match models.verify_installed(model_id) {
         Ok(path) => path,
@@ -449,6 +517,14 @@ fn build_streaming_draft(
     models: &ModelManager,
     dictionary_terms: &[String],
 ) -> (Option<Box<dyn SttEngine>>, Option<String>) {
+    // Kind before integrity: an offline model is a valid, intact install of
+    // something this engine cannot read, and `verify_installed` would wave it
+    // through — see `wrong_model_kind`.
+    if let Some(reason) = wrong_model_kind(models, model_id, STREAMING_ENGINE) {
+        let reason = format!("{reason}. Dictation is unaffected — only the live preview is off.");
+        return (None, Some(reason));
+    }
+
     // `verify_installed`, never `path_for`: a truncated or otherwise damaged
     // model makes sherpa-onnx's C++ layer call `_Exit()` on load, taking the
     // whole app down with no chance for Rust to catch it. See `build_sherpa`,
@@ -866,6 +942,78 @@ mod tests {
             .begin(&TranscribeOptions::default())
             .expect_err("an unavailable engine must fail begin() informatively");
         assert!(matches!(err, SttError::ModelNotFound(_)));
+    }
+
+    /// A streaming preview model configured as the *final* engine's model must be rejected on
+    /// its kind, before `verify_installed` and before any engine is constructed. The offline and
+    /// streaming loaders resolve overlapping artifact names, so an intact model of the wrong kind
+    /// reaches sherpa-onnx looking exactly like a right one and kills the process there.
+    ///
+    /// The fixture is deliberately a *damaged* install of a real streaming id: without the kind
+    /// check `verify_installed` would reject it as damaged and the degradation would look fine
+    /// from the outside, so asserting the notice talks about the model's kind and *not* about
+    /// damage is what pins the check running first, on its own terms.
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn a_streaming_model_is_rejected_as_the_injected_transcript_engine() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = ModelManager::new(dir.path().to_path_buf());
+
+        let model_dir = dir.path().join("models").join("zipformer-ru-small");
+        std::fs::create_dir_all(&model_dir).expect("create model dir");
+        for name in ["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"] {
+            std::fs::write(model_dir.join(name), b"wrong size on purpose").expect("write artifact");
+        }
+
+        let (mut engine, notice) = build_sherpa(Some("zipformer-ru-small"), &models, &[]);
+
+        let notice = notice.expect("a model of the wrong kind must produce a notice");
+        assert!(notice.contains("zipformer-ru-small"), "got {notice:?}");
+        assert!(
+            notice.contains("a streaming preview model"),
+            "the notice must say what the model actually is, got {notice:?}"
+        );
+        assert!(
+            notice.contains("an offline transcription model"),
+            "the notice must say what was needed instead, got {notice:?}"
+        );
+        assert!(
+            notice.contains("Settings > Profiles"),
+            "the notice must name the page where this is changed, got {notice:?}"
+        );
+        assert!(
+            !notice.contains("damaged"),
+            "the kind check must run before the integrity check, got {notice:?}"
+        );
+
+        let err = engine
+            .begin(&TranscribeOptions::default())
+            .expect_err("a profile whose final engine is unusable must fail informatively");
+        assert!(matches!(err, SttError::ModelNotFound(_)));
+    }
+
+    /// An id in no catalog entry at all is the third case: it has no kind to check and nothing
+    /// could ever install it, so it is rejected here rather than falling through to
+    /// `verify_installed`, which would report a typo as merely "not downloaded".
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn an_uncatalogued_model_id_is_rejected_as_unknown_rather_than_undownloaded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = ModelManager::new(dir.path().to_path_buf());
+
+        let (_engine, notice) = build_sherpa(Some("typo-not-a-model"), &models, &[]);
+
+        let notice = notice.expect("an uncatalogued id must produce a notice");
+        assert!(notice.contains("typo-not-a-model"), "got {notice:?}");
+        assert!(
+            notice.contains("not in the model catalog"),
+            "got {notice:?}"
+        );
+        assert!(
+            !notice.contains("not downloaded"),
+            "an id no catalog entry has cannot be downloaded, so saying so would misdirect the \
+             user, got {notice:?}"
+        );
     }
 
     #[cfg(not(feature = "sherpa"))]

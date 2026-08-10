@@ -907,6 +907,110 @@ mod tests {
         assert!(msg.contains("re-download"), "got {msg:?}");
     }
 
+    /// The route the `verify_installed` guard alone does not close: a profile whose preview
+    /// model names an *offline* catalog entry. `parakeet-tdt-110m-en` installs under exactly the
+    /// four artifact names `SherpaStreamingEngine::load` resolves, so an intact copy of it passes
+    /// `verify_installed`, passes every file check, and reaches sherpa-onnx, which kills the
+    /// process on the streaming metadata an offline export does not carry. The id's kind has to
+    /// be settled from the catalog before any of that.
+    ///
+    /// The fixture installs `parakeet-tdt-110m-en` at the wrong sizes on purpose: without the
+    /// kind check, `verify_installed` would call it damaged and the profile would still degrade
+    /// politely, so a test that only asserted "preview off, some notice" would stay green. The
+    /// notice having to name the model's *kind*, and not mention damage, is what pins the check
+    /// running first and on its own grounds. (Installing it at the *right* sizes would be the
+    /// purest fixture and is not worth 456 MB in a unit test; this ordering assertion covers the
+    /// same defect.)
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn an_offline_model_selected_as_the_preview_is_rejected_on_its_kind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model_dir = dir.path().join("models").join("parakeet-tdt-110m-en");
+        std::fs::create_dir_all(&model_dir).expect("create model dir");
+        for name in ["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"] {
+            std::fs::write(model_dir.join(name), b"wrong size on purpose").expect("write artifact");
+        }
+
+        let loader = RealProfileLoader::new(
+            Arc::new(ModelManager::new(dir.path().to_path_buf())),
+            RefineCfg::default(),
+            Vec::new(),
+        );
+
+        let profile = LanguageProfile {
+            draft: Some(DraftCfg {
+                model: "parakeet-tdt-110m-en".to_string(),
+            }),
+            ..LanguageProfile::default()
+        };
+
+        let (deps, notices) = loader.load(&profile);
+
+        assert!(
+            deps.draft_engine.is_none(),
+            "an offline model must never be loaded as a preview engine"
+        );
+
+        let (kind, msg) = notices
+            .iter()
+            .find(|(_, msg)| msg.contains("parakeet-tdt-110m-en"))
+            .expect("a preview model of the wrong kind must be reported by name");
+        assert_eq!(
+            *kind, "info",
+            "the preview still degrades softly: dictation is unaffected"
+        );
+        assert!(
+            msg.contains("an offline transcription model"),
+            "the notice must say what the model actually is, got {msg:?}"
+        );
+        assert!(
+            msg.contains("a streaming preview model"),
+            "the notice must say what a preview needs instead, got {msg:?}"
+        );
+        assert!(
+            msg.contains("Settings > Profiles"),
+            "the notice must name the page where the preview model is chosen, got {msg:?}"
+        );
+        assert!(
+            !msg.contains("damaged"),
+            "the kind check must run before the integrity check, got {msg:?}"
+        );
+    }
+
+    /// A preview model id that is in no catalog entry at all -- the third case, distinct from the
+    /// wrong-kind one above. Reported as uncatalogued rather than as merely undownloaded, since
+    /// no download could ever produce it.
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn an_uncatalogued_preview_model_id_is_reported_as_unknown() {
+        let loader = RealProfileLoader::new(
+            Arc::new(ModelManager::new(PathBuf::from("/nonexistent"))),
+            RefineCfg::default(),
+            Vec::new(),
+        );
+
+        let profile = LanguageProfile {
+            draft: Some(DraftCfg {
+                model: "zipformer-xx-small".to_string(),
+            }),
+            ..LanguageProfile::default()
+        };
+
+        let (deps, notices) = loader.load(&profile);
+
+        assert!(deps.draft_engine.is_none());
+        let (kind, msg) = notices
+            .iter()
+            .find(|(_, msg)| msg.contains("zipformer-xx-small"))
+            .expect("an uncatalogued preview model id must be reported by name");
+        assert_eq!(*kind, "info");
+        assert!(msg.contains("not in the model catalog"), "got {msg:?}");
+        assert!(
+            msg.contains("only the live preview is off"),
+            "the notice must still say dictation is unaffected, got {msg:?}"
+        );
+    }
+
     /// A blank language -- the shape `Profiles.svelte`'s free `TextInput` produces for a newly
     /// added profile -- must reach `ProfileDeps` as `None` (auto-detect), not `Some("")`. The
     /// test above only ever exercises a real language tag and would not notice a missing

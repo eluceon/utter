@@ -330,6 +330,21 @@ impl ModelManager {
         self.is_installed(entry, &path).then_some(path)
     }
 
+    /// The catalog `engine` string `id` is filed under (`"whisper"`,
+    /// `"sherpa"`, `"sherpa-streaming"`), or `None` if `id` is not in the
+    /// catalog at all.
+    ///
+    /// This is what lets a caller check a model's *kind* before loading it,
+    /// which [`verify_installed`](Self::verify_installed) deliberately does
+    /// not: that call answers "are these files intact", not "are these the
+    /// files this engine can read". The two questions are independent, and
+    /// several entries of different kinds install under the very same
+    /// artifact names, so a perfectly intact model of the wrong kind reaches
+    /// the loader looking exactly like a right one.
+    pub fn engine_of(&self, id: &str) -> Option<&str> {
+        self.find(id).map(|entry| entry.engine)
+    }
+
     /// Downloads and installs the model identified by `id`.
     ///
     /// Each artifact's response body streams into a `.part` file inside a
@@ -1231,6 +1246,31 @@ mod tests {
                 "{id} must be catalogued under the sherpa-streaming engine"
             );
         }
+    }
+
+    /// `engine_of` is what the load path uses to reject a model of the wrong
+    /// kind before handing it to a native decoder that would abort the
+    /// process on it. Asserted against the real catalog, and specifically on
+    /// the pair that collides: `parakeet-tdt-110m-en` (offline) and
+    /// `zipformer-ru-small` (streaming) install under the very same four
+    /// artifact names, so their catalog `engine` string is the only thing
+    /// that tells them apart before load.
+    #[test]
+    fn engine_of_reports_the_kind_a_model_is_catalogued_under() {
+        let models = ModelManager::new(PathBuf::from("/nonexistent"));
+
+        assert_eq!(models.engine_of("parakeet-tdt-110m-en"), Some("sherpa"));
+        assert_eq!(
+            models.engine_of("zipformer-ru-small"),
+            Some("sherpa-streaming")
+        );
+        assert_eq!(models.engine_of("small"), Some("whisper"));
+        assert_eq!(
+            models.engine_of("no-such-model"),
+            None,
+            "an id that is not catalogued at all has no kind, and must be \
+             distinguishable from one that has the wrong kind"
+        );
     }
 
     #[test]

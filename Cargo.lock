@@ -5474,7 +5474,7 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "utter-audio"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cpal",
  "crossbeam-channel",
@@ -5486,7 +5486,7 @@ dependencies = [
 
 [[package]]
 name = "utter-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "thiserror 2.0.19",
@@ -5494,7 +5494,7 @@ dependencies = [
 
 [[package]]
 name = "utter-desktop"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -5517,7 +5517,7 @@ dependencies = [
 
 [[package]]
 name = "utter-inject"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -5532,7 +5532,7 @@ dependencies = [
 
 [[package]]
 name = "utter-refine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
@@ -5544,7 +5544,7 @@ dependencies = [
 
 [[package]]
 name = "utter-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -5565,7 +5565,7 @@ dependencies = [
 
 [[package]]
 name = "utter-stt"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hound",
  "reqwest 0.12.28",

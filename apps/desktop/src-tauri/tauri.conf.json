@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Utter",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "identifier": "dev.utter.app",
   "build": {
     "frontendDist": "../ui/dist",

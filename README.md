@@ -135,9 +135,10 @@ They are built on Ubuntu 22.04 and need **glibc 2.35 or newer** — Ubuntu
 The live preview is off by default and takes two steps to turn on: download a
 streaming model under Settings > Engines > Live preview models, then select it
 for a profile under Settings > Profiles > Live preview. That order matters —
-a profile's engines are built once and cached for the run, so a preview model
-selected before it has been downloaded stays silent until the app is
-restarted. A build without the `sherpa` feature has no preview at all.
+a profile's engines are rebuilt when settings are saved, not when a download
+finishes, so a preview model selected before it was downloaded stays silent
+until settings are next saved or the app restarts. A build without the
+`sherpa` feature has no preview at all.
 
 ### Build from source
 

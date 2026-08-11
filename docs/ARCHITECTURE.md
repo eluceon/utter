@@ -12,7 +12,7 @@ plugged in at the edge.
 |---|---|
 | `utter-core` | Domain: the `Session` state machine, ports (`SttEngine`, `TextRefiner`, `TextInjector`), and shared types (`Transcript`, `Tone`, `InjectionMethod`). No I/O. |
 | `utter-audio` | Microphone capture via `cpal`, resampling to 16 kHz mono `i16` (`rubato`), RMS level and silence detection. |
-| `utter-stt` | Speech-to-text adapters behind Cargo features: `whisper` (whisper.cpp via `whisper-rs`), `sherpa` (offline sherpa-onnx transducer via the `sherpa-onnx` crate — one native runtime serving two per-language models, GigaAM-v3 for Russian and Parakeet TDT 110M for English), `cloud` (any OpenAI-compatible `/audio/transcriptions` endpoint). |
+| `utter-stt` | Speech-to-text adapters behind Cargo features: `whisper` (whisper.cpp via `whisper-rs`), `sherpa` (two sherpa-onnx adapters over the `sherpa-onnx` crate — `SherpaOfflineEngine` on the offline recognizer, serving GigaAM-v3 for Russian and Parakeet TDT 110M for English, and `SherpaStreamingEngine` on the online recognizer, serving the small Zipformer preview models for the same two languages — all four on one native runtime), `cloud` (any OpenAI-compatible `/audio/transcriptions` endpoint). |
 | `utter-refine` | Transcript post-processing: dictionary replacement rules, snippet matching, prompt construction, and the LLM client (any OpenAI-compatible `/chat/completions` endpoint). |
 | `utter-inject` | Global hotkey capture (evdev, with an X11 `global-hotkey` fallback) and text injection backends (clipboard-paste, direct typing, clipboard-only), chained with automatic fallback. |
 | `utter-store` | TOML settings persistence, the SQLite-backed history repository, and the STT model catalog/downloader. |
@@ -32,6 +32,7 @@ graph LR
 
     Whisper["utter-stt: WhisperEngine"] -->|implements| SttEngine
     Sherpa["utter-stt: SherpaOfflineEngine"] -->|implements| SttEngine
+    SherpaStream["utter-stt: SherpaStreamingEngine"] -->|implements| SttEngine
     Cloud["utter-stt: CloudEngine"] -->|implements| SttEngine
 
     LlmRefiner["utter-refine: LlmRefiner"] -->|implements| TextRefiner
@@ -91,9 +92,13 @@ A streaming engine can additionally surface partial transcripts while in
 `Recording` through `SttEngine::feed`'s `Option<String>` return, handled
 outside the state machine by the runtime orchestrator
 (`apps/desktop/src-tauri/src/runtime.rs`), which forwards them straight to
-the HUD without affecting `Session`'s state. Neither current engine uses
-this seam — whisper.cpp and sherpa-onnx are both batch, producing text only
-at `finish()` — it exists for a future streaming engine.
+the HUD without affecting `Session`'s state. `SherpaStreamingEngine` is what
+uses that seam, as a profile's optional *draft* engine — the live preview.
+The engines that produce the injected text do not: whisper.cpp, the offline
+sherpa-onnx models and the cloud endpoint are all batch, producing text only
+at `finish()`, so a profile with no preview model configured shows no partial
+at all. Either way the seam is invisible to `Session`, which never sees a
+partial and has no state for one.
 
 ## Data flow
 
@@ -108,11 +113,20 @@ at `finish()` — it exists for a future streaming engine.
 2. **Capture** — `Session::handle` turns a press into `Effect::StartCapture`;
    the runtime starts `utter-audio`'s `Capture`, which pulls frames from
    `cpal` and resamples them to 16 kHz mono `i16`.
-3. **Engine feed** — each audio frame is fed to the active `SttEngine`. Both
-   current engines (whisper.cpp, sherpa-onnx) buffer until `finish()`; a
-   streaming engine could instead return partial text as it goes.
-4. **Finish** — releasing the hotkey (or a silence timeout) stops capture
-   and calls `engine.finish()`, producing a `Transcript`.
+3. **Engine feed** — each audio frame captured while the session is
+   `Recording` is fed to the active profile's `SttEngine`, which buffers it
+   until `finish()`. If the profile also has a draft engine, the same frame
+   goes to that too, in the same function, and the partial it decodes on the
+   spot is what the HUD previews. The draft engine gets exactly one
+   onnxruntime inference thread rather than the half-the-cores share the
+   final engine takes: the two decode concurrently on the same machine, and
+   the preview is a courtesy the injected text must not pay for. The fan-out
+   lives at exactly one call site and ends when recording does — see "The
+   draft engine never touches the result" below.
+4. **Finish** — releasing the hotkey (or a silence timeout) stops capture,
+   drains the frames still in flight into the final engine alone, and calls
+   `engine.finish()`, producing a `Transcript`. The draft engine's `finish()`
+   is never called.
 5. **Rules and snippets** — the runtime applies dictionary replacement rules
    to the raw transcript, then checks it against configured snippets. A
    snippet match replaces the text outright and skips the refiner
@@ -180,23 +194,64 @@ at `finish()` — it exists for a future streaming engine.
   given holds GigaAM-v3 or Parakeet TDT 110M: both are NeMo transducer
   exports with the same encoder/decoder/joiner/tokens layout (only the
   encoder filename differs — `encoder.int8.onnx` vs `encoder.onnx` — which
-  `load()` resolves by trying both). Three engines (`whisper`, `sherpa`,
-  `cloud`) are therefore backed by two native runtimes — whisper.cpp and
-  onnxruntime via sherpa-onnx, both linked statically — with the
-  onnxruntime one covering both language roles instead of one runtime per
-  language.
+  `load()` resolves by trying both). `SherpaStreamingEngine` is split from it
+  along a different axis — sherpa-onnx's online recognizer is a separate API,
+  not a mode of the offline one — and is itself language-agnostic the same
+  way, serving both Zipformer preview models. Three engines a profile can
+  pick (`whisper`, `sherpa`, `cloud`) plus the optional preview are therefore
+  backed by two native runtimes — whisper.cpp and onnxruntime via
+  sherpa-onnx, both linked statically — with the onnxruntime one covering
+  every language role instead of one runtime per language.
 - **One trait for both batch and streaming engines** — `SttEngine::feed`
   returns `Option<String>` rather than `()` so a batch engine (whisper.cpp,
-  sherpa-onnx — both only produce a result at `finish()`) and a future
-  streaming engine can share one trait, without forcing a batch engine to
-  fake partial output or a streaming one to discard its main advantage.
+  the offline sherpa-onnx models, cloud — all of which only produce a result
+  at `finish()`) and a streaming one can share one trait, without forcing a
+  batch engine to fake partial output or a streaming one to discard its main
+  advantage. `SherpaStreamingEngine` is the first implementation to return
+  `Some` from `feed`, and it needed no change to the port to do it: the
+  runtime holds a profile's draft engine in the same `Box<dyn SttEngine>` as
+  its final one, and the fan-out in the worker is two calls on the same
+  trait rather than a second abstraction.
+- **The draft engine never touches the result, and that is structural** —
+  the live preview's text must never reach the injected transcript or the
+  history. That guarantee is not maintained by care or asserted by a test;
+  it holds because no draft transcript is ever produced. `begin()` and
+  `feed()` are the only calls made on a draft engine anywhere in the
+  codebase — `finish()`, the one call that would return a `Transcript`, is
+  deliberately absent — so there is nothing on any path that could be
+  mistaken for the real one. `feed_draft`'s return value is consumed one
+  line later by `handle_partial`, the single function that talks to the HUD.
+  A test can only show that the leak did not happen in the cases it
+  enumerates; not producing the value at all means there is no case to
+  enumerate. The same shape decides the trailing frames drained after the
+  hotkey is released: they go to the final engine only, because the user is
+  already waiting on that decode and nothing would ever read a draft one.
+- **A model's kind is checked against the catalog before its files are
+  opened** — sherpa-onnx's C++ layer calls `_Exit()` when handed a model it
+  cannot read: it does not return an error, it takes the whole process down,
+  and no Rust code can catch that. An offline model and a streaming one
+  install under the *same* four artifact names
+  (`encoder.onnx`/`decoder.onnx`/`joiner.onnx`/`tokens.txt`), so a perfectly
+  intact offline model handed to the streaming recognizer looks right until
+  the moment it is fatal. `runtime_boot`'s `wrong_model_kind` therefore
+  settles the question on catalog data alone — `ModelManager::engine_of`,
+  no filesystem — before anything else runs, on both the streaming and the
+  batch load path. This is distinct from the artifact size verification
+  introduced in v0.2 and deliberately runs before it: that check answers
+  "are these files intact" and guards against a truncated download, which is
+  the other way to reach the same `_Exit()`. Neither check subsumes the
+  other, because a model of the wrong kind is usually perfectly intact.
 - **TOML settings, SQLite history** — settings are small, human-editable,
   and benefit from being diffable and hand-fixable (TOML); history is an
   append-heavy, queryable log where a real database (SQLite via `rusqlite`,
   bundled — no system dependency) is a better fit than a flat file.
 - **Degradation over failure** — a missing model, an unset refine API key,
-  an invalid hotkey, or a build without the `sherpa` feature all boot the app
+  an invalid hotkey, a preview model that cannot be loaded or that fails
+  mid-utterance, or a build without the `sherpa` feature all boot the app
   anyway, with the affected feature reporting an error only when actually
   used (or an upfront notice), rather than the whole app refusing to start.
   Runtime boot (`apps/desktop/src-tauri/src/runtime_boot.rs`) formalizes
-  this as its explicit policy.
+  this as its explicit policy. The preview is the mildest case on that scale
+  and is reported as such: it costs no word of anyone's transcript, so it
+  degrades to a dark preview and an `info` notice rather than the `warning`
+  a broken final engine earns.

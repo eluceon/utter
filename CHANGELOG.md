@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-08-11
+
+### Added
+
+- Live preview: an optional second, streaming speech-to-text engine that
+  shows words in the HUD while you are still speaking. It is a draft only —
+  the text that gets injected still comes from the profile's own engine at
+  the end of the utterance, and no preview text ever reaches the injected
+  result or the dictation history. The preview is off by default, and a
+  profile with no preview model selected behaves exactly as it did in 0.2.0.
+- `SherpaStreamingEngine`, a second sherpa-onnx adapter built on that
+  library's online recognizer, behind the same `SttEngine` port as the
+  offline one. It decodes as samples arrive and hands back a partial only
+  when the recognized text actually changed, so the HUD is not redrawn
+  between chunks the recognizer had nothing new to say about.
+- Two streaming models in the catalog, filed under an engine kind of their
+  own (`sherpa-streaming`) so they can never be offered where the engine
+  whose text gets injected is chosen: Zipformer Small for Russian (27 MB,
+  int8) and for English (43 MB, int8). They are small deliberately — the
+  preview decodes concurrently with the engine the user is waiting on, and
+  is given a single inference thread to stay out of its way. The price is
+  lower accuracy than the offline models and no punctuation at all, which is
+  why their output never leaves the HUD.
+- Per-profile preview selection: `[[profiles]].draft.model` names the
+  streaming model a profile previews with, edited from a picker on the
+  Profiles page that marks the models not downloaded yet. Omitting the table
+  entirely, or leaving the model id blank, is the off state and the default.
+- A "Live preview models" section on the Engines page, for downloading and
+  removing the streaming models.
+- A preview model that is missing, damaged, catalogued under the wrong kind,
+  or unsupported by the running build leaves that profile's preview dark and
+  says so, as an informational notice rather than a warning — it costs no
+  word of anyone's transcript. A model that fails mid-utterance is reported
+  the same way and switches the preview off for that profile until the app
+  restarts: an engine that failed to decode one frame will fail on the next,
+  and a notice per frame would be far worse than one notice and a dark
+  preview.
+- A model's catalog kind is now checked before any of its files are opened,
+  on the streaming and the offline load path alike. sherpa-onnx terminates
+  the process rather than returning an error when handed a model it cannot
+  read, and the two kinds install under identical file names, so a perfectly
+  intact model of the wrong kind was indistinguishable from a right one
+  until the moment it was fatal. This is separate from the artifact size
+  verification added in 0.2.0, which guards against a truncated download,
+  and deliberately runs before it: neither question answers the other.
+
+### Fixed
+
+- Personal dictionary terms handed to sherpa-onnx as recognition hotwords had
+  no effect on what it recognized. The score added to a hotword was left at
+  the crate's default of `0.0`, which boosts a hotword by nothing at all,
+  quietly making the whole feature inert instead of failing visibly. Both
+  sherpa engines now set that score, and the beam width, explicitly rather
+  than inheriting either — the two sherpa-onnx configuration types disagree
+  on the beam width, and the streaming one defaults it to zero, which is an
+  empty hypothesis set rather than a narrower search.
+
 ## [0.2.0] - 2026-08-07
 
 ### Added

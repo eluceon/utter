@@ -644,7 +644,7 @@ fn press_and_release(
 fn happy_path_emits_full_sequence_and_injects_refined_text() {
     let refine_calls = Arc::new(AtomicUsize::new(0));
     let injected = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices_rx) = fake_sink();
+    let (sink, states_rx, notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -674,6 +674,12 @@ fn happy_path_emits_full_sequence_and_injects_refined_text() {
 
     assert_eq!(*injected.lock().expect("lock"), vec!["HELLO WORLD"]);
     assert_eq!(refine_calls.load(Ordering::SeqCst), 1);
+
+    // A dictation that worked says nothing. Every notice is now put in front
+    // of the user by the desktop notification service, so a notice on this
+    // path would be a popup over whatever they are typing into, once per
+    // utterance -- worse than the silence it replaced.
+    assert_no_more_notices(&notices_rx);
 
     handle.shutdown();
 }

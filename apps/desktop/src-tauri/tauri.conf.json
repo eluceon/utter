@@ -24,7 +24,7 @@
         "label": "hud",
         "title": "Utter HUD",
         "width": 280,
-        "height": 64,
+        "height": 104,
         "resizable": false,
         "fullscreen": false,
         "transparent": true,

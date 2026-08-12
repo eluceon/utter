@@ -23,6 +23,7 @@ mod state;
 mod tray;
 
 use tauri::{Manager, RunEvent, WindowEvent};
+use tracing::level_filters::LevelFilter;
 
 use state::AppState;
 
@@ -43,6 +44,36 @@ pub(crate) fn keyring_password(user: &str) -> Option<String> {
         .ok()
 }
 
+/// Turns the `advanced.log_level` setting into a maximum level. Anything
+/// unrecognised (an old or hand-edited config) logs at `info` rather than
+/// falling silent — the setting is a dial, and a bad value should not be
+/// able to turn diagnostics off altogether.
+fn max_level(setting: &str) -> LevelFilter {
+    match setting.to_ascii_lowercase().as_str() {
+        "trace" => LevelFilter::TRACE,
+        "debug" => LevelFilter::DEBUG,
+        "warn" => LevelFilter::WARN,
+        "error" => LevelFilter::ERROR,
+        "off" => LevelFilter::OFF,
+        _ => LevelFilter::INFO,
+    }
+}
+
+/// Installs the `tracing` subscriber every crate in the workspace logs
+/// through, writing to stderr. Without it `tracing`'s events go nowhere at
+/// all: not to a file, not to a console, not anywhere the user or a bug
+/// report can reach — which is what `advanced.log_level` has been promising
+/// to control.
+///
+/// Failure here means a subscriber is already installed (nothing else can
+/// fail), so there is nothing to report and nowhere to report it.
+fn init_tracing(setting: &str) {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(max_level(setting))
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 /// Builds and runs the Tauri application.
 ///
 /// Returns `Err` instead of panicking on failure, so `main` can report the
@@ -54,6 +85,12 @@ pub fn run() -> Result<(), String> {
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let state = AppState::new().map_err(|e| e.to_string())?;
+            // As early as settings are available, and before `boot` — every
+            // degradation it reports is logged on the way past.
+            match state.settings.read() {
+                Ok(settings) => init_tracing(&settings.advanced.log_level),
+                Err(_) => init_tracing("info"),
+            }
             app.manage(state);
 
             let handle = app.handle().clone();
@@ -126,4 +163,30 @@ pub fn run() -> Result<(), String> {
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_every_level_the_settings_ui_offers() {
+        assert_eq!(max_level("trace"), LevelFilter::TRACE);
+        assert_eq!(max_level("debug"), LevelFilter::DEBUG);
+        assert_eq!(max_level("info"), LevelFilter::INFO);
+        assert_eq!(max_level("warn"), LevelFilter::WARN);
+        assert_eq!(max_level("error"), LevelFilter::ERROR);
+        assert_eq!(max_level("off"), LevelFilter::OFF);
+    }
+
+    #[test]
+    fn an_unreadable_level_still_logs_rather_than_falling_silent() {
+        assert_eq!(max_level("verbose"), LevelFilter::INFO);
+        assert_eq!(max_level(""), LevelFilter::INFO);
+    }
+
+    #[test]
+    fn level_names_are_not_case_sensitive() {
+        assert_eq!(max_level("DEBUG"), LevelFilter::DEBUG);
+    }
 }

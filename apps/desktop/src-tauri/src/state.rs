@@ -11,6 +11,7 @@ use directories::ProjectDirs;
 use utter_store::{HistoryRepo, ModelManager, Settings};
 
 use crate::runtime::RuntimeHandle;
+use crate::sink::NoticeThrottle;
 
 /// The name of the history database file under the app's XDG data directory.
 const HISTORY_DB_FILE: &str = "history.sqlite3";
@@ -47,6 +48,10 @@ pub struct AppState {
     /// fresh at sink-construction time, or a settings change wouldn't reach
     /// a sink that already exists.
     pub hud_enabled: Arc<AtomicBool>,
+    /// Shared with every `TauriEventSink` (see [`crate::sink::NoticeThrottle`]),
+    /// for the same reason `hud_enabled` is: sinks are built fresh per emit,
+    /// so the rate limit has to outlive them or it limits nothing.
+    pub notice_throttle: Arc<NoticeThrottle>,
 }
 
 impl AppState {
@@ -85,6 +90,7 @@ impl AppState {
             session_ctl: Mutex::new(None),
             startup_notice,
             hud_enabled,
+            notice_throttle: Arc::new(NoticeThrottle::default()),
         })
     }
 }

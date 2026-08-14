@@ -85,17 +85,17 @@ level meter, and — for a profile that has a live preview model selected — th
 partial transcript as it comes in.
 
 <p align="center">
-  <img src="docs/img/settings-profiles-light.png" alt="Profiles settings page showing a Russian profile bound to Ctrl+Super running GigaAM-v3, with an English profile below it" width="70%">
+  <img src="docs/img/settings-profiles-light.png" alt="Profiles settings page showing a Russian profile bound to Ctrl+Super, running GigaAM-v3 with a Zipformer Small live preview" width="70%">
 </p>
 
 **Profiles** — one chord per language. Each profile carries its own engine,
-model, language tag and refinement policy, so pressing its hotkey selects the
-whole set at once.
+model, language tag, live preview model and refinement policy, so pressing its
+hotkey selects the whole set at once.
 
 | | |
 |---|---|
-| ![Engines settings page listing whisper.cpp and sherpa-onnx models with their install state](docs/img/settings-engines-light.png) | ![Refinement settings page with the provider connection, master switch, and a live test](docs/img/settings-refinement-light.png) |
-| **Engines** — download and remove whisper.cpp and sherpa-onnx models, and hold the cloud engine's API key; which of them a profile uses is set on the Profiles page. | **Refinement** — the LLM connection profiles can send transcripts through: any OpenAI-compatible chat endpoint, including a local Ollama, with a master switch and a live test. |
+| ![Engines settings page listing sherpa-onnx models and live preview models with their install state](docs/img/settings-engines-light.png) | ![Refinement settings page with the provider connection, master switch, and a live test](docs/img/settings-refinement-light.png) |
+| **Engines** — download and remove whisper.cpp, sherpa-onnx and live preview models, and hold the cloud engine's API key; which of them a profile uses is set on the Profiles page. | **Refinement** — the LLM connection profiles can send transcripts through: any OpenAI-compatible chat endpoint, including a local Ollama, with a master switch and a live test. |
 | ![Dictionary settings page with custom terms and heard/write replacement rules](docs/img/settings-dictionary-light.png) | ![Snippets settings page with trigger phrases and their expansion bodies](docs/img/settings-snippets-light.png) |
 | **Dictionary** — custom terms and literal replacement rules applied to every transcript. | **Snippets** — a spoken trigger expands to a stored template, bypassing refinement. |
 

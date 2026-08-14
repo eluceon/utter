@@ -80,6 +80,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arrives on the heels of another, is rate limited: some conditions are
   reported once per audio frame, and a desktop notification per frame would
   be worse than the condition being reported.
+- Notices reported while the app was starting up reached no one at all. Boot
+  runs before the settings window's webview is loaded, and the event bus has
+  no replay, so every `notice` fired there landed on nothing; the desktop
+  notification was not a second chance either, since boot reports its notices
+  back to back and the rate limit drops all but the first. A startup with two
+  things to explain — no transcription model downloaded *and* a preview that
+  could not be loaded — announced one of them, once. Startup notices are now
+  held until a window exists and handed over when one opens, so the settings
+  window lists all of them however many there were.
 - `advanced.log_level` controlled nothing, because no tracing subscriber was
   ever installed. Every log line the app wrote, at every level, was
   discarded — including the ones explaining why something had just degraded.

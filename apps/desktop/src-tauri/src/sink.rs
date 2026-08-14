@@ -125,8 +125,14 @@ fn should_show_hud(phase_wants_visible: bool, hud_enabled: bool) -> bool {
 /// it. What this deliberately does not do is queue: a notification held back
 /// is dropped, not deferred, because by the time it could be shown it would
 /// be describing something the user has already been told about or that is
-/// no longer happening. Nothing is lost from the record — every notice is
-/// still emitted on the event bus, where the settings window lists it.
+/// no longer happening. What is dropped is by construction either a repeat or
+/// one of a burst whose first member did get through, so the *condition*
+/// never goes unannounced even when a particular report of it does.
+///
+/// The full wording of every notice is still emitted on the event bus, where
+/// the settings window lists it for as long as that window is open; the ones
+/// reported before any window exists to hear them are parked instead, and
+/// drained on mount (see [`crate::state::PendingNotices`]).
 ///
 /// Lives in [`AppState`], not in the sink: sinks are constructed fresh for
 /// each emit, so a throttle owned by one would never see the previous one's
@@ -320,7 +326,11 @@ fn parse_phase(state: &str) -> Option<DictationPhase> {
     })
 }
 
-fn parse_kind(kind: &str) -> NoticeKind {
+/// Maps `EventSink::notify`'s `kind` string onto the wire enum. `pub(crate)`
+/// because [`crate::state::PendingNotices`] parks the same payload shape this
+/// builds, and a notice must not change severity depending on which of the
+/// two channels carried it.
+pub(crate) fn parse_kind(kind: &str) -> NoticeKind {
     match kind {
         "warning" => NoticeKind::Warning,
         "error" => NoticeKind::Error,

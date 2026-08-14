@@ -84,6 +84,16 @@ export function cancelDictation(): Promise<void> {
   return invoke('cancel_dictation')
 }
 
+/**
+ * Drains the notices the app reported at startup, before this window existed
+ * to receive the `notice` event (see `src-tauri/src/state.rs`'s
+ * `PendingNotices`). Draining, so reopening the window later does not replay
+ * conditions the user has already read.
+ */
+export function takePendingNotices(): Promise<NoticePayload[]> {
+  return invoke('take_pending_notices')
+}
+
 export function onModelProgress(
   handler: (payload: ModelProgressPayload) => void,
 ): Promise<UnlistenFn> {

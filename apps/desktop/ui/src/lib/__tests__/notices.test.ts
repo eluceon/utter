@@ -87,12 +87,12 @@ describe('notice store', () => {
   it('subscribes to the notice event and shows what it delivers', async () => {
     const unlisten = vi.fn()
     let deliver: ((payload: NoticePayload) => void) | undefined
-    const backend = {
+    const backend = fakeBackend({
       onNotice: vi.fn(async (handler: (payload: NoticePayload) => void) => {
         deliver = handler
         return unlisten
       }),
-    } as unknown as typeof api
+    })
 
     const store = createNoticeStore(backend)
     await expect(store.start()).resolves.toBe(unlisten)
@@ -100,4 +100,82 @@ describe('notice store', () => {
     deliver?.({ kind: 'error', message: 'failed to start audio capture' })
     expect(get(store).map((n) => n.message)).toEqual(['failed to start audio capture'])
   })
+
+  // The startup half, and the reason this store is the app's backstop at all.
+  // The backend reports its startup conditions from Tauri's `setup`, before
+  // this window is loaded, so the `notice` event above cannot carry them —
+  // they are parked and handed over here. A store that merely subscribed
+  // would leave them exactly as lost as they were before they were parked.
+  //
+  // Two of them, and the real pair: a transcription model that is not
+  // downloaded together with a preview that is unavailable is one user's
+  // actual configuration, and it is the second of the two that the
+  // desktop-notification throttle drops.
+  it('shows the notices the app parked before this window existed', async () => {
+    const backend = fakeBackend({
+      takePendingNotices: vi.fn(async () => [
+        { kind: 'warning', message: 'no transcription model' } as NoticePayload,
+        { kind: 'info', message: 'live preview unavailable' } as NoticePayload,
+      ]),
+    })
+
+    const store = createNoticeStore(backend)
+    await store.start()
+
+    expect(get(store).map((n) => `${n.kind}: ${n.message}`)).toEqual([
+      'warning: no transcription model',
+      'info: live preview unavailable',
+    ])
+  })
+
+  // Anything reported between the two calls would fall in the gap otherwise —
+  // the same shape of hole the parked queue exists to close.
+  it('subscribes before it drains, not after', async () => {
+    const order: string[] = []
+    const backend = fakeBackend({
+      onNotice: vi.fn(async () => {
+        order.push('subscribe')
+        return vi.fn()
+      }),
+      takePendingNotices: vi.fn(async () => {
+        order.push('drain')
+        return []
+      }),
+    })
+
+    await createNoticeStore(backend).start()
+
+    expect(order).toEqual(['subscribe', 'drain'])
+  })
+
+  // A backend that cannot hand over its parked notices is a worse day than
+  // usual, which is when the live subscription matters most: it must survive.
+  it('keeps the live subscription when the parked queue cannot be drained', async () => {
+    const unlisten = vi.fn()
+    let deliver: ((payload: NoticePayload) => void) | undefined
+    const backend = fakeBackend({
+      onNotice: vi.fn(async (handler: (payload: NoticePayload) => void) => {
+        deliver = handler
+        return unlisten
+      }),
+      takePendingNotices: vi.fn(async () => {
+        throw new Error('command not found')
+      }),
+    })
+
+    const store = createNoticeStore(backend)
+    await expect(store.start()).resolves.toBe(unlisten)
+
+    deliver?.({ kind: 'warning', message: 'speech engine error: closed' })
+    expect(get(store).map((n) => n.message)).toEqual(['speech engine error: closed'])
+  })
 })
+
+/** The two backend calls `start()` makes, defaulting to "nothing happened". */
+function fakeBackend(overrides: Partial<typeof api> = {}): typeof api {
+  return {
+    onNotice: vi.fn(async () => vi.fn()),
+    takePendingNotices: vi.fn(async () => []),
+    ...overrides,
+  } as unknown as typeof api
+}

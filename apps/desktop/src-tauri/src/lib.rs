@@ -146,6 +146,7 @@ pub fn run() -> Result<(), String> {
             commands::permissions_report,
             commands::test_refine,
             commands::cancel_dictation,
+            commands::take_pending_notices,
         ])
         .build(tauri::generate_context!())
         .map_err(|e| e.to_string())?;
@@ -188,5 +189,62 @@ mod tests {
     #[test]
     fn level_names_are_not_case_sensitive() {
         assert_eq!(max_level("DEBUG"), LevelFilter::DEBUG);
+    }
+
+    /// Every command the settings UI invokes is registered in the
+    /// `generate_handler!` list above.
+    ///
+    /// Nothing else checks this. A command can exist, be annotated, compile,
+    /// and have a matching typed wrapper in `api.ts`, and still reject at
+    /// runtime with "command not found" if its name never reached the list —
+    /// a one-line omission with no compile-time symptom on either side, since
+    /// the two halves are in different languages and neither toolchain reads
+    /// the other. `take_pending_notices` is what motivated writing this down:
+    /// it is the only channel a startup notice reaches a window through, it
+    /// is called exactly once (on mount), and its rejection is deliberately
+    /// swallowed there — so an unregistered command would restore precisely
+    /// the silent dead end it was added to close, with every test green.
+    #[test]
+    fn every_command_the_frontend_invokes_is_registered() {
+        const LIB_RS: &str = include_str!("lib.rs");
+        const API_TS: &str = include_str!("../../ui/src/lib/api.ts");
+
+        // The first `generate_handler!` in this file is the real one; this
+        // test's own mention of it is below.
+        let registered: Vec<&str> = LIB_RS
+            .split_once("generate_handler![")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .expect("lib.rs must have a generate_handler! list")
+            .0
+            .split(',')
+            .filter_map(|entry| entry.trim().strip_prefix("commands::"))
+            .collect();
+
+        let invoked: Vec<&str> = API_TS
+            .match_indices("invoke('")
+            .filter_map(|(at, marker)| API_TS[at + marker.len()..].split_once('\''))
+            .map(|(name, _)| name)
+            .collect();
+
+        // Both halves are scraped from source, so an extraction that quietly
+        // matched nothing would make every assertion below vacuously true --
+        // the failure mode this whole test exists to catch, one level up.
+        assert!(
+            registered.len() >= 10,
+            "scraped only {registered:?} from the handler list; the extraction is broken, not \
+             the app"
+        );
+        assert!(
+            invoked.len() >= 10,
+            "scraped only {invoked:?} from api.ts; the extraction is broken, not the app"
+        );
+
+        for name in &invoked {
+            assert!(
+                registered.contains(name),
+                "api.ts invokes \"{name}\", which is not in generate_handler!: every call to it \
+                 rejects at runtime. Registered: {registered:?}"
+            );
+        }
     }
 }

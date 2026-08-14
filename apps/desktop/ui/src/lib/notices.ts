@@ -1,14 +1,15 @@
 // The `notice` event, collected into a small list the settings window can
 // render.
 //
-// This is the *second* place a notice reaches the user, not the first: the
-// window this store feeds is closed for most of the app's life (dictation
-// happens with nothing on screen but the HUD), so `src-tauri/src/sink.rs`
-// puts every notice in front of the user as a desktop notification too, and
-// that is the path a notice is guaranteed to travel. What this adds is a
-// place to read one properly once the settings window *is* open: full
-// wording, all of it still there after the desktop notification has faded,
-// and dismissed only when the user says so.
+// Two channels carry a notice, and neither one alone carries every notice.
+// `src-tauri/src/sink.rs` puts them in front of the user as desktop
+// notifications, which is the only channel that works during dictation, when
+// the window this store feeds is closed — but that channel is rate limited,
+// and a notification held back there is dropped rather than deferred. This
+// store is the other half: the full wording, still on screen after the
+// notification has faded, dismissed only when the user says so, and — via
+// `start()`, which drains the backend's parked queue — including the startup
+// notices that were reported before any window was loaded to hear them.
 //
 // Plain store contract rather than runes, for the same reason as
 // `stores.ts`: no component lifecycle here, and a `.ts` file is unit-testable
@@ -40,8 +41,9 @@ export interface Notice {
 export const MAX_VISIBLE = 4
 
 export interface NoticeStore extends Readable<Notice[]> {
-  /** Starts listening for `notice` events. Resolves to the unlisten
-   * function; call it when the window goes away. */
+  /** Starts listening for `notice` events *and* drains whatever the app
+   * reported before this window existed. Resolves to the unlisten function;
+   * call it when the window goes away. */
   start(): Promise<UnlistenFn>
   /** Adds a notice, as if one had arrived over the event bus. */
   push(payload: NoticePayload): void
@@ -71,8 +73,33 @@ export function createNoticeStore(backend: typeof api = api): NoticeStore {
     update((current) => current.filter((notice) => notice.id !== id))
   }
 
-  function start(): Promise<UnlistenFn> {
-    return backend.onNotice(push)
+  // The app reports its startup conditions from Tauri's `setup`, which runs
+  // before this webview is loaded, and `emit` has no replay — so the notices
+  // that matter most (no model downloaded, an unavailable preview, a config
+  // that would not migrate) are precisely the ones no listener can be
+  // subscribed in time for. The backend parks them instead; this is where
+  // they are collected.
+  //
+  // Failure is swallowed: a startup notice that cannot be fetched is not
+  // worth costing the window its live subscription, which is the channel
+  // everything after startup arrives on.
+  async function drainPending(): Promise<void> {
+    try {
+      for (const payload of await backend.takePendingNotices()) {
+        push(payload)
+      }
+    } catch {
+      /* nothing to show, and nothing useful to say about it */
+    }
+  }
+
+  async function start(): Promise<UnlistenFn> {
+    // Subscribe before draining, not after: anything reported in between
+    // would otherwise fall in the gap between the two, which is the same
+    // shape of hole the parked queue exists to close.
+    const unlisten = await backend.onNotice(push)
+    await drainPending()
+    return unlisten
   }
 
   return { subscribe, start, push, dismiss }

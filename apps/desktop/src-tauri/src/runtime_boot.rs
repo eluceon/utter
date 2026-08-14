@@ -41,7 +41,7 @@ use utter_stt::{CloudEngine, CloudSttConfig, WhisperEngine};
 use crate::profiles::{ProfileRegistry, RealProfileLoader};
 use crate::runtime::{EventSink, HistoryHandle, RealCaptureBackend, Runtime, RuntimeDeps};
 use crate::sink::TauriEventSink;
-use crate::state::AppState;
+use crate::state::{AppState, PendingNotices};
 use crate::{keyring_password, REFINE_KEY_SERVICE, STT_KEY_SERVICE};
 
 /// Boots the dictation runtime from the current in-memory settings and
@@ -80,11 +80,37 @@ pub fn boot(app: &AppHandle) -> Result<(), String> {
         .lock()
         .map_err(|_| "session control lock poisoned".to_string())? = Some(handle);
 
-    for (kind, msg) in notices {
-        sink.notify(kind, &msg);
-    }
+    report_boot_notices(sink.as_ref(), &state.pending_notices, notices);
 
     Ok(())
+}
+
+/// Reports every notice boot collected on both channels available to it: the
+/// live one (`sink`), and `parked`, which is the only one that still works
+/// this early.
+///
+/// [`boot`] runs synchronously inside Tauri's `setup` — before the webview is
+/// loaded, long before any window subscribes to `notice` — and Tauri's `emit`
+/// has no replay, so on its own every `notice` fired here lands on zero
+/// listeners forever. The desktop notification is not a backstop either: it
+/// is deliberately rate limited (see [`crate::sink::NoticeThrottle`]) and
+/// this loop has no delay in it, so a startup with two conditions to explain
+/// — a transcription model that is not downloaded and a preview that is
+/// unavailable, which arrive together — would show the first and drop the
+/// second. Parking a copy is what lets the settings window list all of them
+/// once it exists (see [`PendingNotices`] and the `take_pending_notices`
+/// command).
+///
+/// [`rebuild`] deliberately does not park: it runs from `save_settings` or
+/// the tray, with a window already open and listening, so a parked copy would
+/// be replayed at some later mount as if it were news.
+fn report_boot_notices(sink: &dyn EventSink, parked: &PendingNotices, notices: Vec<QueuedNotice>) {
+    for (kind, msg) in notices {
+        // Parked first: the parked copy is the one that survives, so it must
+        // not depend on the live emit having got anywhere.
+        parked.push(kind, &msg);
+        sink.notify(kind, &msg);
+    }
 }
 
 /// Rebuilds the dictation runtime from `settings`: reloads the running
@@ -759,6 +785,76 @@ fn spawn_hotkey_sources(specs: &[HotkeySpec]) -> (Receiver<HotkeyEvent>, Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Records what a sink was asked to report, standing in for the
+    /// `TauriEventSink` `boot` builds (which needs a running app).
+    #[derive(Default)]
+    struct RecordingSink {
+        reported: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl EventSink for RecordingSink {
+        fn emit_state(&self, _state: &str, _level: f32, _partial: Option<&str>) {}
+
+        fn notify(&self, kind: &str, msg: &str) {
+            self.reported
+                .lock()
+                .expect("lock")
+                .push((kind.to_string(), msg.to_string()));
+        }
+    }
+
+    /// Every notice boot reports must also be parked, because at boot time
+    /// the live channel reaches nobody: the `notice` event has no listener
+    /// yet (the webview is not loaded during `setup`), and the desktop
+    /// notification throttle drops everything after the first in an
+    /// undelayed loop like this one.
+    ///
+    /// The fixture is deliberately *two* notices, the real pairing of a
+    /// missing transcription model with an unavailable preview: parking only
+    /// the first would satisfy any assertion written against a single-notice
+    /// fixture while leaving the exact configuration this exists for broken.
+    #[test]
+    fn every_notice_boot_reports_is_also_parked_for_the_first_window() {
+        let sink = RecordingSink::default();
+        let parked = PendingNotices::default();
+
+        report_boot_notices(
+            &sink,
+            &parked,
+            vec![
+                ("warning", "no transcription model".to_string()),
+                ("info", "live preview unavailable".to_string()),
+            ],
+        );
+
+        assert_eq!(
+            sink.reported
+                .lock()
+                .expect("lock")
+                .iter()
+                .map(|(kind, msg)| (kind.as_str(), msg.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("warning", "no transcription model"),
+                ("info", "live preview unavailable"),
+            ],
+            "the live channel must still get everything it got before"
+        );
+
+        assert_eq!(
+            parked
+                .take()
+                .iter()
+                .map(|n| n.message.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "no transcription model".to_string(),
+                "live preview unavailable".to_string(),
+            ],
+            "both notices must be parked, not just the one the throttle would let through"
+        );
+    }
 
     #[test]
     fn engine_label_matches_each_kind() {

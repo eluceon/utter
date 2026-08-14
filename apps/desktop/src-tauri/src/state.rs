@@ -10,11 +10,66 @@ use directories::ProjectDirs;
 
 use utter_store::{HistoryRepo, ModelManager, Settings};
 
+use crate::events::Notice;
 use crate::runtime::RuntimeHandle;
-use crate::sink::NoticeThrottle;
+use crate::sink::{parse_kind, NoticeThrottle};
 
 /// The name of the history database file under the app's XDG data directory.
 const HISTORY_DB_FILE: &str = "history.sqlite3";
+
+/// Notices reported before any window existed to hear them, kept until one
+/// asks for them.
+///
+/// `runtime_boot::boot` runs synchronously inside Tauri's `setup` — before
+/// the webview is loaded, and long before the settings window subscribes to
+/// the `notice` event. Tauri's `emit` has no replay, so every notice boot
+/// reports lands on zero listeners and is gone: exactly the degradations the
+/// app most needs to explain (no model downloaded, an unavailable preview, a
+/// config that would not migrate) are the ones reported at the one moment
+/// nothing is listening.
+///
+/// The desktop notification is not a substitute. It is deliberately rate
+/// limited (see [`NoticeThrottle`]), and boot reports its notices in a tight
+/// loop, so a startup with two conditions to explain shows the first and
+/// drops the second — which is a real configuration, not a corner case: a
+/// missing transcription model and an unavailable preview arrive together.
+///
+/// So boot parks a copy here as well, and the frontend drains it on mount
+/// (`take_pending_notices`). That is what makes the settings window the
+/// backstop the rest of the app documents it as: nothing reported at startup
+/// is lost, however many conditions there were.
+#[derive(Default)]
+pub struct PendingNotices {
+    queued: Mutex<Vec<Notice>>,
+}
+
+impl PendingNotices {
+    /// Parks one notice, `kind` using the same vocabulary as
+    /// [`crate::runtime::EventSink::notify`] (`"info"`, `"warning"`,
+    /// `"error"`).
+    pub(crate) fn push(&self, kind: &str, message: &str) {
+        // A poisoned lock means some earlier caller panicked mid-update; the
+        // queue itself is a plain `Vec` and still intact, and losing the
+        // startup notices is precisely the failure this type exists to
+        // prevent, so recover rather than propagate.
+        self.queued
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Notice {
+                kind: parse_kind(kind),
+                message: message.to_string(),
+            });
+    }
+
+    /// Hands over everything parked so far, leaving the queue empty.
+    ///
+    /// Draining (rather than copying) is what keeps a second reader — a
+    /// window reopened later in the same run — from replaying startup
+    /// conditions the user has already read and dismissed.
+    pub(crate) fn take(&self) -> Vec<Notice> {
+        std::mem::take(&mut *self.queued.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
 
 /// Application state shared across all Tauri commands.
 ///
@@ -52,6 +107,20 @@ pub struct AppState {
     /// for the same reason `hud_enabled` is: sinks are built fresh per emit,
     /// so the rate limit has to outlive them or it limits nothing.
     pub notice_throttle: Arc<NoticeThrottle>,
+    /// Everything `runtime_boot::boot` reported before any window could hear
+    /// it, kept until the settings window asks (see [`PendingNotices`] and
+    /// the `take_pending_notices` command).
+    ///
+    /// Distinct from `startup_notice` above, which is a *message* travelling
+    /// from `AppState::new` (which has no `AppHandle`, so cannot report
+    /// anything) to `boot`, the one place notices are reported. This is
+    /// reported notices travelling from `boot` onward to the frontend. Boot
+    /// therefore still reports the migration message through the sink like
+    /// every other notice — and this parks it there like every other notice —
+    /// rather than the two mechanisms being one, which would take the
+    /// migration message out of the desktop-notification channel it currently
+    /// reaches the user through.
+    pub pending_notices: PendingNotices,
 }
 
 impl AppState {
@@ -91,6 +160,7 @@ impl AppState {
             startup_notice,
             hud_enabled,
             notice_throttle: Arc::new(NoticeThrottle::default()),
+            pending_notices: PendingNotices::default(),
         })
     }
 }
@@ -138,6 +208,8 @@ pub(crate) fn history_db_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    use crate::events::NoticeKind;
+
     #[test]
     fn a_notice_without_a_backup_does_not_claim_one_was_saved() {
         // `backup: None` is what a real `MigrationFailed` carries when the
@@ -156,6 +228,40 @@ mod tests {
             "no backup was written, so the notice must not mention one: {notice}"
         );
         assert!(notice.contains("config.toml"), "must still name the file");
+    }
+
+    #[test]
+    fn parked_notices_come_back_in_the_order_they_were_reported() {
+        let parked = PendingNotices::default();
+        parked.push("warning", "no transcription model");
+        parked.push("info", "live preview unavailable");
+
+        let taken = parked.take();
+
+        assert_eq!(
+            taken
+                .iter()
+                .map(|n| (n.kind, n.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (NoticeKind::Warning, "no transcription model"),
+                (NoticeKind::Info, "live preview unavailable"),
+            ],
+            "both conditions of the same startup must survive, in order -- the throttled \
+             desktop-notification channel is what only carries the first"
+        );
+    }
+
+    /// Draining, not copying: the settings window can be closed and reopened
+    /// any number of times in one run, and a startup condition the user has
+    /// already read must not come back as if it were news.
+    #[test]
+    fn taking_parked_notices_empties_the_queue() {
+        let parked = PendingNotices::default();
+        parked.push("error", "failed to start hotkey capture");
+
+        assert_eq!(parked.take().len(), 1);
+        assert!(parked.take().is_empty());
     }
 
     #[test]

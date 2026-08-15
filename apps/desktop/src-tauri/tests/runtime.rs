@@ -1097,7 +1097,7 @@ fn history_entry_recorded_with_raw_and_final_text() {
 
     let refine_calls = Arc::new(AtomicUsize::new(0));
     let injected = Arc::new(Mutex::new(Vec::new()));
-    let (sink, states_rx, _notices_rx) = fake_sink();
+    let (sink, states_rx, notices_rx) = fake_sink();
 
     let (hotkey_tx, hotkey_rx) = unbounded();
     let mut builder = DepsBuilder::new(Ok(transcript("hello world")));
@@ -1126,6 +1126,12 @@ fn history_entry_recorded_with_raw_and_final_text() {
     assert_eq!(recv_state(&states_rx), "idle");
 
     assert_eq!(*injected.lock().expect("lock"), vec!["HELLO WORLD"]);
+
+    // A dictation that worked says nothing -- asserted here as well as on the
+    // happy path, because this is the only test that exercises the history
+    // write, and a write that failed (or that decided to report itself as it
+    // went) would announce it through this channel.
+    assert_no_more_notices(&notices_rx);
 
     handle.shutdown();
 

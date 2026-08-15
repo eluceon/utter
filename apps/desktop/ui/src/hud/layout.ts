@@ -12,12 +12,13 @@
 // browser performs.
 
 /**
- * The height the `hud` window is *requested* at in `tauri.conf.json`.
+ * The height the `hud` window is given, as asked for in `tauri.conf.json`.
  *
- * A request, not a measurement: GTK/WebKitGTK will not give a toplevel
- * webview window an inner height below 200px, so on Linux the real window is
- * always taller than this. The number still has to be right — it is the
- * lower bound the pill is guaranteed, and the only one under our control.
+ * The request is honoured, not merely a floor: the live window measures
+ * 280×104 during dictation. So this is the real ceiling. The window is
+ * undecorated and fixed-size, with no scrollbar and no room to grow, so a
+ * pill laid out past this many pixels is clipped at the edge — which is
+ * exactly what hid the live preview.
  */
 export const WINDOW_HEIGHT = 104
 

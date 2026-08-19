@@ -9,6 +9,7 @@
   import HotkeyPicker from '../lib/components/HotkeyPicker.svelte'
   import * as api from '../lib/api'
   import { chordsConflict, parseChordTokens } from '../lib/hotkey'
+  import { previewModelOptions } from '../lib/models'
   import { mergeDeep, settingsStore, type DeepPartial } from '../lib/stores'
   import type { EngineKind, LanguageProfile, ModelInfo, Tone } from '../lib/types'
 
@@ -40,6 +41,9 @@
     { value: '', label: 'None selected' },
     ...models.filter((m) => m.engine === 'sherpa').map((m) => ({ value: m.id, label: m.label })),
   ])
+  // Streaming models only, never the engine models above — see
+  // `previewModelOptions`, which is where that separation is pinned.
+  let previewOptions = $derived(previewModelOptions(models))
 
   onMount(async () => {
     try {
@@ -228,6 +232,21 @@
         />
       </Field>
     {/if}
+
+    <Field
+      label="Live preview"
+      for="profile-{index}-preview"
+      hint="A streaming model that shows words in the HUD while you speak. The inserted text always comes from the engine above, never from this. Off by default. Download the model on the Engines page first — one selected before it is downloaded stays silent until settings are next saved or the app restarts."
+    >
+      <Select
+        id="profile-{index}-preview"
+        options={previewOptions}
+        bind:value={
+          () => profile.draft?.model ?? '',
+          (v) => updateProfile(index, { draft: v === '' ? null : { model: v } })
+        }
+      />
+    </Field>
 
     <Field
       label="Refine transcripts"

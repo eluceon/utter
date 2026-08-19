@@ -5,6 +5,7 @@
   import Field from '../lib/components/Field.svelte'
   import TextInput from '../lib/components/TextInput.svelte'
   import * as api from '../lib/api'
+  import { previewModels } from '../lib/models'
   import type { ModelInfo } from '../lib/types'
 
   let models = $state<ModelInfo[]>([])
@@ -18,6 +19,7 @@
 
   let whisperModels = $derived(models.filter((m) => m.engine === 'whisper'))
   let sherpaModels = $derived(models.filter((m) => m.engine === 'sherpa'))
+  let streamingModels = $derived(previewModels(models))
 
   let unlisten: (() => void) | undefined
 
@@ -145,6 +147,38 @@
 <Section title="Sherpa-onnx models" description="Offline transducer models, one per language, that emit punctuation directly and bias recognition towards your dictionary terms.">
   <ul class="model-list">
     {#each sherpaModels as model (model.id)}
+      <li>
+        <div class="model-row">
+          <div class="model-info">
+            <span class="model-label">{model.label}</span>
+            <span class="model-size">{model.size_mb} MB</span>
+          </div>
+          <div class="model-actions">
+            {#if model.installed}
+              <span class="badge badge-installed">Installed</span>
+              <button type="button" onclick={() => remove(model.id)} disabled={busy[model.id]}>
+                Remove
+              </button>
+            {:else}
+              <button type="button" onclick={() => install(model.id)} disabled={busy[model.id]}>
+                {busy[model.id] ? 'Downloading…' : 'Install'}
+              </button>
+            {/if}
+          </div>
+        </div>
+        {#if busy[model.id]}
+          <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={progressPercent(model.id) ?? undefined}>
+            <div class="progress-fill" style:width="{progressPercent(model.id) ?? 0}%"></div>
+          </div>
+        {/if}
+      </li>
+    {/each}
+  </ul>
+</Section>
+
+<Section title="Live preview models" description="Small streaming models that show words in the HUD while you speak. They are fast rather than accurate and emit no punctuation, so they never produce the text that gets inserted. Which model a profile previews with is set on the Profiles page.">
+  <ul class="model-list">
+    {#each streamingModels as model (model.id)}
       <li>
         <div class="model-row">
           <div class="model-info">

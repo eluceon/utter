@@ -39,6 +39,16 @@ endpoint, a model download).
   punctuation and capitalization directly and both accepting personal
   dictionary terms as hotwords; or any OpenAI-compatible cloud
   `/audio/transcriptions` endpoint (BYOK).
+- **Live preview** — optionally, a second streaming sherpa-onnx model runs
+  alongside the engine above and shows words in the HUD while you are still
+  speaking. It is a draft only: the text that actually gets inserted always
+  comes from the engine above, at the end of the utterance. The preview
+  models are small on purpose (27 MB Russian, 43 MB English) and get a single
+  inference thread, so they stay out of the way of the model whose output you
+  keep — the price is lower accuracy and no punctuation, which is why their
+  words never leave the HUD. Off by default, picked per profile, and a
+  preview model that is missing, damaged or fails mid-utterance leaves that
+  profile's preview dark without touching dictation.
 - **AI text refinement** — optional pass over the transcript: removes filler
   words, fixes punctuation and casing, applies a tone preset (`verbatim`,
   `clean`, `formal`, `notes`, `code-comment`). Works against any
@@ -71,20 +81,21 @@ endpoint, a model download).
 
 The HUD floats above whatever window has focus while dictating, showing the
 current phase (listening, transcribing, refining, injecting), a live input
-level meter, and the partial transcript as it comes in.
+level meter, and — for a profile that has a live preview model selected — the
+partial transcript as it comes in.
 
 <p align="center">
-  <img src="docs/img/settings-profiles-light.png" alt="Profiles settings page showing a Russian profile bound to Ctrl+Super running GigaAM-v3, with an English profile below it" width="70%">
+  <img src="docs/img/settings-profiles-light.png" alt="Profiles settings page showing a Russian profile bound to Ctrl+Super, running GigaAM-v3 with a Zipformer Small live preview" width="70%">
 </p>
 
 **Profiles** — one chord per language. Each profile carries its own engine,
-model, language tag and refinement policy, so pressing its hotkey selects the
-whole set at once.
+model, language tag, live preview model and refinement policy, so pressing its
+hotkey selects the whole set at once.
 
 | | |
 |---|---|
-| ![Engines settings page listing whisper.cpp and sherpa-onnx models with their install state](docs/img/settings-engines-light.png) | ![Refinement settings page with the provider connection, master switch, and a live test](docs/img/settings-refinement-light.png) |
-| **Engines** — download and remove whisper.cpp and sherpa-onnx models, and hold the cloud engine's API key; which of them a profile uses is set on the Profiles page. | **Refinement** — the LLM connection profiles can send transcripts through: any OpenAI-compatible chat endpoint, including a local Ollama, with a master switch and a live test. |
+| ![Engines settings page listing sherpa-onnx models and live preview models with their install state](docs/img/settings-engines-light.png) | ![Refinement settings page with the provider connection, master switch, and a live test](docs/img/settings-refinement-light.png) |
+| **Engines** — download and remove whisper.cpp, sherpa-onnx and live preview models, and hold the cloud engine's API key; which of them a profile uses is set on the Profiles page. | **Refinement** — the LLM connection profiles can send transcripts through: any OpenAI-compatible chat endpoint, including a local Ollama, with a master switch and a live test. |
 | ![Dictionary settings page with custom terms and heard/write replacement rules](docs/img/settings-dictionary-light.png) | ![Snippets settings page with trigger phrases and their expansion bodies](docs/img/settings-snippets-light.png) |
 | **Dictionary** — custom terms and literal replacement rules applied to every transcript. | **Snippets** — a spoken trigger expands to a stored template, bypassing refinement. |
 
@@ -120,6 +131,14 @@ without any extra setup.
 
 They are built on Ubuntu 22.04 and need **glibc 2.35 or newer** — Ubuntu
 22.04+, Debian 12+, Fedora 37+. On anything older, build from source.
+
+The live preview is off by default and takes two steps to turn on: download a
+streaming model under Settings > Engines > Live preview models, then select it
+for a profile under Settings > Profiles > Live preview. That order matters —
+a profile's engines are rebuilt when settings are saved, not when a download
+finishes, so a preview model selected before it was downloaded stays silent
+until settings are next saved or the app restarts. A build without the
+`sherpa` feature has no preview at all.
 
 ### Build from source
 
@@ -182,12 +201,21 @@ rejected, so the format tolerates being hand-edited or partially upgraded.
 - **Profiles** — `[[profiles]]` is a list of language profiles, each with
   its own `hotkey`, `language` tag, `engine` (`whisper`, `sherpa`, or
   `cloud`) and refine tone; the settings UI's Profiles page edits this list.
-  There is no single active engine — each profile picks its own.
+  There is no single active engine — each profile picks its own. An optional
+  `[[profiles]].draft` table with a single `model` key names the streaming
+  model that drives that profile's live preview; omitting it, or leaving
+  `model` blank, is the default and means no preview.
 - **Engines** — models download to `~/.local/share/utter/models` and are
   managed from the Engines page; which engine a profile actually uses is
-  chosen on the Profiles page. The sherpa-onnx catalog has one model per
-  language — GigaAM-v3 is Russian only, Parakeet TDT 110M is English only —
-  so a profile's engine should match the language it dictates in.
+  chosen on the Profiles page. Four of the catalog's entries are sherpa-onnx
+  models, filed under two engine kinds: the offline models whose text is
+  inserted (GigaAM-v3 for Russian, Parakeet TDT 110M for English) and the
+  streaming models that only drive the live preview (Zipformer Small, one per
+  language). There is one model per language in each kind, so a profile's
+  engine and preview should both match the language it dictates in. The two
+  kinds install under identical filenames, so a model catalogued under the
+  wrong kind is rejected on its catalog entry before any of its files are
+  opened.
 - **Refinement** — point `refine.base_url` / `refine.model` at any
   OpenAI-compatible chat endpoint; the settings UI ships presets for OpenAI,
   Groq, OpenRouter, DeepSeek, and Ollama. For a fully local setup, run
@@ -223,11 +251,12 @@ including dev setup and test/lint gates, are in
 
 ## Roadmap
 
-- **v0.3** — A streaming sherpa-onnx engine driving a live partial-transcript
-  preview in the HUD, and typing into the target application as the user
-  speaks.
-- **Later** — Windows and macOS runtime adapters, voice commands ("new
-  line", "undo that"), translation mode.
+- **v0.3** (this release) — A streaming sherpa-onnx engine driving a live
+  partial-transcript preview in the HUD, selected per profile and off by
+  default.
+- **Later** — Typing into the target application as the user speaks, rather
+  than only previewing in the HUD; Windows and macOS runtime adapters; voice
+  commands ("new line", "undo that"); translation mode.
 
 ## License
 

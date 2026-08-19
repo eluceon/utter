@@ -3,6 +3,8 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event'
   import { invoke } from '@tauri-apps/api/core'
 
+  import { HUD_STYLE } from './layout'
+
   type Phase = 'idle' | 'recording' | 'transcribing' | 'refining' | 'injecting'
 
   interface DictationStatePayload {
@@ -63,6 +65,7 @@
 
 <div
   class="hud"
+  style={HUD_STYLE}
   data-state={phase}
   role="button"
   tabindex="0"
@@ -79,7 +82,7 @@
     {/each}
   </div>
   {#if partial}
-    <div class="partial">{partial}</div>
+    <div class="partial"><span>{partial}</span></div>
   {/if}
 </div>
 
@@ -89,15 +92,23 @@
     background: transparent;
   }
 
+  /* The pill sizes itself from its rows (see `./layout.ts`) rather than to a
+     pinned height: the window is sized for the pill's tallest state, the
+     live preview, and is transparent everywhere the pill isn't.
+
+     Pinning the height here is what hid the preview. A fixed-height flex
+     column does not overflow when its rows don't fit — it *shrinks* them,
+     and this column's rows fitted only until a third one existed. The
+     preview row was squeezed to a few pixels and then clipped away by its
+     own `overflow: hidden`: present in the DOM, correct in every event it
+     received, and never once drawn. */
   .hud {
     box-sizing: border-box;
     width: 280px;
-    height: 64px;
-    padding: 10px 14px;
+    padding: var(--hud-pad-y) 14px;
     display: flex;
     flex-direction: column;
-    justify-content: space-between;
-    gap: 4px;
+    gap: var(--hud-row-gap);
     border-radius: 16px;
     background: rgba(18, 18, 22, 0.86);
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
@@ -116,6 +127,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    height: var(--hud-status-row);
   }
 
   .dot {
@@ -159,7 +171,8 @@
     display: flex;
     align-items: flex-end;
     gap: 3px;
-    height: 20px;
+    height: var(--hud-meter);
+    flex-shrink: 0;
   }
 
   .bar {
@@ -202,12 +215,26 @@
     background: #2ecc71;
   }
 
+  /* A live preview only ever grows, so the interesting end is the newest
+     one. The row is a fixed two-line box (never taller, never shorter, so a
+     window sitting over the user's work never resizes as they speak) with
+     its text pinned to the bottom: as the sentence outgrows two lines the
+     older lines scroll off the top, whole lines at a time, because the box
+     is an exact multiple of the line box. Ellipsising the *end* instead —
+     what `text-overflow` does — would have frozen the preview on the first
+     few words it ever showed. */
   .partial {
-    font-size: 12px;
-    line-height: 1.2;
-    white-space: nowrap;
+    height: var(--hud-partial);
+    display: flex;
+    align-items: flex-end;
     overflow: hidden;
-    text-overflow: ellipsis;
+    font-size: 12px;
+    line-height: var(--hud-partial-line);
     opacity: 0.9;
+  }
+
+  .partial span {
+    flex: 1;
+    overflow-wrap: anywhere;
   }
 </style>

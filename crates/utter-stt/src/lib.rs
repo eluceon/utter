@@ -16,4 +16,4 @@ pub use cloud::{CloudEngine, CloudSttConfig};
 pub mod sherpa;
 
 #[cfg(feature = "sherpa")]
-pub use sherpa::{SherpaConfig, SherpaOfflineEngine};
+pub use sherpa::{SherpaConfig, SherpaOfflineEngine, SherpaStreamingEngine};

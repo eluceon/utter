@@ -35,13 +35,13 @@ use utter_refine::{LlmConfig, LlmRefiner};
 use utter_store::settings::{CloudSttCfg, EngineCfg, EngineKind, InjectionPreference, RefineCfg};
 #[cfg(feature = "sherpa")]
 use utter_store::IntegrityError;
-use utter_store::{LanguageProfile, ModelManager, Settings};
+use utter_store::{DraftCfg, LanguageProfile, ModelManager, Settings};
 use utter_stt::{CloudEngine, CloudSttConfig, WhisperEngine};
 
 use crate::profiles::{ProfileRegistry, RealProfileLoader};
 use crate::runtime::{EventSink, HistoryHandle, RealCaptureBackend, Runtime, RuntimeDeps};
 use crate::sink::TauriEventSink;
-use crate::state::AppState;
+use crate::state::{AppState, PendingNotices};
 use crate::{keyring_password, REFINE_KEY_SERVICE, STT_KEY_SERVICE};
 
 /// Boots the dictation runtime from the current in-memory settings and
@@ -80,11 +80,37 @@ pub fn boot(app: &AppHandle) -> Result<(), String> {
         .lock()
         .map_err(|_| "session control lock poisoned".to_string())? = Some(handle);
 
-    for (kind, msg) in notices {
-        sink.notify(kind, &msg);
-    }
+    report_boot_notices(sink.as_ref(), &state.pending_notices, notices);
 
     Ok(())
+}
+
+/// Reports every notice boot collected on both channels available to it: the
+/// live one (`sink`), and `parked`, which is the only one that still works
+/// this early.
+///
+/// [`boot`] runs synchronously inside Tauri's `setup` — before the webview is
+/// loaded, long before any window subscribes to `notice` — and Tauri's `emit`
+/// has no replay, so on its own every `notice` fired here lands on zero
+/// listeners forever. The desktop notification is not a backstop either: it
+/// is deliberately rate limited (see [`crate::sink::NoticeThrottle`]) and
+/// this loop has no delay in it, so a startup with two conditions to explain
+/// — a transcription model that is not downloaded and a preview that is
+/// unavailable, which arrive together — would show the first and drop the
+/// second. Parking a copy is what lets the settings window list all of them
+/// once it exists (see [`PendingNotices`] and the `take_pending_notices`
+/// command).
+///
+/// [`rebuild`] deliberately does not park: it runs from `save_settings` or
+/// the tray, with a window already open and listening, so a parked copy would
+/// be replayed at some later mount as if it were news.
+fn report_boot_notices(sink: &dyn EventSink, parked: &PendingNotices, notices: Vec<QueuedNotice>) {
+    for (kind, msg) in notices {
+        // Parked first: the parked copy is the one that survives, so it must
+        // not depend on the live emit having got anywhere.
+        parked.push(kind, &msg);
+        sink.notify(kind, &msg);
+    }
 }
 
 /// Rebuilds the dictation runtime from `settings`: reloads the running
@@ -346,6 +372,70 @@ fn sherpa_thread_count() -> usize {
     utter_stt::sherpa::default_threads(available)
 }
 
+/// The catalog `engine` string of the offline models whose text is injected.
+#[cfg(feature = "sherpa")]
+const OFFLINE_ENGINE: &str = "sherpa";
+
+/// The catalog `engine` string of the streaming models that drive the live
+/// preview. Mirrored in the UI as `PREVIEW_ENGINE`
+/// (`apps/desktop/ui/src/lib/models.ts`), which keeps the two out of each
+/// other's pickers; this module is what keeps a config that got one wrong
+/// anyway from reaching a decoder.
+#[cfg(feature = "sherpa")]
+const STREAMING_ENGINE: &str = "sherpa-streaming";
+
+/// How a notice refers to the models catalogued under `engine`.
+#[cfg(feature = "sherpa")]
+fn model_kind_description(engine: &str) -> String {
+    match engine {
+        OFFLINE_ENGINE => "an offline transcription model".to_string(),
+        STREAMING_ENGINE => "a streaming preview model".to_string(),
+        "whisper" => "a whisper model".to_string(),
+        other => format!("a \"{other}\" model"),
+    }
+}
+
+/// Rejects a model id that is catalogued under an engine other than
+/// `expected_engine`, returning the reason to report if so.
+///
+/// **This is a process-liveness check, not a validation nicety, and it must
+/// run before [`ModelManager::verify_installed`].** `verify_installed`
+/// answers "are these files intact"; it cannot answer "are these the files
+/// this engine can read", and a model of the wrong kind is usually perfectly
+/// intact. The two sherpa engines resolve overlapping fixed artifact names —
+/// `parakeet-tdt-110m-en` (offline) installs as exactly the
+/// `encoder.onnx`/`decoder.onnx`/`joiner.onnx`/`tokens.txt` quartet
+/// `SherpaStreamingEngine::load` looks for — so an intact offline model
+/// handed to the streaming recognizer sails through every existing check and
+/// reaches sherpa-onnx, which reads streaming-only metadata keys
+/// (`decode_chunk_len`, encoder dims) that an offline export does not carry
+/// and terminates the process rather than returning an error. Nothing in Rust
+/// can catch that, which is why the id's *kind* is settled here, first, on
+/// catalog data alone.
+///
+/// An id that is not in the catalog at all is rejected too, with its own
+/// wording: it has no kind to check, nothing could install it, and letting it
+/// fall through would report a typo'd id as merely "not downloaded".
+#[cfg(feature = "sherpa")]
+fn wrong_model_kind(
+    models: &ModelManager,
+    model_id: &str,
+    expected_engine: &str,
+) -> Option<String> {
+    match models.engine_of(model_id) {
+        Some(engine) if engine == expected_engine => None,
+        Some(engine) => Some(format!(
+            "model \"{model_id}\" is {}, not {}; choose a different model in Settings > Profiles",
+            model_kind_description(engine),
+            model_kind_description(expected_engine)
+        )),
+        None => Some(format!(
+            "model \"{model_id}\" is not in the model catalog; choose a model in Settings > \
+             Profiles"
+        )),
+    }
+}
+
 #[cfg(feature = "sherpa")]
 fn build_sherpa(
     model_id: Option<&str>,
@@ -357,6 +447,10 @@ fn build_sherpa(
             "no sherpa model configured; open Settings > Engines to download one".to_string();
         return (unavailable_engine(reason.clone()), Some(reason));
     };
+
+    if let Some(reason) = wrong_model_kind(models, model_id, OFFLINE_ENGINE) {
+        return (unavailable_engine(reason.clone()), Some(reason));
+    }
 
     let path = match models.verify_installed(model_id) {
         Ok(path) => path,
@@ -400,6 +494,125 @@ fn build_sherpa(
                    in Settings > Profiles, or install a build with the sherpa feature enabled"
         .to_string();
     (unavailable_engine(reason.clone()), Some(reason))
+}
+
+/// Builds a profile's draft (preview) engine from its [`DraftCfg`], plus a
+/// notice if one was configured but could not be built.
+///
+/// Unlike [`build_engine`], failure has no stand-in: `None` already means
+/// "this profile has no preview", and the runtime treats it exactly that way
+/// (see [`ProfileDeps::draft_engine`](crate::profiles::ProfileDeps::draft_engine)).
+/// A missing, damaged or unloadable preview model therefore costs the user
+/// nothing but the preview itself — the profile still dictates and still
+/// injects the final engine's text — which is why callers queue this
+/// function's notice as `"info"` rather than the `"warning"` a broken final
+/// engine earns.
+///
+/// `None`, or a blank model id, is the configured-off state (what the
+/// Profiles page writes when the preview is switched off) and is silent: it
+/// is a choice, not a degradation.
+pub(crate) fn build_draft_engine(
+    cfg: Option<&DraftCfg>,
+    models: &ModelManager,
+    dictionary_terms: &[String],
+) -> (Option<Box<dyn SttEngine>>, Option<String>) {
+    let model_id = cfg.map(|draft| draft.model.trim()).unwrap_or_default();
+    if model_id.is_empty() {
+        return (None, None);
+    }
+
+    build_streaming_draft(model_id, models, dictionary_terms)
+}
+
+/// The number of onnxruntime inference threads the draft engine gets:
+/// exactly one, deliberately *not* [`sherpa_thread_count`].
+///
+/// The draft engine decodes concurrently with the final engine on the same
+/// machine, so its threads come out of the same pool. Benchmarking on the
+/// target hardware put the final engine's latency optimum at 4 threads of 6,
+/// with the oversubscription of running both at that width costing 18%. A
+/// small int8 streaming model keeps up on a single thread, and staying out of
+/// the final engine's way is the entire point of it: the preview is a
+/// courtesy, the injected text is not.
+#[cfg(feature = "sherpa")]
+const DRAFT_THREADS: usize = 1;
+
+/// The [`utter_stt::SherpaConfig`] every draft engine is loaded with.
+///
+/// Split out of [`build_streaming_draft`] so that [`DRAFT_THREADS`] actually
+/// reaches something a test can look at: the only other observer of it is
+/// onnxruntime, well past the point any test can go. It is the sole
+/// construction site of a draft `SherpaConfig`, so what this returns is what
+/// the draft engine gets.
+#[cfg(feature = "sherpa")]
+fn draft_sherpa_config(dictionary_terms: &[String]) -> utter_stt::SherpaConfig {
+    utter_stt::SherpaConfig {
+        num_threads: DRAFT_THREADS,
+        hotwords: dictionary_terms.to_vec(),
+    }
+}
+
+#[cfg(feature = "sherpa")]
+fn build_streaming_draft(
+    model_id: &str,
+    models: &ModelManager,
+    dictionary_terms: &[String],
+) -> (Option<Box<dyn SttEngine>>, Option<String>) {
+    // Kind before integrity: an offline model is a valid, intact install of
+    // something this engine cannot read, and `verify_installed` would wave it
+    // through — see `wrong_model_kind`.
+    if let Some(reason) = wrong_model_kind(models, model_id, STREAMING_ENGINE) {
+        let reason = format!("{reason}. Dictation is unaffected — only the live preview is off.");
+        return (None, Some(reason));
+    }
+
+    // `verify_installed`, never `path_for`: a truncated or otherwise damaged
+    // model makes sherpa-onnx's C++ layer call `_Exit()` on load, taking the
+    // whole app down with no chance for Rust to catch it. See `build_sherpa`,
+    // which guards the final engine's path the same way.
+    let path = match models.verify_installed(model_id) {
+        Ok(path) => path,
+        Err(IntegrityError::SizeMismatch { artifact, .. }) => {
+            let reason = format!(
+                "preview model \"{model_id}\" is damaged (artifact \"{artifact}\" has the wrong \
+                 size); re-download it from Settings > Engines. Dictation is unaffected — only \
+                 the live preview is off."
+            );
+            return (None, Some(reason));
+        }
+        Err(_) => {
+            let reason = format!(
+                "preview model \"{model_id}\" is not downloaded; open Settings > Engines to \
+                 download it. Dictation is unaffected — only the live preview is off."
+            );
+            return (None, Some(reason));
+        }
+    };
+
+    match utter_stt::SherpaStreamingEngine::load(&path, draft_sherpa_config(dictionary_terms)) {
+        Ok(engine) => (Some(Box::new(engine)), None),
+        Err(e) => {
+            let reason = format!(
+                "failed to load preview model \"{model_id}\": {e}. Dictation is unaffected — \
+                 only the live preview is off."
+            );
+            (None, Some(reason))
+        }
+    }
+}
+
+#[cfg(not(feature = "sherpa"))]
+fn build_streaming_draft(
+    model_id: &str,
+    _models: &ModelManager,
+    _dictionary_terms: &[String],
+) -> (Option<Box<dyn SttEngine>>, Option<String>) {
+    let reason = format!(
+        "this build was compiled without sherpa support, so the preview model \"{model_id}\" \
+         cannot be loaded; switch the preview off in Settings > Profiles, or install a build \
+         with the sherpa feature enabled. Dictation is unaffected — only the live preview is off."
+    );
+    (None, Some(reason))
 }
 
 /// A generous but bounded default for the cloud engine's HTTP timeout:
@@ -572,6 +785,76 @@ fn spawn_hotkey_sources(specs: &[HotkeySpec]) -> (Receiver<HotkeyEvent>, Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Records what a sink was asked to report, standing in for the
+    /// `TauriEventSink` `boot` builds (which needs a running app).
+    #[derive(Default)]
+    struct RecordingSink {
+        reported: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl EventSink for RecordingSink {
+        fn emit_state(&self, _state: &str, _level: f32, _partial: Option<&str>) {}
+
+        fn notify(&self, kind: &str, msg: &str) {
+            self.reported
+                .lock()
+                .expect("lock")
+                .push((kind.to_string(), msg.to_string()));
+        }
+    }
+
+    /// Every notice boot reports must also be parked, because at boot time
+    /// the live channel reaches nobody: the `notice` event has no listener
+    /// yet (the webview is not loaded during `setup`), and the desktop
+    /// notification throttle drops everything after the first in an
+    /// undelayed loop like this one.
+    ///
+    /// The fixture is deliberately *two* notices, the real pairing of a
+    /// missing transcription model with an unavailable preview: parking only
+    /// the first would satisfy any assertion written against a single-notice
+    /// fixture while leaving the exact configuration this exists for broken.
+    #[test]
+    fn every_notice_boot_reports_is_also_parked_for_the_first_window() {
+        let sink = RecordingSink::default();
+        let parked = PendingNotices::default();
+
+        report_boot_notices(
+            &sink,
+            &parked,
+            vec![
+                ("warning", "no transcription model".to_string()),
+                ("info", "live preview unavailable".to_string()),
+            ],
+        );
+
+        assert_eq!(
+            sink.reported
+                .lock()
+                .expect("lock")
+                .iter()
+                .map(|(kind, msg)| (kind.as_str(), msg.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("warning", "no transcription model"),
+                ("info", "live preview unavailable"),
+            ],
+            "the live channel must still get everything it got before"
+        );
+
+        assert_eq!(
+            parked
+                .take()
+                .iter()
+                .map(|n| n.message.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "no transcription model".to_string(),
+                "live preview unavailable".to_string(),
+            ],
+            "both notices must be parked, not just the one the throttle would let through"
+        );
+    }
 
     #[test]
     fn engine_label_matches_each_kind() {
@@ -765,6 +1048,164 @@ mod tests {
             .begin(&TranscribeOptions::default())
             .expect_err("an unavailable engine must fail begin() informatively");
         assert!(matches!(err, SttError::ModelNotFound(_)));
+    }
+
+    /// A streaming preview model configured as the *final* engine's model must be rejected on
+    /// its kind, before `verify_installed` and before any engine is constructed. The offline and
+    /// streaming loaders resolve overlapping artifact names, so an intact model of the wrong kind
+    /// reaches sherpa-onnx looking exactly like a right one and kills the process there.
+    ///
+    /// The fixture is deliberately a *damaged* install of a real streaming id: without the kind
+    /// check `verify_installed` would reject it as damaged and the degradation would look fine
+    /// from the outside, so asserting the notice talks about the model's kind and *not* about
+    /// damage is what pins the check running first, on its own terms.
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn a_streaming_model_is_rejected_as_the_injected_transcript_engine() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = ModelManager::new(dir.path().to_path_buf());
+
+        let model_dir = dir.path().join("models").join("zipformer-ru-small");
+        std::fs::create_dir_all(&model_dir).expect("create model dir");
+        for name in ["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"] {
+            std::fs::write(model_dir.join(name), b"wrong size on purpose").expect("write artifact");
+        }
+
+        let (mut engine, notice) = build_sherpa(Some("zipformer-ru-small"), &models, &[]);
+
+        let notice = notice.expect("a model of the wrong kind must produce a notice");
+        assert!(notice.contains("zipformer-ru-small"), "got {notice:?}");
+        assert!(
+            notice.contains("a streaming preview model"),
+            "the notice must say what the model actually is, got {notice:?}"
+        );
+        assert!(
+            notice.contains("an offline transcription model"),
+            "the notice must say what was needed instead, got {notice:?}"
+        );
+        assert!(
+            notice.contains("Settings > Profiles"),
+            "the notice must name the page where this is changed, got {notice:?}"
+        );
+        assert!(
+            !notice.contains("damaged"),
+            "the kind check must run before the integrity check, got {notice:?}"
+        );
+
+        let err = engine
+            .begin(&TranscribeOptions::default())
+            .expect_err("a profile whose final engine is unusable must fail informatively");
+        assert!(matches!(err, SttError::ModelNotFound(_)));
+    }
+
+    /// An id in no catalog entry at all is the third case: it has no kind to check and nothing
+    /// could ever install it, so it is rejected here rather than falling through to
+    /// `verify_installed`, which would report a typo as merely "not downloaded".
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn an_uncatalogued_model_id_is_rejected_as_unknown_rather_than_undownloaded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = ModelManager::new(dir.path().to_path_buf());
+
+        let (_engine, notice) = build_sherpa(Some("typo-not-a-model"), &models, &[]);
+
+        let notice = notice.expect("an uncatalogued id must produce a notice");
+        assert!(notice.contains("typo-not-a-model"), "got {notice:?}");
+        assert!(
+            notice.contains("not in the model catalog"),
+            "got {notice:?}"
+        );
+        assert!(
+            !notice.contains("not downloaded"),
+            "an id no catalog entry has cannot be downloaded, so saying so would misdirect the \
+             user, got {notice:?}"
+        );
+    }
+
+    /// The catalog installs every streaming model under exactly the file
+    /// names `SherpaStreamingEngine::load` opens.
+    ///
+    /// The two halves live in crates that cannot see each other —
+    /// `utter-store` decides the installed names via `Artifact.name`,
+    /// `utter-stt` resolves four fixed ones — and this crate is the first
+    /// place downstream of both. Nothing else checks them: renaming an
+    /// artifact back to its upstream file name (`encoder.int8.onnx`,
+    /// `encoder-epoch-99-avg-1.int8.onnx`) leaves every other test green
+    /// while the preview quietly never loads for that language, since a
+    /// preview that fails to load is by design only an `"info"` notice.
+    ///
+    /// Driven off the catalog rather than a hardcoded id list, so an entry
+    /// added later is covered without anyone remembering to come back here;
+    /// the emptiness guard is what keeps that from silently becoming a loop
+    /// over nothing. Names are compared as sorted sets because the loader
+    /// resolves each by name and does not care in what order the catalog
+    /// happens to list them.
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn every_streaming_catalog_entry_installs_the_filenames_the_loader_resolves() {
+        let models = ModelManager::new(std::path::PathBuf::from("/nonexistent"));
+
+        let mut expected = utter_stt::sherpa::STREAMING_MODEL_FILES.to_vec();
+        expected.sort_unstable();
+
+        let ids: Vec<String> = models
+            .catalog()
+            .into_iter()
+            .filter(|m| m.engine == STREAMING_ENGINE)
+            .map(|m| m.id)
+            .collect();
+        assert!(
+            !ids.is_empty(),
+            "the catalog has no {STREAMING_ENGINE} entries, so this test would assert nothing"
+        );
+
+        for id in ids {
+            let mut names = models
+                .artifact_names(&id)
+                .expect("an id taken from the catalog is in the catalog");
+            names.sort_unstable();
+            assert_eq!(
+                names, expected,
+                "{id} must install the artifact names SherpaStreamingEngine::load resolves, or \
+                 its preview will never load"
+            );
+        }
+    }
+
+    /// The draft engine is loaded on exactly one inference thread, never on
+    /// [`sherpa_thread_count`] like the final engine.
+    ///
+    /// Nothing downstream of here can be observed from a test — the number's
+    /// only other reader is onnxruntime — so this is asserted at the last
+    /// point it is still visible, [`draft_sherpa_config`], which is the sole
+    /// construction site of a draft `SherpaConfig`. Without it the constant
+    /// is pinned by nothing at all: swapping it for `sherpa_thread_count()`
+    /// leaves the whole suite green while reintroducing the 18% latency cost
+    /// of the two engines oversubscribing the same cores, which only shows up
+    /// on a stopwatch.
+    ///
+    /// Asserting the literal `1` rather than "less than the final engine's"
+    /// is deliberate: on a single-core machine the two are equal and the
+    /// difference is unassertable, but on such a machine there is also no
+    /// oversubscription to prevent, so the invariant worth stating is the
+    /// absolute one. The hotwords assertion rides along because a config
+    /// helper that forgot to forward them would silently cost the preview its
+    /// dictionary biasing.
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn the_draft_engine_is_configured_for_a_single_inference_thread() {
+        let cfg = draft_sherpa_config(&["Kubernetes".to_string()]);
+
+        assert_eq!(
+            cfg.num_threads, 1,
+            "the draft engine runs concurrently with the final one and must stay out of its \
+             way; see DRAFT_THREADS"
+        );
+        assert_eq!(
+            cfg.hotwords,
+            vec!["Kubernetes".to_string()],
+            "the preview is biased by the same dictionary terms the final engine is"
+        );
     }
 
     #[cfg(not(feature = "sherpa"))]

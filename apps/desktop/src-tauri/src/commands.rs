@@ -24,7 +24,7 @@ use utter_inject::PermissionReport;
 use utter_refine::{LlmConfig, LlmRefiner};
 use utter_store::{HistoryEntry, ModelInfo, Settings};
 
-use crate::events::ModelProgress;
+use crate::events::{ModelProgress, Notice};
 use crate::state::AppState;
 use crate::{keyring_password, KEYRING_SERVICE, REFINE_KEY_SERVICE, STT_KEY_SERVICE};
 
@@ -140,6 +140,21 @@ pub fn cancel_dictation(app: AppHandle, state: State<AppState>) -> Result<(), St
         }
     }
     Ok(())
+}
+
+/// Hands the calling window every notice reported before any window existed
+/// to hear it, and empties the queue.
+///
+/// `runtime_boot::boot` runs inside Tauri's `setup`, so the `notice` events it
+/// emits land on zero listeners (see `state::PendingNotices`). The settings
+/// window calls this once on mount, which is what makes it the backstop for
+/// startup conditions that `sink.rs` documents it as.
+///
+/// Left synchronous for the same reason as `cancel_dictation`: this only
+/// takes a `Mutex` around a `Vec`, with no I/O to move off the main thread.
+#[tauri::command]
+pub fn take_pending_notices(state: State<AppState>) -> Vec<Notice> {
+    state.pending_notices.take()
 }
 
 #[tauri::command]

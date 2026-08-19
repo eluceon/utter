@@ -26,8 +26,9 @@ pub struct LanguageProfile {
     pub language: String,
     /// Which engine produces the text that gets injected.
     pub engine: EngineCfg,
-    /// Which engine drives the live preview, if any. Nothing reads this yet;
-    /// the preview arrives in a later release.
+    /// Which streaming model drives the live preview, if any. `None` — the
+    /// default — leaves the preview off; the profile still dictates, and the
+    /// text that gets injected always comes from `engine` either way.
     pub draft: Option<DraftCfg>,
     /// Whether and how this profile's transcripts are refined.
     pub refine: RefinePolicy,
@@ -50,9 +51,11 @@ impl Default for LanguageProfile {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct DraftCfg {
-    /// Catalog id of the streaming model, resolved through
-    /// [`ModelManager::path_for`](crate::ModelManager::path_for) like every
-    /// other model id — never a filesystem path.
+    /// Catalog id of the streaming model — never a filesystem path. Resolved
+    /// through
+    /// [`ModelManager::verify_installed`](crate::ModelManager::verify_installed),
+    /// like the sherpa engine's own model id, so a damaged download is caught
+    /// before its path reaches the native decoder.
     pub model: String,
 }
 

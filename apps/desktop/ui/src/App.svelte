@@ -1,6 +1,9 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte'
+  import type { UnlistenFn } from '@tauri-apps/api/event'
 
+  import Notices from './lib/components/Notices.svelte'
+  import { noticeStore } from './lib/notices'
   import { settingsStore } from './lib/stores'
   import { applyTheme } from './lib/theme'
   import { deepEqual, defaultSettings } from './lib/types'
@@ -47,6 +50,7 @@
   }
 
   let hash = $state(currentHash())
+  let unlistenNotices: UnlistenFn | undefined
   let loading = $state(true)
   let loadError = $state('')
   let showOnboarding = $state(false)
@@ -70,6 +74,16 @@
   }
 
   onMount(async () => {
+    // Subscribed before settings are loaded, and outside the try: a notice
+    // is most worth reading when something else went wrong, including the
+    // load below.
+    noticeStore
+      .start()
+      .then((fn) => {
+        unlistenNotices = fn
+      })
+      .catch(() => {})
+
     try {
       const loaded = await settingsStore.load()
       showOnboarding = !localStorage.getItem(ONBOARDED_KEY) && isDefaultSettings(loaded)
@@ -86,6 +100,7 @@
   onDestroy(() => {
     window.removeEventListener('hashchange', onHashChange)
     window.removeEventListener('beforeunload', onBeforeUnload)
+    unlistenNotices?.()
     // A patch made right before this window closes (e.g. the user tweaked a
     // field and immediately hit the OS close button) must not be dropped
     // just because the 500ms debounce hadn't elapsed yet.
@@ -144,6 +159,10 @@
     </main>
   </div>
 {/if}
+
+<!-- Outside the branches above: a notice has to be readable whichever of
+     them is on screen, including the settings-load error. -->
+<Notices />
 
 <style>
   .status {

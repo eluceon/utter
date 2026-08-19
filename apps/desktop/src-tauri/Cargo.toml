@@ -21,6 +21,11 @@ tauri = { version = "2.11", features = ["tray-icon"] }
 tauri-plugin-notification = "2"
 keyring = "4"
 tracing = { workspace = true }
+# `fmt` + `std` only: the app maps `advanced.log_level` straight to a max
+# level (see `init_tracing`), so neither `env-filter`'s regex machinery nor
+# ANSI colouring on a stderr stream nobody watches interactively earns its
+# place in the dependency tree.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
 utter-core = { path = "../../../crates/utter-core" }
 utter-audio = { path = "../../../crates/utter-audio" }

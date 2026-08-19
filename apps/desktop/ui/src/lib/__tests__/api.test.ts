@@ -108,6 +108,11 @@ describe('api command wrappers', () => {
     expect(handler).toHaveBeenCalledWith({ id: 'small', done: 1, total: 2 })
   })
 
+  it('takePendingNotices -> take_pending_notices with no args', async () => {
+    await api.takePendingNotices()
+    expect(mockInvoke).toHaveBeenCalledWith('take_pending_notices')
+  })
+
   it('onDictationState listens on "dictation-state"', async () => {
     await api.onDictationState(vi.fn())
     expect(mockListen).toHaveBeenCalledWith('dictation-state', expect.any(Function))

@@ -80,7 +80,10 @@ struct CatalogEntry {
 /// API for `ggerganov/whisper.cpp` (`lfs.oid` and `size` per file).
 /// Sherpa-onnx sha256 and size_bytes values were read from the Hugging Face
 /// tree API for each model's repository at the pinned revision in its
-/// artifact URLs.
+/// artifact URLs — except `tokens.txt`, which none of these repositories
+/// track as an LFS file, so the tree API only has a git blob hash for it,
+/// not its sha256. Every `tokens.txt` entry's sha256 was instead obtained by
+/// downloading the file and hashing it directly.
 const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         id: "tiny",
@@ -207,6 +210,70 @@ const CATALOG: &[CatalogEntry] = &[
             },
         ],
     },
+    CatalogEntry {
+        id: "zipformer-ru-small",
+        engine: "sherpa-streaming",
+        label: "Zipformer Small (Russian, streaming)",
+        size_mb: 27,
+        artifacts: &[
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-small-ru-vosk-int8-2025-08-16/resolve/31fa603e4f31279c6e1f7600fed13dc4312663ab/encoder.int8.onnx",
+                sha256: "e0db705e94ec35d803b1df4f40cda23d064e1142977c80ab288430b109777a9d",
+                name: "encoder.onnx",
+                size_bytes: 26_214_060,
+            },
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-small-ru-vosk-int8-2025-08-16/resolve/31fa603e4f31279c6e1f7600fed13dc4312663ab/decoder.onnx",
+                sha256: "89b3088a9e20e1ef7f2e85ce1a3478afe6a9c4ac57369cabcc4beb8e95328ea0",
+                name: "decoder.onnx",
+                size_bytes: 2_093_080,
+            },
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-small-ru-vosk-int8-2025-08-16/resolve/31fa603e4f31279c6e1f7600fed13dc4312663ab/joiner.int8.onnx",
+                sha256: "b55784b071ab7512eab4c7c44e4f5478284ef33c83562cc6a249b972515a31e5",
+                name: "joiner.onnx",
+                size_bytes: 259_417,
+            },
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-small-ru-vosk-int8-2025-08-16/resolve/31fa603e4f31279c6e1f7600fed13dc4312663ab/tokens.txt",
+                sha256: "93bbbc0bae6b78c0bbb743d4aa9fded3bb5ff3aac5f0200e3a769a5a05e0fdf6",
+                name: "tokens.txt",
+                size_bytes: 6_388,
+            },
+        ],
+    },
+    CatalogEntry {
+        id: "zipformer-en-small",
+        engine: "sherpa-streaming",
+        label: "Zipformer Small (English, streaming)",
+        size_mb: 43,
+        artifacts: &[
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/resolve/d42f2d9f7ca24806fb667456a18a9f1b60f70d16/encoder-epoch-99-avg-1.int8.onnx",
+                sha256: "3810755ce7c3ab26b42a8bcf39d191308fa27fb0f53358823ba46141d03b7eb3",
+                name: "encoder.onnx",
+                size_bytes: 42_845_182,
+            },
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/resolve/d42f2d9f7ca24806fb667456a18a9f1b60f70d16/decoder-epoch-99-avg-1.onnx",
+                sha256: "45a7f940ecfb53d89fa270ad11b88b961e53a317203eb24b1c8e95ed208b0f30",
+                name: "decoder.onnx",
+                size_bytes: 2_092_272,
+            },
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/resolve/d42f2d9f7ca24806fb667456a18a9f1b60f70d16/joiner-epoch-99-avg-1.int8.onnx",
+                sha256: "e085d73b593cf9b0707f370dbd656d58327d3fe36d80d849202ef81df02cb01e",
+                name: "joiner.onnx",
+                size_bytes: 259_572,
+            },
+            Artifact {
+                url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/resolve/d42f2d9f7ca24806fb667456a18a9f1b60f70d16/tokens.txt",
+                sha256: "49e3c2646595fd907228b3c6787069658f67b17377c60aeb8619c4551b2316fb",
+                name: "tokens.txt",
+                size_bytes: 5_048,
+            },
+        ],
+    },
 ];
 
 /// Manages the local install state of the speech-to-text model catalog:
@@ -261,6 +328,38 @@ impl ModelManager {
         let entry = self.find(id)?;
         let path = self.install_path(entry);
         self.is_installed(entry, &path).then_some(path)
+    }
+
+    /// The catalog `engine` string `id` is filed under (`"whisper"`,
+    /// `"sherpa"`, `"sherpa-streaming"`), or `None` if `id` is not in the
+    /// catalog at all.
+    ///
+    /// This is what lets a caller check a model's *kind* before loading it,
+    /// which [`verify_installed`](Self::verify_installed) deliberately does
+    /// not: that call answers "are these files intact", not "are these the
+    /// files this engine can read". The two questions are independent, and
+    /// several entries of different kinds install under the very same
+    /// artifact names, so a perfectly intact model of the wrong kind reaches
+    /// the loader looking exactly like a right one.
+    pub fn engine_of(&self, id: &str) -> Option<&str> {
+        self.find(id).map(|entry| entry.engine)
+    }
+
+    /// The file names `id`'s artifacts are installed under, in catalog
+    /// order, or `None` if `id` is not in the catalog at all.
+    ///
+    /// The contents of a model directory are a contract with whoever loads
+    /// it: an engine opens fixed file names inside the directory this
+    /// manager installed, and [`Artifact::name`] is what decides those names
+    /// — deliberately independent of the URL, since upstream file names vary
+    /// per release (`encoder.int8.onnx`, `encoder-epoch-99-avg-1.int8.onnx`,
+    /// ...) and an engine cannot chase them. That contract is otherwise
+    /// stated twice, in two crates that cannot see each other, with nothing
+    /// checking the copies still agree; this is the accessor that lets a
+    /// crate downstream of both hold them against one another.
+    pub fn artifact_names(&self, id: &str) -> Option<Vec<&'static str>> {
+        self.find(id)
+            .map(|entry| entry.artifacts.iter().map(|a| a.name).collect())
     }
 
     /// Downloads and installs the model identified by `id`.
@@ -1129,6 +1228,65 @@ mod tests {
         assert!(
             models.catalog().iter().all(|m| m.engine != "vosk"),
             "vosk models must not be offered once the engine is removed"
+        );
+    }
+
+    /// The desktop UI's final-model picker (the engine whose output actually
+    /// gets injected) builds its options by filtering the catalog on
+    /// `engine == "sherpa"`. A streaming preview model must never appear in
+    /// that set: it would let a user select a fast, lower-accuracy draft
+    /// engine as the one whose text gets injected, silently replacing an
+    /// offline model like GigaAM-v3. This is what actually keeps the two
+    /// roles apart, so it is asserted directly against the real catalog
+    /// rather than a test fixture.
+    #[test]
+    fn streaming_preview_models_are_excluded_from_the_injected_transcript_engine_set() {
+        let models = ModelManager::new(PathBuf::from("/nonexistent")).catalog();
+        let streaming_ids = ["zipformer-ru-small", "zipformer-en-small"];
+
+        assert!(
+            models
+                .iter()
+                .filter(|m| m.engine == "sherpa")
+                .all(|m| !streaming_ids.contains(&m.id.as_str())),
+            "a streaming preview model must not appear in the plain sherpa engine set"
+        );
+
+        for id in streaming_ids {
+            let engine = models
+                .iter()
+                .find(|m| m.id == id)
+                .map(|m| m.engine.as_str());
+            assert_eq!(
+                engine,
+                Some("sherpa-streaming"),
+                "{id} must be catalogued under the sherpa-streaming engine"
+            );
+        }
+    }
+
+    /// `engine_of` is what the load path uses to reject a model of the wrong
+    /// kind before handing it to a native decoder that would abort the
+    /// process on it. Asserted against the real catalog, and specifically on
+    /// the pair that collides: `parakeet-tdt-110m-en` (offline) and
+    /// `zipformer-ru-small` (streaming) install under the very same four
+    /// artifact names, so their catalog `engine` string is the only thing
+    /// that tells them apart before load.
+    #[test]
+    fn engine_of_reports_the_kind_a_model_is_catalogued_under() {
+        let models = ModelManager::new(PathBuf::from("/nonexistent"));
+
+        assert_eq!(models.engine_of("parakeet-tdt-110m-en"), Some("sherpa"));
+        assert_eq!(
+            models.engine_of("zipformer-ru-small"),
+            Some("sherpa-streaming")
+        );
+        assert_eq!(models.engine_of("small"), Some("whisper"));
+        assert_eq!(
+            models.engine_of("no-such-model"),
+            None,
+            "an id that is not catalogued at all has no kind, and must be \
+             distinguishable from one that has the wrong kind"
         );
     }
 

@@ -37,10 +37,11 @@ const CLIPBOARD_RESTORE_DELAY: Duration = Duration::from_millis(150);
 /// receiving toolkit — see [`crate::uinput_kbd`] for why it cannot be Ctrl+V.
 /// The previous contents of both are saved before the paste and restored
 /// afterward on a best-effort basis: a failed restore is logged (see
-/// [`crate::clipboard::restore`]) but never turns a successful injection into
+/// [`crate::clipboard::Selections::restore`]) but never turns a successful injection into
 /// an error.
 pub struct ClipboardPasteInjector {
     keyboard: VirtualKeyboard,
+    selections: clipboard::Selections,
 }
 
 impl ClipboardPasteInjector {
@@ -49,14 +50,15 @@ impl ClipboardPasteInjector {
     pub fn new() -> Result<Self, InjectError> {
         Ok(Self {
             keyboard: VirtualKeyboard::new()?,
+            selections: clipboard::Selections::new(),
         })
     }
 }
 
 impl TextInjector for ClipboardPasteInjector {
     fn inject(&mut self, text: &str) -> Result<InjectionMethod, InjectError> {
-        let previous = clipboard::save();
-        clipboard::set_text(text)?;
+        let previous = self.selections.save();
+        self.selections.set_text(text)?;
         std::thread::sleep(CLIPBOARD_SET_TO_PASTE_DELAY);
 
         // Push-to-talk releases the hotkey right before this runs; wait
@@ -67,7 +69,7 @@ impl TextInjector for ClipboardPasteInjector {
 
         let paste_result = self.keyboard.paste();
         std::thread::sleep(CLIPBOARD_RESTORE_DELAY);
-        clipboard::restore(previous);
+        self.selections.restore(previous);
 
         paste_result?;
         Ok(InjectionMethod::ClipboardPaste)
@@ -115,20 +117,24 @@ impl TextInjector for TypeInjector {
 /// paste it manually. The universal last resort: it has no hardware
 /// dependency beyond a working clipboard, so it never needs to be gated
 /// behind an availability check.
-#[derive(Debug, Default)]
-pub struct ClipboardOnlyInjector;
+#[derive(Default)]
+pub struct ClipboardOnlyInjector {
+    selections: clipboard::Selections,
+}
 
 impl ClipboardOnlyInjector {
     /// Creates a new injector. Never fails: clipboard access is only
     /// attempted (and can only fail) at `inject` time.
     pub fn new() -> Self {
-        Self
+        Self {
+            selections: clipboard::Selections::new(),
+        }
     }
 }
 
 impl TextInjector for ClipboardOnlyInjector {
     fn inject(&mut self, text: &str) -> Result<InjectionMethod, InjectError> {
-        clipboard::set_text(text)?;
+        self.selections.set_text(text)?;
         Ok(InjectionMethod::ClipboardOnly)
     }
 }
@@ -139,6 +145,9 @@ mod tests {
 
     #[test]
     fn clipboard_only_injector_reports_its_method_on_success() {
+        let _guard = crate::clipboard::SELECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // arboard needs a running display/compositor session; skip cleanly
         // if this environment doesn't have one instead of failing the suite.
         let mut injector = ClipboardOnlyInjector::new();

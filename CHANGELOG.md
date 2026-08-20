@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Dictating into a terminal inserted text from some earlier point in the
+  session instead of what was just said, while every other application
+  received the right text. The transcript is published to both the CLIPBOARD
+  and the PRIMARY selection, because the paste chord is Shift+Insert and VTE
+  terminals read PRIMARY from it where other toolkits read CLIPBOARD — but
+  each selection was published over a clipboard connection that was closed
+  again the moment the call returned. A selection has no storage of its own;
+  it is served by whoever owns it, and closing the connection gives that
+  ownership up. CLIPBOARD hid the mistake, since the session's clipboard
+  manager copies it the instant an owner disappears, which is what a
+  clipboard manager is for. PRIMARY has no manager, so it was empty before
+  the paste chord was even synthesized and the terminal pasted whatever the
+  user had last selected with the mouse. One connection is now held open for
+  as long as the injector lives.
+
 ## [0.3.0] - 2026-08-20
 
 ### Added
